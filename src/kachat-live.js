@@ -10,7 +10,8 @@
 // swipe up to confirm (the swipe is the confirmation, iOS e67074c); then the wallet password (the
 // browser's stand-in for iOS's device lock, DeviceAuth) before anything is signed. The swipe-up
 // screen follows the transaction: the BlockDAG while it goes out, then its progress, or Failed with
-// Try Again (KaPay 5bab351).
+// Try Again (KaPay 5bab351) - or "Not confirmed" with only Done when the network never answered,
+// since Try Again could pay twice (KaPay 953b255: errorText keeps that message word for word).
 //
 // Left out on purpose: iOS's Message button on a name's owner (the wallet has no chats).
 
@@ -1170,7 +1171,7 @@ function takeOverScreen() {
 function transactionSwipeLabels(done) {
   return {
     release: "Release to Confirm", working: "Sending", workingDetail: "Broadcasting to the Kaspa BlockDAG...",
-    done, hint: "Let go past halfway to confirm.", recipientWord: "for", failedFallback: "The transaction didn't go out.",
+    done, recipientWord: "for", failedFallback: "The transaction didn't go out.",
   };
 }
 

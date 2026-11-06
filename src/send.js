@@ -10,7 +10,8 @@
 //   Review  swipe up to send: the amount, To, From and Total; only the fee (its Edit opens the fee
 //           editor) and coin control can change, and a Max amount is worked out again when they
 //           do. The password ("Confirm Send", wallet.js) is asked as the send starts, under the
-//           BlockDAG; then Sent with the transaction, or Failed with the error and Try Again.
+//           BlockDAG; then Sent with the transaction, or Failed with the error and Try Again, or
+//           "Not confirmed" with only Done when the network never answered (KaPay 953b255).
 // A pre-filled recipient (Donate, a contact) or a payment request link opens on From (on the
 // amount when From is fixed). Compound UTXOs - the recipient locked to the address itself, the
 // amount Max - opens on the review.
@@ -23,6 +24,7 @@ import { scanQr } from "./camera.js";
 import { loadOwnAddresses } from "./own-addresses.js";
 import { KAS_UNIT } from "./net.js";
 import { parsePaymentRequestLink, paymentRequestAmountText } from "../shared/engine/payment-request.js";
+import { SEND_OUTCOME_UNKNOWN, SEND_OUTCOME_UNKNOWN_MESSAGE } from "../shared/engine/transactions.js";
 import { entryFor, entryName } from "./address-book.js";
 import {
   FEE_TIERS, recipientCardHtml, recipientStatusHtml, recipientLookup, bindAddressBookButton, amountState, feeControlsHtml,
@@ -770,6 +772,9 @@ export function showSend(opts) {
 }
 
 function friendlySendError(error) {
+  // word for word: the swipe-up screen knows it by its message and shows "Not confirmed" with only
+  // Done, since it may have gone through (KaPay 953b255)
+  if (error?.code === SEND_OUTCOME_UNKNOWN) return SEND_OUTCOME_UNKNOWN_MESSAGE;
   const message = String(error?.message || error || "");
   if (/storage mass/i.test(message)) return "This amount can't be sent from these coins without leaving a tiny change output the network rejects. Try a slightly different amount, or Compound UTXOs first.";
   if (/insufficient/i.test(message)) return "Not enough Kaspa for this amount plus the network fee.";

@@ -2,6 +2,10 @@
 // KachatListingDetailView, KachatBuySheet and KachatOfferSheet (Kaspa Hub > .kachat on iOS; here
 // the .kachat row under Your Domains).
 //
+// The tab is the logo and four numbered cards - Marketplace, Available, Expired, Activity - each
+// opening its page; only the Marketplace has the name search (KaPay 99ab88a). A card's number is
+// how many live on its page, "-" until the registry has answered.
+//
 // On mainnet it is UI only, as on iOS: search answers "Registration isn't open yet", listings,
 // offers and activity are placeholder skeletons, and every final action is disabled. No invented
 // names or prices anywhere - the skeletons are redacted shapes (iOS .redacted(reason:
@@ -10,9 +14,9 @@
 // On TESTNET (testnet-10, with the bundled registry manifest verified) it is live
 // (kachat-live.js, iOS KachatNamesLiveViews.swift): search shows real availability (Available or
 // Taken; no price per year, KaPay 05db583), Claim registers in steps - how long, then the costs and
-// swipe up, which follows the claim (KaPay 5bab351) - and the tabs -
-// Marketplace, Available, Activity (iOS 0765ce0, eea52b2) - read the registry. Your own names and the
-// offers you made live in Your Domains.
+// swipe up, which follows the claim (KaPay 5bab351) - and the pages -
+// Marketplace, Available, Expired, Activity (iOS 0765ce0, eea52b2, cb3c27d) - read the registry. Your
+// own names and the offers you made live in Your Domains.
 
 import { app, esc, render, $, ICONS, navHeader } from "./ui.js";
 import { SYMBOLS, kachatWordmark, openPanel } from "./kachat-ui.js";
@@ -32,15 +36,132 @@ const pill = () => '<span class="coming-pill">Coming soon</span>';
 const header = (title, detail) => `
   <div class="km-header"><div class="km-title">${esc(title)}</div>${detail ? `<div class="muted tiny">${esc(detail)}</div>` : ""}</div>`;
 
-let page = "market"; // kept while you go into a listing and back, like iOS @State
+// The pages behind the cards (KaPay 99ab88a KachatMarketView.Page): names for sale, names back on
+// the market (Available), names in their grace period (Expired), and everything that happens in
+// the registry.
+const PAGES = [
+  { id: "market", title: "Marketplace", icon: "tag" },
+  { id: "available", title: "Available", icon: "sealCheck" },
+  { id: "expired", title: "Expired", icon: "hourglass" },
+  { id: "activity", title: "Activity", icon: "history" },
+];
+// The cards' icons not in SYMBOLS: checkmark.seal and clock.arrow.circlepath (KaPay 99ab88a).
+const CARD_ICONS = {
+  sealCheck: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1.8l2.4 1.8 3-.2.9 2.9 2.5 1.7-1 2.8 1 2.8-2.5 1.7-.9 2.9-3-.2L12 22.2l-2.4-1.8-3 .2-.9-2.9-2.5-1.7 1-2.8-1-2.8 2.5-1.7.9-2.9 3 .2Z"/><path d="m8.4 12.3 2.4 2.4 4.8-5"/></svg>',
+  history: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.6 12a7.5 7.5 0 1 0 2.2-5.3L4.5 9"/><path d="M4.5 4.8V9h4.2"/><path d="M12 8v4.3l2.8 1.7"/></svg>',
+};
 
-/** The .kachat tab's first screen (its own place in the dock): no Back. */
+const isLive = () => kachatLive && live.hub.isLive;
+// Live, or not launched here (mainnet): the same pages - empty on mainnet (iOS 7227d69). The
+// placeholder pages remain only for a testnet registry that is setting up.
+const livePages = () => isLive() || !kachatLaunched;
+
+// The names being claimed, with a count (iOS b219bb0 KachatClaimsButton): beside How it works on
+// the cards, alone on a page.
+const claimsButton = () => (isLive() ? live.claimsButtonHtml() : "");
+const bindClaims = () => { const b = $("#claims"); if (b) b.onclick = () => live.openClaimsList(); };
+
+/** Starts the hub (or, where the registry isn't launched, shows its pages empty) and repaints with
+ *  `paintParts` on every change. */
+function follow(paintParts, { start = true } = {}) {
+  if (kachatLive) {
+    live.hub.onChange = paintParts;
+    if (start || !live.hub.isLive) live.hub.start();
+    else paintParts();
+  } else {
+    // Not launched here: the live pages show empty, under "Coming soon".
+    live.hub.loaded = true;
+    paintParts();
+  }
+}
+
+/** The .kachat tab's first screen (its own place in the dock): the logo and a numbered card per
+ *  page - Marketplace, Available, Expired, Activity - each opening its page (KaPay 99ab88a). No
+ *  Back, unless it was opened from somewhere else (`onBack`). */
 export function showKachatMarket({ onBack = null } = {}) {
-  const state = { search: "" };
   const back = () => showKachatMarket({ onBack });
-  const isLive = () => kachatLive && live.hub.isLive;
-  // a name opened here stays in the .kachat tab
-  const nav = { openName: (info) => { live.hub.onChange = null; live.showLiveNameDetail({ info, onBack: back, screen: "kachat:name" }); } };
+
+  /** How many live on a page; "-" until the registry has answered (KaPay 99ab88a count(of:)). */
+  const countText = (id) => {
+    const h = live.hub;
+    if (!isLive() || !h.loaded || h.loadError) return "-";
+    const list = id === "available" ? h.lapsed : id === "expired" ? h.grace : id === "activity" ? h.activity : h.listings;
+    return String(list.length);
+  };
+  const cardsHtml = () => PAGES.map((p) => `
+    <button class="km-card km-hub-card" data-open-page="${p.id}">
+      <span class="km-hub-card-top">
+        <span class="accent km-hub-card-icon">${SYMBOLS[p.icon] || CARD_ICONS[p.icon]}</span>
+        <span class="km-chevron">${ICONS.chevron}</span>
+      </span>
+      <span class="km-hub-card-count" data-count="${p.id}">${esc(countText(p.id))}</span>
+      <span class="km-hub-card-title">${esc(p.title)}</span>
+    </button>`).join("");
+
+  const heroStatus = () => {
+    // the Testnet badge on testnet only; mainnet is live as it is (iOS ef6b21e)
+    if (isLive()) return IS_TESTNET ? live.testnetBadge() : "";
+    // The bundled manifest is for the previous registry: a calm "Setting up", no error (iOS d2e0673).
+    if (kachatLive && live.hub.upgrading) {
+      // the Testnet badge on testnet only, and no network named in the text (EXT-021)
+      return `<div class="kl-badges">${IS_TESTNET ? live.testnetBadge() : ""}<span class="coming-pill kl-setting-up">${SYMBOLS.hammer}<span>Setting up</span></span></div>
+        <p class="muted tiny center-text">The .kachat registry is being upgraded. Names open here again once the new registry is live.</p>`;
+    }
+    const error = kachatLive && live.hub.ready === false && live.hub.setupError
+      ? `<p class="muted tiny center-text">${esc(live.hub.setupError)}</p>` : "";
+    return pill() + error;
+  };
+
+  render(`
+    <header class="navbar">
+      ${onBack ? `<button class="nav-back" id="back" aria-label="Back">${ICONS.back}<span>Back</span></button>` : "<span></span>"}
+      <div class="nav-title">.kachat</div>
+      <div class="nav-right km-nav-actions">
+        <span id="km-claims">${claimsButton()}</span>
+        <button class="icon plain accent" id="how" aria-label="How it works">${SYMBOLS.question}</button>
+      </div>
+    </header>
+    <section class="km">
+      <div class="km-hero compact">
+        ${kachatWordmark(64)}
+        <div id="km-status">${heroStatus()}</div>
+      </div>
+      <div class="km-hub-cards">${cardsHtml()}</div>
+    </section>`, "kachat:market");
+  dock.remember(back);
+  if (onBack) $("#back").onclick = onBack;
+  $("#how").onclick = () => showHowItWorks(isLive());
+  bindClaims();
+  for (const card of app.querySelectorAll("[data-open-page]")) {
+    card.onclick = () => showKachatPage(card.dataset.openPage, { onBack: back });
+  }
+
+  // Live updates redraw the parts in place.
+  const paintParts = () => {
+    if (app.dataset.screen !== "kachat:market") return;
+    $("#km-status").innerHTML = heroStatus();
+    $("#km-claims").innerHTML = claimsButton();
+    bindClaims();
+    for (const count of app.querySelectorAll("[data-count]")) count.textContent = countText(count.dataset.count);
+  };
+  follow(paintParts);
+}
+
+/** A card's page (KaPay 99ab88a pageScreen): its title and the claims button on top; only the
+ *  Marketplace has the name search ("Find a name"). Back goes to the cards. `search` and `scroll`
+ *  are where it was, coming back from a name opened on it. */
+function showKachatPage(id, { onBack, search = "", scroll = 0 }) {
+  const page = PAGES.find((p) => p.id === id) || PAGES[0];
+  const state = { search: page.id === "market" ? search : "" };
+  const again = (at = 0) => showKachatPage(page.id, { onBack, search: state.search, scroll: at });
+  // a name opened here stays in the .kachat tab, and Back comes back to this page as it was
+  const nav = {
+    openName: (info) => {
+      const at = app.querySelector(".km")?.scrollTop || 0;
+      live.hub.onChange = null;
+      live.showLiveNameDetail({ info, onBack: () => again(at), screen: "kachat:name" });
+    },
+  };
 
   const searchResult = () => {
     const typed = state.search.trim().toLowerCase();
@@ -52,6 +173,16 @@ export function showKachatMarket({ onBack = null } = {}) {
         <button class="km-prominent small-button" disabled>Claim</button>
       </div>`;
   };
+  // The Marketplace's search (KaPay 99ab88a KachatNameSearchCard): Available or Taken.
+  const searchHtml = () => `
+    <div class="km-search">
+      <label class="km-card km-search-field">
+        <span class="muted">${ICONS.search}</span>
+        <input id="search" value="${esc(state.search)}" placeholder="Find a name" autocomplete="off" autocapitalize="off" spellcheck="false" />
+        <span class="muted strong">.kachat</span>
+      </label>
+      <div id="search-result">${searchResult()}</div>
+    </div>`;
 
   // A name tile's shape, redacted: no invented name or price (iOS tilePlaceholder, 27a4f39 / c488d1d).
   const tile = (attr = "") => `<button class="km-card kl-tile" ${attr}>${live.nameTileHtml(redact("somename"), redact("000 KAS"))}</button>`;
@@ -85,108 +216,62 @@ export function showKachatMarket({ onBack = null } = {}) {
     </div>
     <p class="muted small center-text">Activity appears here once .kachat names launch.</p>`;
 
-  const paint = () => {
-    const scroll = app.querySelector(".km")?.scrollTop || 0;
-    render(`
-      <header class="navbar">
-        ${onBack ? `<button class="nav-back" id="back" aria-label="Back">${ICONS.back}<span>Back</span></button>` : "<span></span>"}
-        <div class="nav-title">.kachat</div>
-        <div class="nav-right km-nav-actions">
-          <span id="km-claims">${claimsButton()}</span>
-          <button class="icon plain accent" id="how" aria-label="How it works">${SYMBOLS.question}</button>
-        </div>
-      </header>
-      <section class="km">
-        <div class="km-hero compact">
-          ${kachatWordmark(64)}
-          <div id="km-status">${heroStatus()}</div>
-        </div>
-        <div class="km-search">
-          <label class="km-card km-search-field">
-            <span class="muted">${ICONS.search}</span>
-            <input id="search" value="${esc(state.search)}" placeholder="Find a name" autocomplete="off" autocapitalize="off" spellcheck="false" />
-            <span class="muted strong">.kachat</span>
-          </label>
-          <div id="search-result">${searchResult()}</div>
-        </div>
-        <div class="underline-tabs" role="tablist">
-          ${[["market", "Marketplace"], ["available", "Available"], ["expired", "Expired"], ["activity", "Activity"]].map(([id, title]) =>
-            `<button role="tab" data-page="${id}" aria-selected="${id === page}">${title}</button>`).join("")}
-        </div>
-        <div class="km-page" id="km-page">${pageHtml()}</div>
-      </section>`, "kachat:market");
-    dock.remember(back);
-    const scroller = app.querySelector(".km");
-    if (scroller) scroller.scrollTop = scroll;
-    if (onBack) $("#back").onclick = onBack;
-    $("#how").onclick = () => showHowItWorks(isLive());
-    bindClaims();
-    const search = $("#search");
-    search.oninput = () => {
-      state.search = search.value;
+  // Mainnet (or before the testnet registry is ready): the mockups.
+  const mockPage = () => (page.id === "available" ? availablePage() : page.id === "expired" ? expiredPage() : page.id === "activity" ? activityPage() : marketPage());
+  const pageHtml = () => (livePages() ? live.livePageHtml(page.id) : mockPage());
+
+  render(`
+    <header class="navbar">
+      <button class="nav-back" id="back" aria-label="Back">${ICONS.back}<span>Back</span></button>
+      <div class="nav-title">${esc(page.title)}</div>
+      <div class="nav-right km-nav-actions"><span id="km-claims">${claimsButton()}</span></div>
+    </header>
+    <section class="km km-page-screen">
+      ${page.id === "market" ? searchHtml() : ""}
+      <div class="km-page" id="km-page">${pageHtml()}</div>
+    </section>`, "kachat:page");
+  dock.remember(() => again());
+  const scroller = app.querySelector(".km");
+  if (scroller) scroller.scrollTop = scroll;
+  $("#back").onclick = onBack;
+  bindClaims();
+  const field = $("#search");
+  if (field) {
+    field.oninput = () => {
+      state.search = field.value;
       if (isLive()) live.hub.lookup(state.search.trim().toLowerCase());
       paintSearch();
     };
-    for (const tab of app.querySelectorAll("[data-page]")) tab.onclick = () => { page = tab.dataset.page; paint(); };
-    bindParts();
-  };
+    // coming back from a name: the result for what is still typed
+    if (state.search.trim() && isLive()) live.hub.lookup(state.search.trim().toLowerCase());
+  }
 
-  // The names being claimed, with a count, next to How it works (iOS b219bb0 KachatClaimsButton).
-  const claimsButton = () => (isLive() ? live.claimsButtonHtml() : "");
-  const bindClaims = () => { const b = $("#claims"); if (b) b.onclick = () => live.openClaimsList(); };
-
-  // Mainnet (or before the testnet registry is ready): the mockups.
-  const mockPage = () => (page === "available" ? availablePage() : page === "expired" ? expiredPage() : page === "activity" ? activityPage() : marketPage());
-  // Live, or not launched here (mainnet): the same pages - empty on mainnet (iOS 7227d69). The
-  // placeholder pages remain only for a testnet registry that is setting up.
-  const livePages = () => isLive() || !kachatLaunched;
-  const pageHtml = () => (livePages() ? live.livePageHtml(page) : mockPage());
-  const heroStatus = () => {
-    // the Testnet badge on testnet only; mainnet is live as it is (iOS ef6b21e)
-    if (isLive()) return IS_TESTNET ? live.testnetBadge() : "";
-    // The bundled manifest is for the previous registry: a calm "Setting up", no error (iOS d2e0673).
-    if (kachatLive && live.hub.upgrading) {
-      // the Testnet badge on testnet only, and no network named in the text (EXT-021)
-      return `<div class="kl-badges">${IS_TESTNET ? live.testnetBadge() : ""}<span class="coming-pill kl-setting-up">${SYMBOLS.hammer}<span>Setting up</span></span></div>
-        <p class="muted tiny center-text">The .kachat registry is being upgraded. Names open here again once the new registry is live.</p>`;
-    }
-    const error = kachatLive && live.hub.ready === false && live.hub.setupError
-      ? `<p class="muted tiny center-text">${esc(live.hub.setupError)}</p>` : "";
-    return pill() + error;
-  };
   const bindParts = () => {
-    for (const listing of app.querySelectorAll("[data-listing]")) listing.onclick = () => showListing({ onBack: back });
+    for (const listing of app.querySelectorAll("[data-listing]")) listing.onclick = () => showListing({ onBack: () => again() });
     if (livePages()) live.bindLivePage($("#km-page"), nav);
-    if (!isLive()) return;
-    live.bindSearchResult($("#search-result"), nav);
   };
   const paintSearch = () => {
-    $("#search-result").innerHTML = searchResult();
-    if (isLive()) live.bindSearchResult($("#search-result"), nav);
+    const result = $("#search-result");
+    if (!result) return;
+    result.innerHTML = searchResult();
+    if (isLive()) live.bindSearchResult(result, nav);
   };
   // Live updates redraw the parts in place, so typing in the search field keeps its focus.
   const paintParts = () => {
-    if (app.dataset.screen !== "kachat:market") return;
-    const scroller = app.querySelector(".km");
-    const scroll = scroller?.scrollTop || 0;
-    $("#km-status").innerHTML = heroStatus();
+    if (app.dataset.screen !== "kachat:page") return;
+    const el = app.querySelector(".km");
+    const top = el?.scrollTop || 0;
     $("#km-claims").innerHTML = claimsButton();
     bindClaims();
     $("#km-page").innerHTML = pageHtml();
     paintSearch();
     bindParts();
-    if (scroller) scroller.scrollTop = scroll;
+    if (el) el.scrollTop = top;
   };
-
-  paint();
-  if (kachatLive) {
-    live.hub.onChange = paintParts;
-    live.hub.start();
-  } else {
-    // Not launched here: the live pages show empty, under "Coming soon".
-    live.hub.loaded = true;
-    paintParts();
-  }
+  bindParts();
+  paintSearch();
+  // the cards already started the hub: a page only follows it (and starts it if it never got going)
+  follow(paintParts, { start: false });
 }
 
 // --- How it works (sheet) ------------------------------------------------------------------

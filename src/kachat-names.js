@@ -143,6 +143,12 @@ export function kachatRegistry() {
   return kachatLaunched ? base().registry : null;
 }
 
+/** The shared service (no key needed) where the registry is launched, else null: what
+ *  `registry.resolveHeldOnChain` reads the chain with (KaPay 953b255 confirmOnChain). */
+export function kachatService() {
+  return kachatLaunched ? base().service : null;
+}
+
 /**
  * The runtime with the active account's chatting address bound as the signer:
  * `{ service, registry, actions, engine }`, or null where the registry isn't launched (mainnet).

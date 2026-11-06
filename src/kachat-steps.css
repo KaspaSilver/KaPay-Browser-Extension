@@ -1,7 +1,7 @@
 /* The .kachat transactions in steps (KaPay iOS 05db583 / 5bab351, KaChat-Desktop
    ui/kachat-names-live.css; kachat-live.js): what the name screens add to send-steps.css - the
    review's text rows, an entry step's picker and captions, Renew's "How long?" rows and the
-   claim's "For how long?" buttons. */
+   claim's "For how long?" buttons; and the .kachat tab's numbered cards. */
 
 /* The review: a value of text, on one line while short; a long one (an address) wraps anywhere. */
 .kl-review-text { overflow-wrap: anywhere; white-space: nowrap; }
@@ -58,3 +58,21 @@ body.tab .kl-offer-entry .ss-key { height: 52px; }
 .kl-claim-length-price { flex: 0 0 auto; color: var(--muted); font-size: 15px; font-variant-numeric: tabular-nums; }
 .kl-claim-length-chevron { flex: 0 0 auto; display: grid; place-items: center; color: var(--kaspa-ink); }
 .kl-claim-years-note { margin: 2px 0 0; line-height: 1.4; }
+
+/* The .kachat tab's cards (KaPay 99ab88a KachatHubCard; market.js): two to a row under the logo,
+   each its page's icon and chevron, how many live there, and its title. A card's page starts just
+   under the bar. */
+.km-hub-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 0 16px; }
+.km-hub-card {
+  display: flex; flex-direction: column; align-items: stretch; gap: 10px; min-width: 0; padding: 14px; margin: 0;
+  border-radius: 16px; color: var(--text); font-weight: 400; text-align: left; cursor: pointer;
+  transition: transform .12s ease, background-color .12s ease;
+}
+@media (hover: hover) { .km-hub-card:hover { background: color-mix(in srgb, var(--kaspa) 8%, var(--panel)); } }
+.km-hub-card:active { transform: scale(.98); }
+.km-hub-card-top { display: flex; align-items: center; justify-content: space-between; }
+.km-hub-card-icon { display: inline-flex; }
+.km-hub-card-icon svg { width: 22px; height: 22px; }
+.km-hub-card-count { font-size: 28px; font-weight: 700; line-height: 34px; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.km-hub-card-title { font-size: 15px; font-weight: 600; line-height: 20px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.km-page-screen { padding-top: 8px; }

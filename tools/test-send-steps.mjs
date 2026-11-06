@@ -1,7 +1,10 @@
 // The step-by-step send's keypad (src/keypad.js, KaPay iOS 05db583 KaspaKeypad.applying; the same
-// checks as KaChat-Desktop tools/test-send-steps.mjs). Run: node tools/test-send-steps.mjs
+// checks as KaChat-Desktop tools/test-send-steps.mjs) and the swipe-up screen's rules
+// (src/swipe-up.js, KaPay 953b255). Run: node tools/test-send-steps.mjs
 import assert from "node:assert/strict";
 import { applyKeypadKey, keypadKeyForKeyboard, keypadFontSize, keypadDisplayText } from "../src/keypad.js";
+import { swipeUpThreshold, swipeUpEnding } from "../src/swipe-up.js";
+import { SEND_OUTCOME_UNKNOWN_MESSAGE, sendOutcomeUnknownError } from "../shared/engine/transactions.js";
 
 let passed = 0;
 function check(name, fn) { fn(); passed += 1; console.log(`ok - ${name}`); }
@@ -49,6 +52,22 @@ check("the typed amount shrinks as it grows (popup 52 / 40 / 30)", () => {
 check("the amount shows 0 while empty, grouped once typed", () => {
   assert.equal(keypadDisplayText(""), "0");
   assert.match(keypadDisplayText("1234567.5"), /^1.234.567.5$/);
+});
+
+// The swipe-up screen (src/swipe-up.js, KaPay 953b255).
+check("letting go sends at about 30% of the screen, never under 120", () => {
+  assert.equal(swipeUpThreshold(600), 180);
+  assert.equal(swipeUpThreshold(300), 120);
+  assert.equal(swipeUpThreshold(0), 120);
+});
+check("a send the network never confirmed is Not confirmed, with only Done", () => {
+  assert.deepEqual(swipeUpEnding({ failure: SEND_OUTCOME_UNKNOWN_MESSAGE }), { kind: "unknown", title: "Not confirmed", final: "done" });
+  assert.equal(sendOutcomeUnknownError("ab").message, SEND_OUTCOME_UNKNOWN_MESSAGE);
+});
+check("any other failure is Failed with Try Again; a finished one is Done", () => {
+  assert.deepEqual(swipeUpEnding({ failure: "The send didn't go out." }), { kind: "failed", title: "Failed", final: "retry" });
+  assert.deepEqual(swipeUpEnding({ done: true, doneTitle: "Name Bought" }), { kind: "done", title: "Name Bought", final: "done" });
+  assert.deepEqual(swipeUpEnding({}), { kind: null, title: null, final: null });
 });
 
 console.log(`\n${passed} passed`);

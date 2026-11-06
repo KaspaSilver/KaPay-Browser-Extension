@@ -19,9 +19,8 @@ import { getEndpoint } from "../shared/engine/endpoints.js";
 import { dotkCanonical, kaspaNamesCanonical } from "./names-normalize.js";
 import { esc, ICONS } from "./ui.js";
 import { IS_TESTNET, MAINNET_KNS, TESTNET_KNS } from "./net.js";
-import { kachatRegistry, kachatLaunched } from "./kachat-names.js";
+import { kachatRegistry, kachatService, kachatLaunched } from "./kachat-names.js";
 import { normalize as kachatNormalize, isValid as kachatIsValid } from "../shared/engine/kachat-names/codec.js";
-import { Status } from "../shared/engine/kachat-names/registry-state.js";
 import { KachatNamesRegistry } from "../shared/engine/kachat-names/registry.js";
 
 // The KNS API for the running network (testnet reads /tn10, iOS knsBaseURL).
@@ -122,7 +121,10 @@ async function resolveKaspaNames(label) {
 /** .kachat: the owner of a name that is active or in its grace period - a name in grace keeps
  *  resolving to its owner (iOS f7c371a); one past grace does not. Same rules as the registry:
  *  a-z, 0-9, hyphen. Always listed first; where the registry isn't live yet (mainnet before its
- *  launch) it is listed as "Coming soon" and resolves nothing (iOS 6ac48a7). */
+ *  launch) it is listed as "Coming soon" and resolves nothing (iOS 6ac48a7).
+ *  Every typed name may be paid, so an indexer's answer counts only once the chain holds the
+ *  record it describes (`resolveHeldOnChain`, KaPay 953b255 confirmOnChain); when it doesn't, or
+ *  the indexer answered for another name, the lookup failed. */
 async function resolveKachat(label) {
   const canonical = kachatNormalize(label);
   if (!kachatIsValid(canonical)) return null;
@@ -130,10 +132,8 @@ async function resolveKachat(label) {
   const registry = kachatRegistry();
   if (!registry) return { tld: "kachat", display, address: null, failed: false, notLive: true };
   try {
-    await registry.refreshIfStale();
-    const found = await registry.lookup(canonical);
-    const active = found.kind === "registered" && found.info.status(registry.graceMs) !== Status.lapsed;
-    return { tld: "kachat", display, address: active ? KachatNamesRegistry.addressOf(found.info.owner) : null, failed: false };
+    const address = await registry.resolveHeldOnChain(canonical, kachatService());
+    return { tld: "kachat", display, address: address || null, failed: false };
   } catch (error) {
     console.info("[KaPay] .kachat lookup failed:", error?.message || error);
     return { tld: "kachat", display, address: null, failed: true };

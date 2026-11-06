@@ -43,11 +43,13 @@
 //   showSwipeUp({ screen, title, onBack, onCancel, barTitle, labels, bodyHtml, enabled,
 //                 direction, getPreview, getFailureMessage, onAction, onDone })
 //       The review (iOS SwipeUpToSendScrollView): the header, the scrolling `body`, and the bar.
-//       Drag the bar up past halfway and let go: the screen moves up into a full-screen BlockDAG
-//       while it sends, then Sent with the transaction (Done) or Failed with the error (Try
-//       Again brings the review back as it was). Enter / Space on the bar sends too. Returns
-//       { body, setBody(html), setEnabled(on), setBusy(on), setSent({ txid, amountSompi,
-//       recipient, explorerUrl }, outcomeHtml), setSucceeded(html), returnToForm(), sending }.
+//       Drag the bar up about a third of the screen and let go (KaPay 953b255; it was half): the
+//       screen moves up into a full-screen BlockDAG while it sends, then Sent with the transaction
+//       (Done) or Failed with the error (Try Again brings the review back as it was). A send the
+//       network never confirmed (SEND_OUTCOME_UNKNOWN's message) is "Not confirmed" with only
+//       Done, since Try Again could pay twice (KaPay 953b255). Enter / Space on the bar sends
+//       too. Returns { body, setBody(html), setEnabled(on), setBusy(on), setSent({ txid,
+//       amountSompi, recipient, explorerUrl }, outcomeHtml), setSucceeded(html), returnToForm(), sending }.
 //       The screen calls setBusy(true) once its send started (else it fails after a moment),
 //       then setSent(...) when it went out, or setBusy(false) alone for a failure shown with
 //       getFailureMessage(). returnToForm() drops back to the review with nothing shown (the
@@ -61,6 +63,7 @@ import { KAS_UNIT } from "./net.js";
 import { sompiFromUserText } from "./amounts.js";
 import { trimmedKas } from "./send-pieces.js";
 import { applyKeypadKey, usesCommaDecimal, keypadKeyForKeyboard, keypadFontSize, keypadDisplayText } from "./keypad.js";
+import { swipeUpThreshold, swipeUpEnding } from "./swipe-up.js";
 import "./send-steps.css";
 
 export { applyKeypadKey, keypadKeyForKeyboard, keypadFontSize, keypadDisplayText, usesCommaDecimal };
@@ -75,6 +78,8 @@ const ICON = {
   fail: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5 2.5 20h19L12 3.5Z"/><path d="M12 10v4.5M12 17.2v.1"/></svg>',
   markDone: '<svg viewBox="0 0 72 72" aria-hidden="true"><circle cx="36" cy="36" r="34" class="sk-swipe-mark-fill"/><path d="m22 37 9.5 9.5L51 27" class="sk-swipe-mark-ink"/></svg>',
   markFailed: '<svg viewBox="0 0 72 72" aria-hidden="true"><circle cx="36" cy="36" r="34" class="sk-swipe-mark-fill"/><path d="M25 25l22 22M47 25 25 47" class="sk-swipe-mark-ink"/></svg>',
+  // questionmark.circle.fill, orange (KaPay 953b255)
+  markUnknown: '<svg viewBox="0 0 72 72" aria-hidden="true"><circle cx="36" cy="36" r="34" class="sk-swipe-mark-fill"/><path d="M27 28.5a9.2 9.2 0 1 1 13.7 8c-3 1.8-4.7 3.4-4.7 6.8M36 52.5v.1" class="sk-swipe-mark-ink"/></svg>',
 };
 
 const short = (address) => {
@@ -345,13 +350,15 @@ export function mountOwnAddressList(list, { selectedAddress = null, onPick, excl
   const rowHtml = (r) => {
     const current = selected != null && r.address === selected;
     const funded = BigInt(r.balanceSompi || 0n) > 0n;
+    // a balance that couldn't be read is a dash, never 0 KAS (KaPay 953b255)
+    const balance = r.balanceSompi == null ? "—" : unitText(`${trimmedKas(r.balanceSompi)} ${KAS_UNIT}`);
     return `
       <button type="button" class="ss-source-row${current ? " current" : ""}" role="option" aria-selected="${current}" data-source-key="${esc(r.key)}" data-source-address="${esc(r.address)}">
         <span class="ss-source-copy">
           <span class="ss-source-name"><span class="ellipsis">${esc(r.title)}</span><span data-used="${esc(r.key)}">${usedTagHtml(used.get(r.address))}</span></span>
           <span class="mono tiny muted">${esc(short(r.address))}</span>
         </span>
-        <span class="ss-source-balance${funded ? "" : " muted"}">${esc(unitText(`${trimmedKas(r.balanceSompi || 0n)} ${KAS_UNIT}`))}</span>
+        <span class="ss-source-balance${funded ? "" : " muted"}">${esc(balance)}</span>
         <span class="ss-source-check" aria-hidden="true">${current ? ICON.check : ""}</span>
       </button>`;
   };
@@ -360,7 +367,9 @@ export function mountOwnAddressList(list, { selectedAddress = null, onPick, excl
     const view = await vault.readAccounts();
     const main = (await wallet.cachedAddresses(view.activeAccountId))?.main || null;
     const spendingList = await wallet.spendingList();
-    const mainBalance = main ? BigInt((await wallet.balancesFor([main]).catch(() => ({})))[main] ?? 0n) : 0n;
+    // A failed read says nothing about the balance: left unknown, not shown as 0 (KaPay 953b255).
+    const mainRead = main ? await wallet.balancesFor([main]).catch(() => null) : null;
+    const mainBalance = mainRead?.[main] != null ? BigInt(mainRead[main]) : null;
     if (!alive()) return;
     const chatting = main ? [{ key: "chatting", title: "Chatting Address", address: main, balanceSompi: mainBalance, source: { kind: "chatting", address: main } }] : [];
     const spending = spendingList.rows
@@ -473,23 +482,24 @@ export function showFeeEditor({ screen = "send-fee", feeSompi = null, minimumSom
 
 // --- Swipe up to send (SwipeUpToSendScrollView, KaPay 59593af) ------------------------------------
 
-/** The words a swipe-up screen uses (iOS SwipeUpLabels). */
+/** The words a swipe-up screen uses (iOS SwipeUpLabels). No hint under the title any more: it
+ *  already says Keep Swiping or Release (KaPay 953b255). */
 export const SWIPE_UP_LABELS = {
   send: {
     release: "Release to Send", working: "Sending", workingDetail: "Broadcasting to the Kaspa BlockDAG...",
-    done: "Sent", hint: "Let go past halfway to send.", recipientWord: "to", failedFallback: "The send didn't go out.",
+    done: "Sent", recipientWord: "to", failedFallback: "The send didn't go out.",
   },
   consolidate: {
     release: "Release to Consolidate", working: "Consolidating", workingDetail: "Broadcasting to the Kaspa BlockDAG...",
-    done: "Sent", hint: "Let go past halfway to consolidate.", recipientWord: "to", failedFallback: "The send didn't go out.",
+    done: "Sent", recipientWord: "to", failedFallback: "The send didn't go out.",
   },
   buy: {
     release: "Release to Buy", working: "Buying", workingDetail: "Sending the purchase to the Kaspa BlockDAG...",
-    done: "Name Bought", hint: "Let go past halfway to buy.", recipientWord: "for", failedFallback: "The purchase didn't go out.",
+    done: "Name Bought", recipientWord: "for", failedFallback: "The purchase didn't go out.",
   },
   claim: {
     release: "Release to Claim", working: "Claiming", workingDetail: "Committing to the Kaspa BlockDAG...",
-    done: "Claim Started", hint: "Let go past halfway to claim.", recipientWord: "for", failedFallback: "The claim didn't start.",
+    done: "Claim Started", recipientWord: "for", failedFallback: "The claim didn't start.",
   },
 };
 /** iOS settle: spring(response 0.45, damping 0.86). */
@@ -556,7 +566,7 @@ export function showSwipeUp({
 
   let on = Boolean(enabled);
   let busy = false;
-  // iOS state: how far the screen is pushed up, past halfway (armed), form / sending, the DAG's
+  // iOS state: how far the screen is pushed up, past the threshold (armed), form / sending, the DAG's
   // moment on screen, whether the send really started, and how it ended.
   let lift = 0;
   let armed = false;
@@ -577,7 +587,7 @@ export function showSwipeUp({
   const clearTimers = () => { for (const t of timers) clearTimeout(t); timers.clear(); };
   const active = () => on && !busy;
   const height = () => host.clientHeight || 580;
-  const threshold = () => Math.max(140, height() * 0.5);
+  const threshold = () => swipeUpThreshold(height());
   const failureText = () => (failed && dagShown ? (String(getFailureMessage?.() || "").trim() || labels.failedFallback) : null);
   const dag = blockDagAnimation(q("canvas"));
 
@@ -604,21 +614,26 @@ export function showSwipeUp({
     const done = dagShown && Boolean(sent || succeeded);
     const failure = failureText();
     const sending = phase === "sending";
+    // Sent, Not confirmed (it may have gone through: Done only) or Failed (KaPay 953b255).
+    const ending = swipeUpEnding({ done, failure, doneTitle: labels.done });
+    const unknown = ending.kind === "unknown";
     dag.setHighlight(sending && !failure);
     dag.setDimmed(Boolean(done || failure));
-    els.mark.innerHTML = done ? ICON.markDone : (failure ? ICON.markFailed : "");
-    els.mark.className = `sk-swipe-mark${done ? " done" : failure ? " failed" : ""}`;
-    els.big.textContent = done ? labels.done : failure ? "Failed" : (sending ? labels.working : (armed ? labels.release : "Keep Swiping"));
+    els.mark.innerHTML = done ? ICON.markDone : unknown ? ICON.markUnknown : (failure ? ICON.markFailed : "");
+    els.mark.className = `sk-swipe-mark${ending.kind ? ` ${ending.kind}` : ""}`;
+    els.big.textContent = ending.title ?? (sending ? labels.working : (armed ? labels.release : "Keep Swiping"));
     const amount = sent?.amountSompi ?? preview.amountSompi;
     els.amount.hidden = amount == null;
     if (amount != null) els.amount.textContent = unitText(`${trimmedKas(amount)} ${KAS_UNIT}`);
     const to = String(sent?.recipient ?? preview.recipient ?? "").trim();
     els.to.hidden = !to;
     if (to) { els.to.title = to; els.to.innerHTML = `<span class="sk-sent-to-word">${esc(labels.recipientWord)}&nbsp;</span>${middleTruncatedHtml(to, 8)}`; }
-    const showDetail = !(done || failure);
+    // Before that, the title above already says Keep Swiping or Release (KaPay 953b255).
+    const showDetail = !(done || failure) && sending;
     els.detail.hidden = !showDetail;
-    if (showDetail) els.detail.textContent = sending ? labels.workingDetail : labels.hint;
+    if (showDetail) els.detail.textContent = labels.workingDetail;
     els.failure.hidden = !failure;
+    els.failure.classList.toggle("unknown", unknown);
     if (failure) els.failureText.textContent = failure;
     const id = done && sent ? String(sent.txid || "").trim() : "";
     els.tx.hidden = !id;
@@ -631,9 +646,9 @@ export function showSwipeUp({
     const showOutcome = done && Boolean(outcomeHtml);
     els.outcome.hidden = !showOutcome;
     if (showOutcome && els.outcome.dataset.html !== outcomeHtml) { els.outcome.innerHTML = unitText(outcomeHtml); els.outcome.dataset.html = outcomeHtml; }
-    els.final.hidden = !(done || failure);
-    els.final.textContent = done ? "Done" : "Try Again";
-    els.final.dataset.kind = done ? "done" : "retry";
+    els.final.hidden = !ending.final;
+    els.final.textContent = ending.final === "done" ? "Done" : "Try Again";
+    els.final.dataset.kind = ending.final || "retry";
   }
   function paint(animate = false) { paintBar(); place(animate); paintProgress(); }
 

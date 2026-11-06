@@ -11,7 +11,8 @@
 //   Sign with KasSigner  the animated KSPT QR (2.5 s a frame) on its own white card; Scan Signed
 //           Transaction opens the scanner, and closing it without a scan returns to the QR.
 //   Signed  "Signed by KasSigner", the summary, and swipe up to send (59593af): the BlockDAG, then
-//           Sent, or Failed with Try Again - still signed, so it goes out again with no new signing.
+//           Sent, or Failed with Try Again - still signed, so it goes out again with no new signing -
+//           or "Not confirmed" with only Done when the network never answered (KaPay 953b255).
 // Compound UTXOs (the recipient locked to the address itself, the largest KasSigner can sign at
 // once, Max) opens on the review. A build that fails, or a scan that isn't a signed transaction,
 // shows Something Went Wrong with Try Again back on the review.
@@ -653,7 +654,9 @@ export function showColdSend(opts) {
   };
 
   /** The swipe let go (iOS broadcast): the signed transaction goes out, checked against what was
-   *  sent for signing first. A failure leaves it signed: Try Again sends the same one again. */
+   *  sent for signing first. A failure leaves it signed: Try Again sends the same one again. One
+   *  the network never confirmed keeps SEND_OUTCOME_UNKNOWN's message word for word, which the
+   *  swipe-up screen shows as "Not confirmed" with only Done (KaPay 953b255). */
   const broadcast = async () => {
     const swipe = handle?.swipe;
     if (!s.decoded || !s.unsigned || s.broadcasting || s.sent) return;
