@@ -3,16 +3,29 @@
 // node is touched - Send Kaspa, Max, Compound, a spending address's send, .kas transfers, and
 // payments approved for websites - so no screen can skip it. Cancelling sends nothing.
 
-import { esc } from "./ui.js";
+import { app, esc } from "./ui.js";
 import * as vault from "./vault.js";
+
+// The prompt up now, if any: one at a time (iOS authPending, KaPay iOS 0799cec).
+let waiting = null;
 
 /**
  * "Confirm Send" with what is being sent and to whom. Resolves true once the password checks out,
  * false when cancelled. `details`: { amountText, recipient, max, title }.
+ *
+ * While it is up nothing else starts or changes the send it waits for (iOS SwipeUpToSendScrollView
+ * authPending, KaPay iOS 0799cec): a second request is turned down (false, nothing sent) and the
+ * waiting prompt stays as it is; the screen behind takes no clicks, keys or focus; a click beside
+ * the prompt does nothing - only Cancel or Escape cancel it.
  */
-export function confirmSpend({ amountText = "", recipient = "", max = false, title = "Confirm Send" } = {}) {
+export function confirmSpend(details = {}) {
+  if (waiting) return Promise.resolve(false);
+  waiting = askPassword(details).finally(() => { waiting = null; });
+  return waiting;
+}
+
+function askPassword({ amountText = "", recipient = "", max = false, title = "Confirm Send" } = {}) {
   return new Promise((resolve) => {
-    document.querySelector(".spend-auth")?.remove();
     const backdrop = document.createElement("div");
     backdrop.className = "alert-backdrop spend-auth";
     const what = max ? `Everything${amountText ? ` (${amountText})` : ""}` : amountText;
@@ -31,14 +44,26 @@ export function confirmSpend({ amountText = "", recipient = "", max = false, tit
           <button type="submit" class="alert-button strong">Send</button>
         </div>
       </form>`;
-    const done = (ok) => { backdrop.remove(); document.removeEventListener("keydown", onKey); resolve(ok); };
+    // the screen behind sits still until this answers
+    const wasInert = Boolean(app?.inert);
+    if (app) app.inert = true;
+    let answered = false;
+    const done = (ok) => {
+      if (answered) return;
+      answered = true;
+      backdrop.remove();
+      document.removeEventListener("keydown", onKey);
+      if (app) app.inert = wasInert;
+      resolve(ok);
+    };
     const onKey = (event) => { if (event.key === "Escape") done(false); };
     document.addEventListener("keydown", onKey);
-    backdrop.addEventListener("click", (event) => { if (event.target === backdrop || event.target.closest("[data-cancel]")) done(false); });
+    backdrop.addEventListener("click", (event) => { if (event.target.closest("[data-cancel]")) done(false); });
     const input = backdrop.querySelector(".alert-field");
     backdrop.querySelector("form").onsubmit = async (event) => {
       event.preventDefault();
       if (await vault.verifyPassword(input.value)) return done(true);
+      if (answered) return;
       backdrop.querySelector(".spend-auth-error").textContent = "Wrong password.";
       input.select();
     };

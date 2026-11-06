@@ -163,53 +163,8 @@ export function recipientLookup({ read, resolve, onChange, delay = 350 }) {
 
 // --- Amount (KaspaAmountEntry + KaspaFiatAmountState) --------------------------------------
 
-/**
- * The amount as typed - in KAS, or in your currency (`fiat`) - and what it is in KAS. iOS
- * KaspaFiatAmountState: the screen keeps the KAS text; this owns the field's own text and unit.
- */
-export function amountState() {
-  return {
-    fiat: false,
-    display: "",
-    /** The KAS amount as text after `display` changed; "" when it isn't a number yet. */
-    kasFromDisplay(price) {
-      const entered = Number(this.display);
-      if (!this.display || !Number.isFinite(entered)) return null;
-      if (!this.fiat) return entered;
-      return price > 0 ? entered / price : null;
-    },
-    onInput(text, price) {
-      this.display = text;
-      if (!this.fiat) return text;
-      const kas = this.kasFromDisplay(price);
-      return kas == null ? "" : plainKas(kas);
-    },
-    /** Max (or a compound) sets the KAS amount; the field shows it in the unit on screen. */
-    setKas(kasText, price) {
-      const kas = Number(kasText);
-      this.display = this.fiat && price > 0 && Number.isFinite(kas) ? (kas * price).toFixed(2) : String(kasText);
-    },
-    toggle(price) {
-      if (!(price > 0)) return;
-      const kas = this.kasFromDisplay(price);
-      this.fiat = !this.fiat;
-      this.display = kas == null ? "" : this.fiat ? (kas * price).toFixed(2) : plainKas(kas);
-    },
-    /** The other unit's value for the switch: "$12.34" / "123.4 TKAS"; null while empty.
-     *  `formatFiat(kas)` formats a KAS amount in your currency. */
-    conversion(price, formatFiat) {
-      const kas = this.kasFromDisplay(price);
-      if (kas == null) return null;
-      if (this.fiat) return `${plainKas(kas)} ${KAS_UNIT}`;
-      return price > 0 ? formatFiat(kas) : null;
-    },
-    reset() { this.fiat = false; this.display = ""; },
-  };
-}
-
-function plainKas(kas) {
-  return kas.toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
-}
+// The amount field's KAS / currency state lives in amount-state.js (no screen code, tested in node).
+export { amountState } from "./amount-state.js";
 
 /**
  * The big centred amount and its unit, with the KAS / currency switch (showing the converted

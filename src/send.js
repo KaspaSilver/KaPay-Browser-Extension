@@ -37,6 +37,8 @@ import {
 } from "./send-steps.js";
 
 const ORDER = ["to", "from", "amount", "review", "fee"];
+/** The From address's coins couldn't be read (iOS, KaPay iOS 0799cec). */
+const COINS_UNREAD = "Couldn't load the coins at this address";
 const short = (a) => `${a.slice(0, 14)}...${a.slice(-6)}`;
 
 /**
@@ -65,11 +67,13 @@ export function showSend(opts) {
     maxMode: false,
     fillingMax: false,
     coins: null,            // all spendable coins at the source
+    coinsUnread: false,     // they couldn't be read: said so, never Available 0 (KaPay iOS 0799cec)
     selected: null,         // Set of coin keys, or null for Automatic
     tier: "normal",
     base: null,             // { policyKas, sdkBaseKas } for the current amount/coins
     customFeeKas: null,     // number when the user set their own
     estimating: false,
+    feeError: "",           // the fee couldn't be worked out: no swipe (iOS feeError, KaPay iOS 0799cec)
     price: null,
     sending: false,
     error: "",
@@ -113,8 +117,13 @@ export function showSend(opts) {
     const amount = amountSompi();
     return Boolean(state.recipient) && !state.resolving && amount != null && amount > 0n && !exceedsBalance() && !state.fillingMax;
   };
+  // The swipe waits for a settled amount and fee (iOS canSend, KaPay iOS 0799cec): a Max or fee
+  // still being worked out, or a fee that couldn't be, would send something other than the review
+  // shows. Fast and Priority are the Normal fee times their multiplier here, with no estimate of
+  // their own to wait for.
   const canSend = () => {
     if (state.sending || !state.recipient || state.resolving || state.fillingMax) return false;
+    if (state.estimating || !state.base || state.feeError) return false;
     const amount = amountSompi();
     const fee = totalFeeKas();
     const available = spendableSompi();
@@ -175,13 +184,15 @@ export function showSend(opts) {
   const load = async () => {
     const address = opts.fromAddress;
     wallet.utxoLabels(address).then((labels) => { state.labels = labels; }).catch(() => {});
+    state.coinsUnread = false;
     try {
       const coins = await wallet.utxos(address);
       if (address !== opts.fromAddress) return; // another address was picked meanwhile
       state.coins = coins;
     } catch (error) {
       if (address !== opts.fromAddress) return;
-      state.error = `Couldn't load this address's coins: ${error?.message || error}`;
+      console.warn("[KaPay] coins unreadable:", error);
+      state.coinsUnread = true;
     }
     const currency = (await settings()).currency || "usd";
     state.currency = currency;
@@ -202,12 +213,19 @@ export function showSend(opts) {
   };
 
   let estimateTimer = null;
+  // Only the newest estimate answers: an older one landing late would put its amount's fee on
+  // this one (and Max's own fee is never overwritten by one).
+  let estimateSeq = 0;
   const scheduleEstimate = () => {
     clearTimeout(estimateTimer);
-    estimateTimer = setTimeout(() => estimate().then(paint), 400);
+    const mine = ++estimateSeq;
+    // being worked out from the key on, through the 400 ms wait (iOS isEstimatingFee)
+    if (!state.maxMode && !opts.compound) state.estimating = true;
+    estimateTimer = setTimeout(() => { if (mine === estimateSeq) estimate().then(paint); }, 400);
   };
   const estimate = async () => {
     if (state.maxMode || opts.compound) return;
+    const mine = ++estimateSeq;
     state.estimating = true;
     try {
       const available = spendableSompi();
@@ -220,12 +238,17 @@ export function showSend(opts) {
         amountKas: wallet.sompiToKasText(amount),
         selectedOutpoints: selectedOutpoints(),
       });
-      if (result && result.policyKas > 0) state.base = result;
-      else if (!state.base) state.base = { policyKas: 0.002, sdkBaseKas: 0.00002 };
-    } catch {
-      if (!state.base) state.base = { policyKas: 0.002, sdkBaseKas: 0.00002 };
+      if (mine !== estimateSeq) return;
+      if (!(result?.policyKas > 0)) throw new Error("No spendable UTXOs");
+      state.base = result;
+      state.feeError = "";
+    } catch (error) {
+      if (mine !== estimateSeq) return;
+      // no made-up fee: the review says why and the swipe stays off (iOS feeError, KaPay iOS 0799cec)
+      state.base = null;
+      state.feeError = friendlySendError(error);
     } finally {
-      state.estimating = false;
+      if (mine === estimateSeq) state.estimating = false;
     }
   };
 
@@ -235,13 +258,22 @@ export function showSend(opts) {
   const fillMax = async () => {
     const available = spendableSompi();
     if (available == null) return;
+    // a typed amount's estimate still waiting or on its way no longer applies
+    clearTimeout(estimateTimer);
+    estimateSeq += 1;
     state.estimating = true;
     state.fillingMax = true;
     paint();
     try {
       state.base = await wallet.maxFee(inputCount(), { sourceIndex: opts.source?.kind === "spending" ? opts.source.index : null });
-    } catch {
-      state.base = state.base || { policyKas: 0.002, sdkBaseKas: 0.00002 };
+      state.feeError = "";
+    } catch (error) {
+      // the amount stays as it was and the swipe stays off (iOS setMaxAmount, KaPay iOS 0799cec)
+      state.base = null;
+      state.feeError = friendlySendError(error);
+      state.estimating = false;
+      state.fillingMax = false;
+      return;
     }
     state.estimating = false;
     state.fillingMax = false;
@@ -449,7 +481,8 @@ export function showSend(opts) {
         <div class="sk-card sk-from">
           <div class="sk-from-row">
             <span class="tx-meta"><span class="strong small">Chatting Address</span><span class="mono tiny muted">${esc(state.chatting ? short(state.chatting) : "")}</span></span>
-            ${available != null && isChattingSource() ? `<span class="small strong">${esc(`${trimmedKas(available)} ${KAS_UNIT}`)}</span>` : '<span class="spinner small-spin"></span>'}
+            ${available != null && isChattingSource() ? `<span class="small strong">${esc(`${trimmedKas(available)} ${KAS_UNIT}`)}</span>`
+              : state.coinsUnread && isChattingSource() ? `<span class="small muted">${esc(COINS_UNREAD)}</span>` : '<span class="spinner small-spin"></span>'}
           </div>
         </div>`}`);
     host.querySelector("#from-chatting").onclick = () => {
@@ -493,11 +526,15 @@ export function showSend(opts) {
   };
   /** Fee estimate, Max and coin control follow the new address (coin control resets). */
   const resetForSource = () => {
+    // the last address's fee estimate, waiting or on its way, is not this one's
+    clearTimeout(estimateTimer);
+    estimateSeq += 1;
     state.coins = null;
     state.selected = null;
     state.customFeeKas = null;
     state.maxMode = false;
     state.base = null;
+    state.feeError = "";
     state.error = "";
     paint();
     load();
@@ -530,6 +567,7 @@ export function showSend(opts) {
   };
   /** Under the typed amount: what's wrong with it, else what's available. */
   const amountFootnote = () => {
+    if (state.coinsUnread) return COINS_UNREAD;
     if (state.error) return state.error;
     if (exceedsBalance()) return "This is more than the address you're sending from holds.";
     const available = spendableSompi();
@@ -546,7 +584,7 @@ export function showSend(opts) {
     maxEnabled: Boolean(state.recipient) && state.coins != null,
     estimatingMax: state.fillingMax,
     footnote: amountFootnote(),
-    footnoteError: Boolean(state.error) || exceedsBalance(),
+    footnoteError: state.coinsUnread || Boolean(state.error) || exceedsBalance(),
   });
   const requestAmountHtml = () => `
     ${reviewAmountHtml({ eyebrow: "You're sending", amountText: `${trimmedKas(amountSompi() ?? 0n)} ${KAS_UNIT}`, fiatText: reviewFiat() })}
@@ -634,7 +672,7 @@ export function showSend(opts) {
         coinSummary: coinSummary(state.selected),
         editPill: true,
       })}
-      ${state.error ? `<p class="error-text small center-text">${esc(state.error)}</p>` : ""}`;
+      ${state.coinsUnread || state.error || state.feeError ? `<p class="error-text small center-text">${esc(state.coinsUnread ? COINS_UNREAD : (state.error || state.feeError))}</p>` : ""}`;
   };
   const drawReview = (direction) => {
     const back = backFrom("review");
@@ -714,7 +752,7 @@ export function showSend(opts) {
     const swipe = handle?.swipe;
     if (!canSend()) {
       // the swipe-up screen shows this as Failed, with Try Again
-      state.error = state.error || (totalFeeKas() == null ? "Still working out the network fee. Try again in a moment." : "Not enough Kaspa for this amount plus the network fee.");
+      state.error = state.error || state.feeError || (totalFeeKas() == null || state.estimating || state.fillingMax ? "Still working out the network fee. Try again in a moment." : "Not enough Kaspa for this amount plus the network fee.");
       return;
     }
     state.sending = true;

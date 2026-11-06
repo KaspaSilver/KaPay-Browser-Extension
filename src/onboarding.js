@@ -24,6 +24,7 @@ import { showDeleteAccountSheet } from "./delete-account.js";
 import { nextDefaultAccountName } from "../shared/ui/account-backup-status.js";
 import { forgetWallet as forgetAddressBook } from "./address-book.js";
 import { forgetAccount as forgetBell } from "./bell.js";
+import { forgetKachatSigner } from "./kachat-names.js";
 
 let goHome = () => {};
 let goSettings = () => {};
@@ -125,8 +126,7 @@ export async function showWelcome() {
   $("#advanced").onclick = createWithPassphrase;
   $("#import").onclick = () => { importDraft = null; showImportSource(); };
   for (const button of app.querySelectorAll("[data-sign-in]")) {
-    button.onclick = async () => {
-      button.disabled = true;
+    button.onclick = () => runAccountAction(async () => {
       try {
         await vault.switchAccount(button.dataset.signIn);
         await markUsed(button.dataset.signIn);
@@ -135,9 +135,8 @@ export async function showWelcome() {
         goHome();
       } catch (error) {
         toast(error.message || "Unable to sign in to this account.");
-        button.disabled = false;
       }
-    };
+    });
   }
   for (const button of app.querySelectorAll("[data-edit]")) {
     const account = saved.find((a) => a.id === button.dataset.edit);
@@ -175,6 +174,21 @@ function showRenameAccount(account) {
   };
 }
 
+// Creating, signing in or removing: one at a time, since each one replaces the account in the active
+// slot (KaPay iOS 0799cec). The accounts screen's buttons are off while one runs.
+let accountActionRunning = false;
+async function runAccountAction(action) {
+  if (accountActionRunning) return;
+  accountActionRunning = true;
+  for (const button of app.querySelectorAll(".onboard button")) button.disabled = true;
+  try {
+    await action();
+  } finally {
+    accountActionRunning = false;
+    if (app.dataset.screen === "accounts") for (const button of app.querySelectorAll(".onboard button")) button.disabled = false;
+  }
+}
+
 /** The sign-in screen's Delete (iOS 99ab88a DeleteAccountSheet): the warning first, and an account
  *  that still owes its backup says so. Signed out, there are no words open to show. */
 function confirmRemoveAccount(account) {
@@ -186,7 +200,7 @@ function confirmRemoveAccount(account) {
       message: "Enter your wallet password to delete this account.",
       verify: (password) => vault.verifyPassword(password),
       onBack: showWelcome,
-      onUnlocked: async () => {
+      onUnlocked: () => runAccountAction(async () => {
         try {
           await deleteAccount(account.id, account.address);
           toast("Account removed.");
@@ -194,7 +208,7 @@ function confirmRemoveAccount(account) {
           toast(error.message);
         }
         showWelcome();
-      },
+      }),
     }),
   });
 }
@@ -203,9 +217,10 @@ function confirmRemoveAccount(account) {
  * Removes an account and everything kept for it in this browser (iOS removeSavedAccount): both
  * networks' address caches, spending state, Cold Storage and portfolios, its website connections,
  * its contacts and the bell's notifications (KaPay iOS 99ab88a), and what it owed a backup. The
- * last account takes the vault with it.
+ * last account takes the vault with it. Any key held for signing goes first (KaPay iOS 0799cec).
  */
 export async function deleteAccount(accountId, mainAddress) {
+  forgetKachatSigner();
   const view = await vault.readAccounts();
   if (view.accounts.length <= 1) {
     // nothing is left to seal, so the vault goes too, with every kachat.* record and the pages' storage
@@ -236,13 +251,22 @@ async function discoverAfterRestore(account, accountId) {
   wallet.runPendingDiscovery(accountId);
 }
 
-/** Nobody has seen a created account's words yet, so it owes the backup steps; whoever imported one
- *  has them, and its six months of Backup Hygiene start now (iOS AccountBackupStatus, 4f5dfd2). */
-async function noteBackupOwed(account) {
+/** Nobody has seen a created account's words yet, so it owes the backup steps, marked before its
+ *  keys are saved (KaPay iOS 0799cec): a popup closed in between can't leave an account that owes
+ *  nothing. Whoever imported one has the words, so its six months of Backup Hygiene start once it's
+ *  saved (iOS 4f5dfd2). Returns the save's result. */
+async function savingAccount(account, save) {
   const address = await wallet.previewMainAddress(account.mnemonic, account.passphrase, account.family, account.identityIndex || 0);
-  if (!address) return;
-  if (account.imported) backupStatus.markConfirmed(address);
-  else backupStatus.markPending(address);
+  if (address && !account.imported) backupStatus.markPending(address);
+  let view;
+  try {
+    view = await save();
+  } catch (error) {
+    if (address && !account.imported) backupStatus.forget(address);
+    throw error;
+  }
+  if (address && account.imported) backupStatus.markConfirmed(address);
+  return view;
 }
 
 /**
@@ -253,8 +277,7 @@ async function finishAccount(account, onBack, buttonLabel) {
   if (await vault.hasVault()) {
     if (!(await vault.isUnlocked())) return showUnlock();
     try {
-      const view = await vault.addAccount(account);
-      await noteBackupOwed(account);
+      const view = await savingAccount(account, () => vault.addAccount(account));
       await markUsed(view.activeAccountId);
       await setLoggedOut(false);
       importDraft = null;
@@ -278,34 +301,31 @@ async function finishAccount(account, onBack, buttonLabel) {
 // done. The first account also chooses the wallet password, the one step iOS doesn't have: a
 // browser has no Face ID or iOS keychain, so the words are sealed with a password (vault.js).
 
-let creating = false;
-
 /** The names saved accounts already have, for the next free default name. */
 async function takenAccountNames() {
   if (!(await vault.hasVault()) || !(await vault.isUnlocked())) return [];
   return ((await vault.readAccounts().catch(() => null))?.accounts || []).map((a) => a.name);
 }
 
-async function createAccount() {
-  if (creating) return;
-  creating = true;
-  const button = $("#create");
-  if (button) { button.disabled = true; button.innerHTML = '<span class="spinner"></span><span>Create New Account</span>'; }
-  try {
-    const phrase = await wallet.newRecoveryPhrase(24);
-    const name = nextDefaultAccountName(await takenAccountNames());
-    await finishAccount({ mnemonic: phrase, passphrase: "", family: "kaspaStandard", name }, showWelcome, "Create Account");
-  } catch (error) {
-    // iOS "Couldn't Create Account"
-    toast(error.message || "Couldn't create the account.");
-    if (button) { button.disabled = false; button.innerHTML = `${ICONS.plusCircle}<span>Create New Account</span>`; }
-  } finally {
-    creating = false;
-  }
+function createAccount() {
+  return runAccountAction(async () => {
+    const button = $("#create");
+    if (button) button.innerHTML = '<span class="spinner"></span><span>Create New Account</span>';
+    try {
+      const phrase = await wallet.newRecoveryPhrase(24);
+      const name = nextDefaultAccountName(await takenAccountNames());
+      await finishAccount({ mnemonic: phrase, passphrase: "", family: "kaspaStandard", name }, showWelcome, "Create Account");
+    } catch (error) {
+      // iOS "Couldn't Create Account"
+      toast(error.message || "Couldn't create the account.");
+    }
+    if (button?.isConnected) button.innerHTML = `${ICONS.plusCircle}<span>Create New Account</span>`;
+  });
 }
 
 /** Advanced: a new 24-word phrase, then the passphrase entry; Back there is the accounts screen. */
 async function createWithPassphrase() {
+  if (accountActionRunning) return;
   let phrase;
   try {
     phrase = await wallet.newRecoveryPhrase(24);
@@ -380,7 +400,7 @@ function showPassphraseQuestion(flow) {
   $("#back").onclick = flow.onBack;
   $("#yes").onclick = () => showPassphraseEntry(flow);
   $("#no").onclick = () => flow.onProceed("");
-  $("#what").onclick = () => showPassphraseExplainer(flow);
+  $("#what").onclick = () => showPassphraseExplainer(flow, () => showPassphraseQuestion(flow));
 }
 
 /**
@@ -415,11 +435,29 @@ function showPassphraseEntry(flow) {
       </div>
       <p class="error" id="error"></p>
       <button id="continue" class="big" disabled>${create ? "Continue" : "Import"}</button>
+      <button id="what" class="ghost">What is a passphrase?</button>
     </section>`, "passphrase");
-  // iOS clears what was typed when you go back.
-  $("#back").onclick = create ? flow.onBack : () => showPassphraseQuestion(flow);
+  // iOS clears what was typed when you go back; reading the explainer keeps it.
+  $("#back").onclick = () => { flow.typed = null; (create ? flow.onBack : () => showPassphraseQuestion(flow))(); };
   const pp = $("#pp");
   const pp2 = $("#pp2");
+  if (flow.typed) { pp.value = flow.typed.pp; if (pp2) pp2.value = flow.typed.pp2; }
+  $("#what").onclick = () => {
+    flow.typed = { pp: pp.value, pp2: pp2?.value || "" };
+    showPassphraseExplainer(flow, () => showPassphraseEntry(flow));
+  };
+  // The import's search for the address holding funds: Import waits for it, or it would import onto
+  // #0 while the funds sit on another address. Held from the first keystroke, not only once the
+  // lookup starts (KaPay iOS 0799cec).
+  let searching = false;
+  const paintContinue = () => {
+    const button = $("#continue");
+    if (!button) return;
+    const waiting = !create && searching && Boolean(pp.value);
+    button.disabled = !pp.value || waiting;
+    button.innerHTML = waiting ? '<span class="spinner"></span><span>Finding your address...</span>' : (create ? "Continue" : "Import");
+  };
+  const setSearching = (on) => { searching = on; paintContinue(); };
   let revealed = false;
   $("#eye").onclick = () => {
     revealed = !revealed;
@@ -473,12 +511,13 @@ function showPassphraseEntry(flow) {
     $("#preview-balance").innerHTML = '<span class="spinner small-spin"></span>';
     $("#preview-hint").hidden = true;
     $("#preview-found").innerHTML = "";
+    if (!create) setSearching(true);
     const seq = ++previewSeq;
     previewTimer = setTimeout(async () => {
       const address = await wallet.previewMainAddress(flow.phrase, typed, flow.family);
       if (seq !== previewSeq || !$("#preview")) return;
       $("#preview").textContent = address || "Checking...";
-      const failed = () => { $("#preview-balance").innerHTML = '<span class="muted small">Couldn\'t check</span>'; };
+      const failed = () => { setSearching(false); $("#preview-balance").innerHTML = '<span class="muted small">Couldn\'t check</span>'; };
       if (!address) return failed();
       await new Promise((resolve) => setTimeout(resolve, 450));
       if (seq !== previewSeq) return;
@@ -488,6 +527,7 @@ function showPassphraseEntry(flow) {
         const first = found?.find((entry) => entry.balanceSompi > 0n) || found?.[0];
         if (!first) return failed();
         select(found, first);
+        setSearching(false);
         return;
       }
       let balances = null;
@@ -496,18 +536,30 @@ function showPassphraseEntry(flow) {
       if (balances) showBalance(balances[address] ?? 0n); else failed();
     }, 250);
   };
-  pp.oninput = () => { $("#continue").disabled = !pp.value; schedulePreview(); };
+  pp.oninput = () => { schedulePreview(); paintContinue(); };
   schedulePreview();
+  paintContinue();
   $("#continue").onclick = () => {
+    if (!create && searching) return;
     const error = $("#error");
     error.textContent = "";
     if (!pp.value) { error.textContent = "Enter a passphrase, or go back and choose No."; return; }
     if (create && pp.value !== pp2.value) { error.textContent = "The passphrases do not match. Please re-enter them."; return; }
-    flow.onProceed(pp.value);
+    flow.typed = null;
+    // nothing changes the account once it is being made (KaPay iOS 0799cec)
+    const fields = [pp, pp2, $("#eye"), $("#what"), $("#continue")].filter(Boolean);
+    for (const field of fields) field.disabled = true;
+    Promise.resolve(flow.onProceed(pp.value)).finally(() => {
+      if (!pp.isConnected) return;
+      for (const field of fields) field.disabled = false;
+      paintContinue();
+    });
   };
 }
 
-function showPassphraseExplainer(flow) {
+/** Back returns to the screen it was opened from: the question, or the entry screen, which links it
+ *  too (KaPay iOS 0799cec). */
+function showPassphraseExplainer(flow, onBack) {
   const sections = [
     ["The short version", "A passphrase is an extra word or sentence you add on top of your 12 or 24 words. It is optional, and most people do not use one."],
     ["It does not lock your account", "This is the part people get wrong. A passphrase does not put a password on your account. It opens a completely different account. Your 12 or 24 words with no passphrase open one account. The same words with the word \"apple\" opens another one. With \"banana\", another one again. Every passphrase is its own separate account, with its own address and its own balance."],
@@ -515,7 +567,7 @@ function showPassphraseExplainer(flow) {
     ["The catch", "There is no reset and no recovery. If you forget your passphrase, the account it opened is gone for good. Your 12 or 24 words alone will not bring it back, and nobody can help you. Treat it exactly like the words themselves: written down, somewhere safe, before you rely on it."],
     ["One more thing to know", "If you type the wrong passphrase, nothing will tell you. You will simply land in a different account, and it will look empty. That is not a bug and your money is not lost - it just means you are in the wrong account."],
     ["So do you need one?", flow.mode === "create"
-      ? "If you are not sure, choose No. Your account is still protected by your 12 or 24 words, and you can always create another account with a passphrase later."
+      ? "If you are not sure, you do not need one: go back to the start and tap Create New Account, which makes an account without a passphrase. It is still protected by your 12 or 24 words, and you can always create another account with a passphrase later."
       : "If you never set one up, choose No. A passphrase is something you would have typed in on purpose, so if this is the first you are hearing of it, you do not have one."],
   ];
   render(`
@@ -523,7 +575,7 @@ function showPassphraseExplainer(flow) {
     <section class="screen explainer">
       ${sections.map(([title, body]) => `<div><h3>${esc(title)}</h3><p class="muted">${esc(body)}</p></div>`).join("")}
     </section>`, "passphrase");
-  $("#back").onclick = () => showPassphraseQuestion(flow);
+  $("#back").onclick = onBack;
 }
 
 // --- import account: iOS ImportSourceWalletView -> ImportWalletView -> PassphraseOptionView ---
@@ -643,15 +695,18 @@ function canImport(d) {
   return Boolean(d.wordCount) && importWordsValid(d) === d.wordCount && Boolean(d.name.trim());
 }
 
-/** iOS ImportWalletView.pasteFromClipboard, same rules and messages. */
+/** iOS ImportWalletView.pasteFromClipboard, same rules and messages; a refusal never repeats what
+ *  was pasted. */
 function parsePastedPhrase(text) {
   const tokens = String(text || "").toLowerCase().split(/[\s,]+/)
     .map((t) => t.replace(/[.)]+$/, ""))
     .filter((t) => t && !/^\d+$/.test(t));
   if (!tokens.length) throw new Error("Nothing to paste.");
   if (tokens.length !== 12 && tokens.length !== 24) throw new Error(`You need 12 or 24 words - the clipboard holds ${tokens.length}.`);
+  // never repeats what was pasted (KaPay iOS 0799cec)
   const unknown = tokens.filter((t) => !isBip39Word(t));
-  if (unknown.length) throw new Error(`Not one of the 12 or 24 words: ${unknown.slice(0, 3).join(", ")}.`);
+  if (unknown.length === 1) throw new Error("One of the pasted words isn't a valid word. Check your copy and try again.");
+  if (unknown.length) throw new Error(`${unknown.length} of the pasted words aren't valid words. Check your copy and try again.`);
   return tokens;
 }
 
@@ -693,13 +748,14 @@ function showImportWords() {
   };
 
   const applyPaste = (text) => {
+    // The clipboard is cleared as soon as it's read, whether or not the words are accepted: secret
+    // words don't belong there either way (KaPay iOS 0799cec).
+    navigator.clipboard.writeText("").catch(() => {});
     try {
       const tokens = parsePastedPhrase(text);
       d.wordCount = tokens.length;
       d.words = [...tokens, ...Array(24 - tokens.length).fill("")];
       d.active = tokens.length - 1;
-      // iOS clears the clipboard once the phrase is in.
-      navigator.clipboard.writeText("").catch(() => {});
       showImportWords();
     } catch (error) {
       $("#error").textContent = error.message;
@@ -831,8 +887,7 @@ function showSetPassword(account, onBack, buttonLabel = "Create Account") {
     button.disabled = true;
     button.innerHTML = '<span class="spinner"></span> Encrypting…';
     try {
-      const view = await vault.createVault(pw, account);
-      await noteBackupOwed(account);
+      const view = await savingAccount(account, () => vault.createVault(pw, account));
       await markUsed(view.activeAccountId);
       await setLoggedOut(false);
       importDraft = null;

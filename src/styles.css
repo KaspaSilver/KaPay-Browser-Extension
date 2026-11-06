@@ -687,6 +687,8 @@ body.tab #app[data-screen="visibility"], body.tab #app[data-screen="coins"], bod
 .ios-balance { display: flex; flex-direction: column; align-items: center; gap: 2px; padding-top: 4px; }
 .ios-balance-value { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
 .ios-balance-value.big { font-size: 24px; font-weight: 800; }
+/* a balance that couldn't be read (KaPay iOS 0799cec): the words and Try Again, never 0 */
+.unreadable-balance { gap: 6px; padding: 8px 16px 4px; }
 .ios-capsule { width: 100%; border-radius: 999px; background: var(--kaspa); color: #000; font-weight: 700; font-size: 14px; padding: 14px; display: flex; align-items: center; justify-content: center; gap: 6px; }
 .ios-capsule:disabled { background: var(--kaspa) !important; color: #000 !important; opacity: .5; }
 .ios-capsule svg { width: 18px; height: 18px; }

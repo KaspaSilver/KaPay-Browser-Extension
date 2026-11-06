@@ -306,10 +306,21 @@ function eventRowHtml(event, showName = false) {
 
 // --- Password confirmation (iOS DeviceAuth) ------------------------------------------------
 
-/** Asks for the wallet password; resolves true once it is right, false when cancelled. */
+// The prompt up now, if any: one at a time (iOS authPending, KaPay iOS 0799cec).
+let passwordWaiting = null;
+
+/** Asks for the wallet password; resolves true once it is right, false when cancelled. While it is
+ *  up nothing else starts or changes what it waits for (iOS authPending, KaPay iOS 0799cec): a
+ *  second request is turned down (false), the screen behind takes no clicks, keys or focus, and a
+ *  click beside it does nothing - only Cancel or Escape cancel it, as spend-auth.js does. */
 export function confirmPassword(reason = AUTH_REASON) {
+  if (passwordWaiting) return Promise.resolve(false);
+  passwordWaiting = askPassword(reason).finally(() => { passwordWaiting = null; });
+  return passwordWaiting;
+}
+
+function askPassword(reason) {
   return new Promise((resolve) => {
-    document.querySelector(".kl-auth")?.remove();
     const backdrop = document.createElement("div");
     backdrop.className = "alert-backdrop kl-auth";
     backdrop.innerHTML = `
@@ -325,14 +336,26 @@ export function confirmPassword(reason = AUTH_REASON) {
           <button type="submit" class="alert-button strong">Confirm</button>
         </div>
       </form>`;
-    const done = (ok) => { backdrop.remove(); document.removeEventListener("keydown", onKey); resolve(ok); };
+    // the screen behind sits still until this answers
+    const wasInert = Boolean(app?.inert);
+    if (app) app.inert = true;
+    let answered = false;
+    const done = (ok) => {
+      if (answered) return;
+      answered = true;
+      backdrop.remove();
+      document.removeEventListener("keydown", onKey);
+      if (app) app.inert = wasInert;
+      resolve(ok);
+    };
     const onKey = (event) => { if (event.key === "Escape") done(false); };
     document.addEventListener("keydown", onKey);
-    backdrop.addEventListener("click", (event) => { if (event.target === backdrop || event.target.closest("[data-cancel]")) done(false); });
+    backdrop.addEventListener("click", (event) => { if (event.target.closest("[data-cancel]")) done(false); });
     const input = backdrop.querySelector(".alert-field");
     backdrop.querySelector("form").onsubmit = async (event) => {
       event.preventDefault();
       if (await vault.verifyPassword(input.value)) return done(true);
+      if (answered) return;
       backdrop.querySelector(".kl-auth-error").textContent = "Wrong password.";
       input.select();
     };

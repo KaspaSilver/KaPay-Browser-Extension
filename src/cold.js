@@ -35,6 +35,7 @@ import { addressDomainsTab } from "./address-domains.js";
 import { kachatRegistry } from "./kachat-names.js";
 import { showAddToPortfolio } from "./portfolio.js";
 import { showColdSend } from "./cold-send.js";
+import { unreadableBalanceHtml } from "./manage.js";
 import { SF, txDate, feeText, portfolioKas, middle, shortAddress, fieldSheet } from "./cold-common.js";
 
 const INVALID_KPUB = "That doesn't look like a valid Kaspa extended public key (kpub).";
@@ -129,14 +130,15 @@ const balanceCache = new Map(); // address -> sompi, last known
 const domainOwners = new Map(); // address -> owns a KNS domain
 const usedState = new Map();    // address -> true | false | "unknown" (probe failed)
 
-/** iOS getAddressList: 0...maxAddressIndex with live balances (batched), labels and hidden. */
+/** iOS getAddressList: 0...maxAddressIndex with live balances (batched), labels and hidden. A
+ *  balance that can't be read and was never read is null - unknown, never 0 (KaPay iOS 0799cec). */
 async function addressList(account) {
   const addresses = await wallet.kpubAddresses(account.kpub, 0, account.maxAddressIndex + 1);
   let balances = null;
   try { balances = await wallet.balancesFor(addresses); } catch { balances = null; }
   const hidden = new Set(account.hidden);
   return addresses.map((address, index) => {
-    const balanceSompi = balances ? (balances[address] ?? 0n) : (balanceCache.get(address) ?? 0n);
+    const balanceSompi = balances ? (balances[address] ?? 0n) : (balanceCache.get(address) ?? null);
     if (balances) balanceCache.set(address, balanceSompi);
     return { index, address, balanceSompi, label: labelOf(account, index), hidden: hidden.has(index) };
   });
@@ -207,7 +209,8 @@ async function generateAddress(accountId) {
   const entries = await addressList(account);
   let pick = null;
   for (const entry of entries) {
-    if (!entry.hidden || entry.balanceSompi > 0n) continue;
+    // funded, or unread (it may be): not a fresh one
+    if (!entry.hidden || entry.balanceSompi !== 0n) continue;
     if ((await probeUsed(entry.address)) === false) { pick = entry.index; break; }
   }
   await updateAccount(accountId, (a) => {
@@ -729,7 +732,10 @@ function showAccount({ accountId, onBack }) {
       return;
     }
     const rows = visibleEntries();
-    const total = (state.entries || []).filter((e) => !e.hidden).reduce((sum, e) => sum + e.balanceSompi, 0n);
+    const shown = (state.entries || []).filter((e) => !e.hidden);
+    // a balance that couldn't be read leaves no total to show (a dash, never a short one)
+    const unread = shown.some((e) => e.balanceSompi == null);
+    const total = unread ? null : shown.reduce((sum, e) => sum + e.balanceSompi, 0n);
     const busy = Boolean(state.discovery) || state.busy === "generate";
     const scroll = app.querySelector(".manage-scroll")?.scrollTop || 0;
     render(`
@@ -751,7 +757,7 @@ function showAccount({ accountId, onBack }) {
           </div>
           <div class="tx-meta">
             <span class="muted cold-caption">Total Balance</span>
-            <span class="cold-total">${state.entries ? `${esc(formatKas8(total))} KAS` : '<span class="spinner small-spin"></span>'}</span>
+            <span class="cold-total">${!state.entries ? '<span class="spinner small-spin"></span>' : unread ? '<span class="muted">—</span>' : `${esc(formatKas8(total))} KAS`}</span>
           </div>
           <button class="ios-capsule" id="address-actions" ${busy ? "disabled" : ""}>${busy ? '<span class="spinner dark-spinner small-spin"></span>' : "Address Actions"}</button>
         </div>
@@ -762,7 +768,9 @@ function showAccount({ accountId, onBack }) {
               <div class="address-card-main">
                 <span class="accent cold-row-label">${esc(displayLabel(entry))}</span>
                 <span class="mono cold-row-address">${esc(shortAddress(entry.address))}</span>
-                <span class="strong cold-row-amount">${esc(formatKas8(entry.balanceSompi))} KAS</span>
+                ${entry.balanceSompi == null
+                  ? '<span class="muted small cold-row-amount">Couldn\'t load the coins at this address</span>'
+                  : `<span class="strong cold-row-amount">${esc(formatKas8(entry.balanceSompi))} KAS</span>`}
                 <span class="address-status">${usedBadge(entry)}${domainOwners.get(entry.address) ? '<span class="domain-tag">Contains domain</span>' : ""}</span>
               </div>
               <button class="icon plain card-menu" data-menu="${entry.index}" aria-label="Address actions">${SF.ellipsisV}</button>
@@ -1042,6 +1050,8 @@ function showAddress({ accountId, entry, onBack }) {
 
   function paint() {
     const total = balance();
+    // its coins couldn't be read: no balance and no Send (KaPay iOS 0799cec)
+    const unreadable = total == null && Boolean(state.coinsError) && !state.coinsLoading;
     const scroll = app.querySelector(".manage-scroll")?.scrollTop || 0;
     const tabs = [["history", "History"], ["utxos", "UTXOs"], ["domains", "Domains"]];
     render(`
@@ -1050,7 +1060,7 @@ function showAddress({ accountId, entry, onBack }) {
         <div class="nav-title cold-nav-title">${esc(title)}</div>
         <div class="nav-right"><a class="icon plain accent cold-globe" href="${esc(wallet.explorerAddressUrl(address))}" target="_blank" rel="noopener noreferrer" aria-label="View in Explorer" title="View in Explorer">${SF.globe}</a></div>
       </header>
-      <div class="ios-balance cold-address-balance"><span class="muted tiny">Balance</span><span class="ios-balance-value">${esc(formatKas8(total))} KAS</span></div>
+      ${unreadable ? unreadableBalanceHtml("cold-address-balance") : `<div class="ios-balance cold-address-balance"><span class="muted tiny">Balance</span><span class="ios-balance-value">${total != null ? `${esc(formatKas8(total))} KAS` : '<span class="spinner small-spin"></span>'}</span></div>`}
       <div class="underline-tabs cold-tabs" role="tablist">
         ${tabs.map(([id, label]) => `<button role="tab" data-tab="${id}" aria-selected="${state.tab === id}">${esc(label)}</button>`).join("")}
       </div>
@@ -1059,7 +1069,7 @@ function showAddress({ accountId, entry, onBack }) {
       </div>
       <div class="ios-bottom-bar">
         <button class="ios-capsule with-icon" id="receive">${SF.qrcodeSmall}<span>Receive</span></button>
-        <button class="ios-capsule with-icon cold-bold" id="send" ${total === 0n ? "disabled" : ""}>${SF.sendFill}<span>Send</span></button>
+        <button class="ios-capsule with-icon cold-bold" id="send" ${total == null || total === 0n ? "disabled" : ""}>${SF.sendFill}<span>Send</span></button>
       </div>`, "cold:address");
     if (state.tab === "domains") kachatTab?.bind(app, back);
     app.dataset.coldAddress = address;
@@ -1075,6 +1085,8 @@ function showAddress({ accountId, entry, onBack }) {
     if (historyRetry) historyRetry.onclick = loadHistory;
     const coinsRetry = $("#coins-retry");
     if (coinsRetry) coinsRetry.onclick = loadCoins;
+    const balanceRetry = $("#balance-retry");
+    if (balanceRetry) balanceRetry.onclick = loadCoins;
     const compound = $("#compound");
     if (compound) compound.onclick = () => openSend(true);
     for (const button of app.querySelectorAll("[data-rename-utxo]")) {

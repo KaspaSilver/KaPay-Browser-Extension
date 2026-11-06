@@ -216,6 +216,15 @@ function bindTabsContent(state, { address, repaint, reloadHistory, reloadCoins, 
   }
 }
 
+/** A balance that couldn't be read (KaPay iOS 0799cec `.unreadable`): said so, with Try Again
+ *  (#balance-retry) - never 0 KAS, which would say the address is empty. */
+export function unreadableBalanceHtml(className = "") {
+  return `<div class="ios-balance unreadable-balance ${className}">
+    <span class="muted small center-text">Couldn't load the coins at this address</span>
+    <button class="link-button strong" id="balance-retry">Try Again</button>
+  </div>`;
+}
+
 function loaders(state, address, repaintIfHere) {
   const loadHistory = () => {
     state.historyLoading = true;
@@ -368,18 +377,20 @@ export function showManageAddress(opts) {
 
   function paint() {
     const total = balance();
+    // its coins couldn't be read: no balance and no Send (KaPay iOS 0799cec)
+    const unreadable = total == null && Boolean(state.coinsError) && !state.coinsLoading;
     const scroll = app.querySelector(".manage-scroll")?.scrollTop || 0;
     render(`
       ${navHeader({ title: "Chatting Address" })}
       <div class="manage-scroll">
-        <div class="ios-balance"><span class="muted tiny">Balance</span><span class="ios-balance-value">${total != null ? `${esc(formatKas8(total))} KAS` : '<span class="spinner small-spin"></span>'}</span></div>
+        ${unreadable ? unreadableBalanceHtml() : `<div class="ios-balance"><span class="muted tiny">Balance</span><span class="ios-balance-value">${total != null ? `${esc(formatKas8(total))} KAS` : '<span class="spinner small-spin"></span>'}</span></div>`}
         <button class="ios-capsule" id="address-actions">Address Actions</button>
         ${addressTabsHtml(state.tab)}
         ${addressTabContent(state, "Combines all UTXOs at this address into a single one, to reduce the number of inputs a future send needs.")}
       </div>
       <div class="ios-bottom-bar">
         <button class="ios-capsule with-icon" id="receive">${SF.qrcode}<span>Receive</span></button>
-        <button class="ios-capsule with-icon" id="send" ${total === 0n ? "disabled" : ""}>${SF.sendFill}<span>Send</span></button>
+        <button class="ios-capsule with-icon" id="send" ${total === 0n || unreadable ? "disabled" : ""}>${SF.sendFill}<span>Send</span></button>
       </div>`, "manage-chat");
     bindKachatTab(state, back);
     remember(() => paint());
@@ -393,6 +404,8 @@ export function showManageAddress(opts) {
       note: "This address should be for chatting and domains only. 1 Kaspa is enough for about 500 interactions in the app. Domains cost from 35 to 4,000 Kaspa, depending on the name.",
     });
     $("#send").onclick = () => openSend(false);
+    const balanceRetry = $("#balance-retry");
+    if (balanceRetry) balanceRetry.onclick = loadCoins;
     bindTabsContent(state, { address: opts.address, repaint: paint, reloadHistory: loadHistory, reloadCoins: loadCoins, onCompound: () => openSend(true) });
   }
 
@@ -440,10 +453,15 @@ export function showManageAddresses({ onBack, onChangeIdentity = null }) {
       try {
         const main = (await wallet.cachedAddresses((await vault.readAccounts()).activeAccountId))?.main || null;
         if (main) {
-          const balances = await wallet.balancesFor([main]);
-          state.chatting = { address: main, balance: balances[main] ?? 0n };
+          try {
+            const balances = await wallet.balancesFor([main]);
+            state.chatting = { address: main, balance: balances[main] ?? 0n };
+          } catch {
+            // unread, not 0 (KaPay iOS 0799cec): the card says so; a balance read before stays
+            if (state.chatting?.address !== main || state.chatting.balance == null) state.chatting = { address: main, balance: null };
+          }
         }
-      } catch { /* the chatting card shows without a balance */ }
+      } catch { /* no chatting card */ }
     } catch (error) {
       state.error = error.message;
     }
@@ -633,12 +651,16 @@ export function showManageAddresses({ onBack, onChangeIdentity = null }) {
     const rows = sortRows(visibleRows(), state.used);
     // every address of the account, hidden ones and the chatting address too (iOS 245a5d2)
     const total = (state.list?.rows || []).reduce((sum, r) => sum + r.balanceSompi, 0n) + BigInt(state.chatting?.balance ?? 0n);
+    // the chatting address's balance couldn't be read: no total to show (a dash, never a short one)
+    const chattingUnread = Boolean(state.chatting) && state.chatting.balance == null;
     const chattingCard = state.chatting ? `
           <div class="glass address-card" id="open-chatting" role="button" tabindex="0">
             <div class="address-card-main">
               <span class="muted small medium">Chatting Address</span>
               <span class="mono small">${esc(shortAddress(state.chatting.address))}</span>
-              <span class="strong small">${esc(formatKas8(state.chatting.balance))} KAS</span>
+              ${chattingUnread
+                ? '<span class="muted small">Couldn\'t load the coins at this address</span>'
+                : `<span class="strong small">${esc(formatKas8(state.chatting.balance))} KAS</span>`}
             </div>
           </div>` : "";
     const busy = Boolean(state.discovery) || state.busy === "generate";
@@ -646,7 +668,7 @@ export function showManageAddresses({ onBack, onChangeIdentity = null }) {
     render(`
       ${navHeader({ title: "Manage Addresses" })}
       <div class="manage-scroll">
-        <div class="ios-balance"><span class="muted tiny">Total Balance</span><span class="ios-balance-value big">${state.list ? `${esc(formatKas8(total))} KAS` : '<span class="spinner small-spin"></span>'}</span></div>
+        <div class="ios-balance"><span class="muted tiny">Total Balance</span><span class="ios-balance-value big">${!state.list && state.error ? '<span class="muted">—</span>' : !state.list ? '<span class="spinner small-spin"></span>' : chattingUnread ? '<span class="muted">—</span>' : `${esc(formatKas8(total))} KAS`}</span></div>
         <button class="ios-capsule" id="address-actions" ${busy ? "disabled" : ""}>${busy ? '<span class="spinner dark-spinner small-spin"></span>' : "Address Actions"}</button>
         ${state.error ? `<p class="error">${esc(state.error)}</p>` : ""}
         ${state.loading && !state.list ? '<div class="center-text"><span class="spinner"></span></div>' : ""}
@@ -695,7 +717,16 @@ export function showManageAddresses({ onBack, onChangeIdentity = null }) {
  *  (iOS 95e2cba); the list when it isn't one of this account's. */
 export async function openSpendingAddress(address, onBack) {
   let row = null;
-  try { row = (await wallet.spendingList()).rows.find((r) => r.address === String(address).toLowerCase()) || null; } catch { row = null; }
+  try {
+    row = (await wallet.spendingList()).rows.find((r) => r.address === String(address).toLowerCase()) || null;
+  } catch {
+    // its balance couldn't be read: said so with Try Again, not a screen showing 0 with Send off
+    // (iOS OwnAddressHistorySheet .unreadable, KaPay iOS 0799cec)
+    render(`${navHeader({})}<div class="manage-scroll pad">${unreadableBalanceHtml()}</div>`, "manage-spending");
+    $("#back").onclick = onBack;
+    $("#balance-retry").onclick = () => openSpendingAddress(address, onBack);
+    return;
+  }
   if (row) showSpendingAddress({ row, onBack });
   else showManageAddresses({ onBack });
 }

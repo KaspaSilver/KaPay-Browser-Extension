@@ -243,10 +243,12 @@ function backupGoBack() {
       flow.wordPage = wordPageCount(flow.seed.words.length) - 1;
       goTo("words");
       break;
-    case "passphrase": startWordCheck(); break;
+    // Back to a check already passed keeps its words and answers: going back is for looking
+    // again, not for being tested on new words (KaPay iOS 0799cec).
+    case "passphrase": goTo("wordCheck"); break;
     case "passphraseCheck": goTo("passphrase"); break;
     case "tips":
-      if (hasPassphrase()) { flow.passphraseAnswer = ""; goTo("passphraseCheck"); } else startWordCheck();
+      if (hasPassphrase()) { flow.passphraseAnswer = ""; goTo("passphraseCheck"); } else goTo("wordCheck");
       break;
     default: break;
   }
