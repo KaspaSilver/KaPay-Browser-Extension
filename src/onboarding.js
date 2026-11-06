@@ -3,7 +3,8 @@
 //   the accounts screen   KaChat wordmark, Saved Accounts (tap to sign in, pencil to rename or
 //                         remove), Create New Account, Import Existing Account, App Settings.
 //                         Log Out in Settings lands here, as on iOS.
-//   create                CreateWalletView -> seed -> PassphraseOptionView
+//   create                one tap (KaPay iOS 99ab88a), or Advanced: CreateWalletView ->
+//                         PassphraseOptionView's entry
 //   import                ImportSourceWalletView -> ImportWalletView -> PassphraseOptionView
 //   unlock / reset        the browser's stand-in for Face ID: the wallet password
 //
@@ -14,10 +15,15 @@ import * as vault from "./vault.js";
 import * as wallet from "./wallet.js";
 import { ext, getLocal, setLocal, removeLocal } from "./browser.js";
 import {
-  app, esc, render, $, toast, noteActivity, resetActivityPing, ICONS, navHeader, showSheet,
+  app, esc, render, $, toast, noteActivity, resetActivityPing, ICONS, navHeader, showSheet, passwordGate,
 } from "./ui.js";
 import { isBip39Word, bip39Matches } from "../shared/ui/bip39-english.js";
 import { removeConnectionsFor } from "./approve.js";
+import { backupStatus } from "./account-backup.js";
+import { showDeleteAccountSheet } from "./delete-account.js";
+import { nextDefaultAccountName } from "../shared/ui/account-backup-status.js";
+import { forgetWallet as forgetAddressBook } from "./address-book.js";
+import { forgetAccount as forgetBell } from "./bell.js";
 
 let goHome = () => {};
 let goSettings = () => {};
@@ -110,11 +116,13 @@ export async function showWelcome() {
       <div class="buttons">
         <button id="create">${ICONS.plusCircle}<span>Create New Account</span></button>
         <button id="import" class="secondary">${ICONS.download}<span>Import Existing Account</span></button>
+        <button id="advanced" class="ghost advanced-create">Advanced: Create with a Passphrase</button>
       </div>
       ${appVersion ? `<p class="onboard-version">Version ${esc(appVersion)}</p>` : ""}
     </section>`, "accounts");
   $("#app-settings").onclick = () => goSettings({ appSettings: true, onBack: showWelcome });
-  $("#create").onclick = () => { createDraft = null; showCreate(); };
+  $("#create").onclick = createAccount;
+  $("#advanced").onclick = createWithPassphrase;
   $("#import").onclick = () => { importDraft = null; showImportSource(); };
   for (const button of app.querySelectorAll("[data-sign-in]")) {
     button.onclick = async () => {
@@ -138,7 +146,7 @@ export async function showWelcome() {
       subtitle: shortAddr(account.address),
       rows: [
         { label: "Rename", subtitle: "Gives this account a name of your own.", icon: ICONS.pencil, onClick: () => showRenameAccount(account) },
-        { label: "Delete", subtitle: "Removes this account and its local data from this browser.", icon: ICONS.trash, danger: true, onClick: () => confirmRemoveAccount(account, saved.length) },
+        { label: "Delete", subtitle: "Removes this account and its local data from this browser.", icon: ICONS.trash, danger: true, onClick: () => confirmRemoveAccount(account) },
       ],
     });
   }
@@ -167,36 +175,54 @@ function showRenameAccount(account) {
   };
 }
 
-function confirmRemoveAccount(account, count) {
-  showSheet({
-    title: "Remove Saved Account",
-    rows: [{
-      label: "Remove from Device",
-      subtitle: `Deletes ${account.name} (${shortAddr(account.address)}) and its local data from this browser.`,
-      icon: ICONS.trash,
-      danger: true,
-      onClick: async () => {
+/** The sign-in screen's Delete (iOS 99ab88a DeleteAccountSheet): the warning first, and an account
+ *  that still owes its backup says so. Signed out, there are no words open to show. */
+function confirmRemoveAccount(account) {
+  showDeleteAccountSheet({
+    confirmSubtitle: `Deletes ${account.name} (${shortAddr(account.address)}) and its local data from this browser.`,
+    notBackedUp: backupStatus.isPending(account.address),
+    onConfirm: () => passwordGate({
+      title: "Delete Account",
+      message: "Enter your wallet password to delete this account.",
+      verify: (password) => vault.verifyPassword(password),
+      onBack: showWelcome,
+      onUnlocked: async () => {
         try {
-          if (count <= 1) {
-            // The last account: nothing is left to seal, so the vault goes too.
-            await vault.resetWallet();
-            await setLoggedOut(false);
-          } else {
-            await vault.removeAccount(account.id);
-          }
-          // Both networks' data (iOS removeSavedAccount clears both encodings).
-          const keys = ["spending", "addresses", "cold", "portfolios", "portfolioFees"].map((k) => `kachat.${k}.${account.id}`);
-          await removeLocal([...keys, ...keys.map((k) => `${k}.testnet`)]);
-          await removeConnectionsFor(account.id);
-          await wallet.disconnect();
+          await deleteAccount(account.id, account.address);
           toast("Account removed.");
         } catch (error) {
           toast(error.message);
         }
         showWelcome();
       },
-    }],
+    }),
   });
+}
+
+/**
+ * Removes an account and everything kept for it in this browser (iOS removeSavedAccount): both
+ * networks' address caches, spending state, Cold Storage and portfolios, its website connections,
+ * its contacts and the bell's notifications (KaPay iOS 99ab88a), and what it owed a backup. The
+ * last account takes the vault with it.
+ */
+export async function deleteAccount(accountId, mainAddress) {
+  const view = await vault.readAccounts();
+  if (view.accounts.length <= 1) {
+    // nothing is left to seal, so the vault goes too, with every kachat.* record and the pages' storage
+    await vault.resetWallet();
+    await setLoggedOut(false);
+  } else {
+    await vault.removeAccount(accountId);
+    const keys = ["spending", "addresses", "cold", "portfolios", "portfolioFees"].map((k) => `kachat.${k}.${accountId}`);
+    await removeLocal([...keys, ...keys.map((k) => `${k}.testnet`)]);
+    if (mainAddress) {
+      await forgetAddressBook(mainAddress);
+      forgetBell(mainAddress);
+      backupStatus.forget(mainAddress);
+    }
+  }
+  await removeConnectionsFor(accountId);
+  await wallet.disconnect();
 }
 
 /** A typed-in recovery phrase runs the full Discover Addresses sweep - both chains - in the
@@ -210,6 +236,15 @@ async function discoverAfterRestore(account, accountId) {
   wallet.runPendingDiscovery(accountId);
 }
 
+/** Nobody has seen a created account's words yet, so it owes the backup steps; whoever imported one
+ *  has them, and its six months of Backup Hygiene start now (iOS AccountBackupStatus, 4f5dfd2). */
+async function noteBackupOwed(account) {
+  const address = await wallet.previewMainAddress(account.mnemonic, account.passphrase, account.family, account.identityIndex || 0);
+  if (!address) return;
+  if (account.imported) backupStatus.markConfirmed(address);
+  else backupStatus.markPending(address);
+}
+
 /**
  * The last step of create and import. The first account also chooses the wallet password;
  * after that, accounts go straight into the unlocked vault.
@@ -219,9 +254,9 @@ async function finishAccount(account, onBack, buttonLabel) {
     if (!(await vault.isUnlocked())) return showUnlock();
     try {
       const view = await vault.addAccount(account);
+      await noteBackupOwed(account);
       await markUsed(view.activeAccountId);
       await setLoggedOut(false);
-      createDraft = null;
       importDraft = null;
       noteActivity();
       goHome();
@@ -234,27 +269,60 @@ async function finishAccount(account, onBack, buttonLabel) {
   showSetPassword(account, onBack, buttonLabel);
 }
 
-// --- create account: iOS CreateWalletView + PassphraseOptionView, same steps and words ------
+// --- create account: one tap, or Advanced with a passphrase (KaPay iOS 99ab88a) -------------
 //
-//   1. Create a name for your wallet - the name, stored only on this device (iOS acd879b)
-//   2. Choose seed phrase length - 12 or 24 words as two buttons (c6bd716), the Important card,
-//      Generate Account
-//   3. Write Down Your Seed Phrase - tap to reveal, numbered grid (no copy, as on iOS), the
-//      "I have written down..." checkbox, Next
-//   4. Passphrase - the question (Yes / No / What is a passphrase?), the entry screen with the
-//      live address preview, and the explainer
-//   5. Wallet password - the one step iOS does not have: a browser has no Face ID or iOS
-//      keychain, so the phrase is sealed with a password instead (vault.js).
-// iOS then shows its Welcome Guide (chat setup); a wallet-only extension goes straight home.
+// Create New Account makes the account at once: 24 words, no passphrase, the next free name (My
+// Account, My Account 2 and on). "Advanced: Create with a Passphrase" (iOS CreateWalletView) is the
+// only other way: also 24 words, straight to the passphrase entry. Creating never shows the words:
+// the account is owed the backup steps (account-backup.js), and every tab says so until they're
+// done. The first account also chooses the wallet password, the one step iOS doesn't have: a
+// browser has no Face ID or iOS keychain, so the words are sealed with a password (vault.js).
 
-let createDraft = null;
-function freshCreateDraft() {
-  // Nothing preset: an empty name and no length picked - both are the user's choice.
-  return { wordCount: null, name: "", phrase: null, revealed: false, confirmed: false };
+let creating = false;
+
+/** The names saved accounts already have, for the next free default name. */
+async function takenAccountNames() {
+  if (!(await vault.hasVault()) || !(await vault.isUnlocked())) return [];
+  return ((await vault.readAccounts().catch(() => null))?.accounts || []).map((a) => a.name);
 }
 
-/** A name for the wallet, local to this device (iOS AccountNameForm) - Create Account's first
- *  step and Import Account's second. */
+async function createAccount() {
+  if (creating) return;
+  creating = true;
+  const button = $("#create");
+  if (button) { button.disabled = true; button.innerHTML = '<span class="spinner"></span><span>Create New Account</span>'; }
+  try {
+    const phrase = await wallet.newRecoveryPhrase(24);
+    const name = nextDefaultAccountName(await takenAccountNames());
+    await finishAccount({ mnemonic: phrase, passphrase: "", family: "kaspaStandard", name }, showWelcome, "Create Account");
+  } catch (error) {
+    // iOS "Couldn't Create Account"
+    toast(error.message || "Couldn't create the account.");
+    if (button) { button.disabled = false; button.innerHTML = `${ICONS.plusCircle}<span>Create New Account</span>`; }
+  } finally {
+    creating = false;
+  }
+}
+
+/** Advanced: a new 24-word phrase, then the passphrase entry; Back there is the accounts screen. */
+async function createWithPassphrase() {
+  let phrase;
+  try {
+    phrase = await wallet.newRecoveryPhrase(24);
+  } catch (error) {
+    toast(error.message || "Couldn't create the account.");
+    return;
+  }
+  const flow = { mode: "create", phrase, family: "kaspaStandard", onBack: showWelcome, onProceed: null };
+  flow.onProceed = async (passphrase) => finishAccount(
+    { mnemonic: phrase, passphrase, family: "kaspaStandard", name: nextDefaultAccountName(await takenAccountNames()) },
+    () => showPassphraseEntry(flow),
+    "Create Account",
+  );
+  showPassphraseEntry(flow);
+}
+
+/** A name for the wallet, local to this device (iOS AccountNameForm): Import Account's second step. */
 function showAccountName({ title, draft, onBack, onNext }) {
   render(`
     ${navHeader()}
@@ -268,7 +336,7 @@ function showAccountName({ title, draft, onBack, onNext }) {
         <input id="name" value="${esc(draft.name)}" placeholder="Enter account name" maxlength="40" autocomplete="off" autofocus />
       </form>
       <button id="next" ${draft.name.trim() ? "" : "disabled"}>Next</button>
-    </section>`, title === "Create Account" ? "create" : "import");
+    </section>`, "import");
   $("#back").onclick = onBack;
   const name = $("#name");
   const next = () => { if (draft.name.trim()) onNext(); };
@@ -277,36 +345,6 @@ function showAccountName({ title, draft, onBack, onNext }) {
   $("#next").onclick = next;
   name.focus();
 }
-
-/** Step 1: the account's name. */
-function showCreate() {
-  if (!createDraft) createDraft = freshCreateDraft();
-  if (createDraft.phrase) return showCreateSeed();
-  showAccountName({
-    title: "Create Account",
-    draft: createDraft,
-    onBack: () => { createDraft = null; showWelcome(); },
-    onNext: showCreateLength,
-  });
-}
-
-/** "What is a seed phrase?" (iOS dd0aab1 / 712bb4d SeedPhraseExplainerPage): a page, in the same
- *  headline-and-text sections as "What is a passphrase?". */
-function showSeedExplainer({ onBack }) {
-  const section = (title, body) => `<div class="explainer-section"><h3>${esc(title)}</h3><p class="muted small">${esc(body)}</p></div>`;
-  render(`
-    ${navHeader({ title: "What is a seed phrase?" })}
-    <section class="screen explainer">
-      ${section("The short version", "A seed phrase is a list of 12 or 24 ordinary words that works as the master key to your account. Your wallet, your chatting address and your messages all come from it.")}
-      ${section("Anyone with it can take everything", "Anyone who has these words can take everything in your account. If you lose them and lose this device, nobody can get your account back, not even KaPay.")}
-      ${section("How to keep it safe", "Write the words on paper, in order, and keep them somewhere safe and private. Never type them into a website, send them in a chat, or keep them in a screenshot or cloud notes.")}
-      ${section("12 or 24 words?", "12 words are already very secure. 24 words add even more protection.")}
-    </section>`, "create");
-  $("#back").onclick = onBack;
-}
-
-// SF Symbol questionmark.circle, for "What is this?".
-const QUESTION_MARK = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M9.6 9.3a2.5 2.5 0 0 1 4.8.9c0 1.7-2.4 2.3-2.4 3.8M12 17.2h.01"/></svg>';
 
 // The chosen length's mark, white on the filled button (iOS checkmark.circle.fill).
 const CHOSEN_MARK = '<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="#fff"/><path d="M7.5 12.5l3 3 6-6.5" fill="none" stroke="var(--kaspa)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -319,91 +357,12 @@ function lengthChoice(count, chosenCount) {
   </button>`;
 }
 
-/** Step 2: 12 or 24 words, and the warning that the seed phrase comes next. */
-function showCreateLength() {
-  const d = createDraft;
-  const choice = (count) => lengthChoice(count, d.wordCount);
-  render(`
-    ${navHeader()}
-    <section class="screen">
-      <h1 class="large-title">Create Account</h1>
-      <div class="field-group" role="radiogroup" aria-label="Choose seed phrase length">
-        <h2 class="step-title">Choose seed phrase length</h2>
-        ${choice(12)}
-        ${choice(24)}
-      </div>
-      <div class="callout warn">
-        <div class="callout-title">${ICONS.warning}<span>Important</span></div>
-        <p>The next screen shows your seed phrase. It is the only way to recover your account: write it down and store it securely, and make sure no one can see your screen.</p>
-      </div>
-      <p class="error" id="error"></p>
-      <button id="generate" class="with-icon" ${d.wordCount ? "" : "disabled"}>${ICONS.plusCircle}<span>Generate Account</span></button>
-      <button id="what" class="ghost with-icon what-button">${QUESTION_MARK}<span>What is this?</span></button>
-    </section>`, "create");
-  $("#back").onclick = showCreate;
-  $("#what").onclick = () => showSeedExplainer({ onBack: showCreateLength });
-  for (const option of app.querySelectorAll("[data-words]")) {
-    option.onclick = () => { d.wordCount = Number(option.dataset.words); showCreateLength(); };
-  }
-  $("#generate").onclick = async () => {
-    if (!d.wordCount) return;
-    const button = $("#generate");
-    button.disabled = true;
-    button.innerHTML = '<span class="spinner"></span><span>Generate Account</span>';
-    try {
-      d.phrase = await wallet.newRecoveryPhrase(d.wordCount);
-      d.revealed = false;
-      d.confirmed = false;
-      showCreateSeed();
-    } catch (error) {
-      $("#error").textContent = error.message;
-      button.disabled = false;
-      button.innerHTML = `${ICONS.plusCircle}<span>Generate Account</span>`;
-    }
-  };
-}
-
-function showCreateSeed() {
-  const d = createDraft;
-  const words = d.phrase.split(" ");
-  render(`
-    ${navHeader()}
-    <section class="screen">
-      <h1 class="large-title">Create Account</h1>
-      <div class="callout warn tinted">
-        <div class="callout-title">${ICONS.pencil}<span>Write Down Your Seed Phrase</span></div>
-        <p>Store this in a safe place. Anyone with these words can access your account.</p>
-      </div>
-      ${d.revealed
-        ? `<div class="seed-grid">${words.map((w, i) => `<div class="seed-word"><span class="n">${i + 1}.</span><span class="w">${esc(w)}</span></div>`).join("")}</div>`
-        : `<button class="reveal-box" id="reveal">${ICONS.eyeSlash}<span>Tap to reveal seed phrase</span></button>`}
-      <button class="checkline" id="confirm" role="checkbox" aria-checked="${d.confirmed}">
-        ${d.confirmed ? ICONS.checkSquare : ICONS.square}
-        <span>I have written down my seed phrase and stored it securely</span>
-      </button>
-      <button id="next" ${d.confirmed ? "" : "disabled"}>Next</button>
-    </section>`, "create");
-  // Back goes to the length step and the phrase goes with it: Generate Account makes a new one.
-  $("#back").onclick = () => { d.phrase = null; d.revealed = false; d.confirmed = false; showCreateLength(); };
-  const reveal = $("#reveal");
-  if (reveal) reveal.onclick = () => { d.revealed = true; showCreateSeed(); };
-  $("#confirm").onclick = () => { d.confirmed = !d.confirmed; showCreateSeed(); };
-  // One flow object, so Back from the password step returns to the same passphrase question.
-  const flow = { mode: "create", phrase: d.phrase, family: "kaspaStandard", onBack: showCreateSeed, onProceed: null };
-  flow.onProceed = (passphrase) => finishAccount(
-    { mnemonic: d.phrase, passphrase, family: "kaspaStandard", name: d.name.trim() },
-    () => showPassphraseQuestion(flow),
-    "Create Account",
-  );
-  $("#next").onclick = () => showPassphraseQuestion(flow);
-}
-
 // --- passphrase: iOS PassphraseOptionView ------------------------------------------------
 
 function showPassphraseQuestion(flow) {
   const title = flow.mode === "create"
     ? "Do you want to add a passphrase to your account?"
-    : "Did you create this seed with a passphrase?";
+    : "Did you create these words with a passphrase?";
   render(`
     ${navHeader({ title: "Passphrase" })}
     <section class="screen question">
@@ -424,14 +383,22 @@ function showPassphraseQuestion(flow) {
   $("#what").onclick = () => showPassphraseExplainer(flow);
 }
 
+/**
+ * The passphrase field, with the chatting address it produces and that address's balance updating
+ * underneath (KaPay iOS 99ab88a PassphraseAddressPreview): the only direct evidence that a
+ * passphrase opens a different account, and how someone importing tells they typed the right one.
+ * On import it checks the first 50 chatting addresses, picks the first with funds and lists any
+ * others to choose from (iOS 4f5dfd2); the import lands on the chosen one. Creating opens here
+ * (Advanced: Create with a Passphrase), so its Back is the accounts screen.
+ */
 function showPassphraseEntry(flow) {
   const create = flow.mode === "create";
   render(`
     ${navHeader({ title: "Passphrase" })}
-    <section class="screen">
+    <section class="screen passphrase-entry">
       <h2>${create ? "Choose your passphrase" : "Enter your passphrase"}</h2>
       <p class="muted">${create
-        ? "Write it down somewhere safe. Without it this account cannot be recovered, even with your seed phrase."
+        ? "Write it down somewhere safe. Without it this account cannot be recovered, even with your 12 or 24 words."
         : "It has to be exactly what you used before, including capital letters and spaces."}</p>
       <div class="secure-field">
         <input id="pp" type="password" placeholder="Passphrase" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus />
@@ -441,13 +408,16 @@ function showPassphraseEntry(flow) {
       <div class="preview">
         <div class="muted small">Your chatting address</div>
         <div class="preview-address" id="preview">Checking...</div>
-        <div class="muted small" id="preview-note">This is the account your seed phrase opens on its own.</div>
+        <div class="preview-balance"><span class="muted small">Balance</span><span id="preview-balance"><span class="spinner small-spin"></span></span></div>
+        <div class="small" id="preview-hint" hidden></div>
+        <div id="preview-found"></div>
+        <div class="muted small" id="preview-note">This is the account your 12 or 24 words open on their own.</div>
       </div>
       <p class="error" id="error"></p>
       <button id="continue" class="big" disabled>${create ? "Continue" : "Import"}</button>
     </section>`, "passphrase");
-  // iOS clears what was typed when you go back to the question.
-  $("#back").onclick = () => showPassphraseQuestion(flow);
+  // iOS clears what was typed when you go back.
+  $("#back").onclick = create ? flow.onBack : () => showPassphraseQuestion(flow);
   const pp = $("#pp");
   const pp2 = $("#pp2");
   let revealed = false;
@@ -457,20 +427,73 @@ function showPassphraseEntry(flow) {
     $("#eye").innerHTML = revealed ? ICONS.eyeSlash : ICONS.eye;
     $("#eye").setAttribute("aria-label", revealed ? "Hide passphrase" : "Show passphrase");
   };
-  // Address #0 for the passphrase as typed, on a short debounce (the derivation is PBKDF2).
+  const showBalance = (balanceSompi) => {
+    const holds = balanceSompi > 0n;
+    $("#preview-balance").innerHTML = `<span class="strong small ${holds ? "good-text" : ""}">${esc(wallet.formatKas(balanceSompi, 8))} KAS</span>`;
+    if (create) return;
+    const hint = $("#preview-hint");
+    hint.hidden = false;
+    hint.className = `small ${holds ? "good-text" : "warn-text"}`;
+    hint.textContent = holds
+      ? "This address holds funds, so this looks like the right account."
+      : "No funds on this address. If you expected funds here, check your passphrase.";
+  };
+  const showFound = (found) => {
+    const list = $("#preview-found");
+    if (!found || found.length < 2) { list.innerHTML = ""; return; }
+    list.innerHTML = `
+      <p class="muted small found-lead">We picked the first address with funds. Tap another if that's not the one you chat from.</p>
+      ${found.map((entry) => `
+        <button type="button" class="found-row" data-found="${entry.index}">
+          <span class="found-mark">${flow.chattingIndex === entry.index ? ICONS.circleCheck : ICONS.circle}</span>
+          <span class="found-text"><span class="small strong">Address #${entry.index}</span><span class="mono tiny muted">${esc(`${entry.address.slice(0, 14)}...${entry.address.slice(-6)}`)}</span></span>
+          <span class="small strong ${entry.balanceSompi > 0n ? "good-text" : "muted"}">${esc(wallet.formatKas(entry.balanceSompi, 8))} KAS</span>
+        </button>`).join("")}`;
+    for (const row of list.querySelectorAll("[data-found]")) {
+      row.onclick = () => select(found, found.find((entry) => entry.index === Number(row.dataset.found)));
+    }
+  };
+  const select = (found, entry) => {
+    flow.chattingIndex = entry.index;
+    $("#preview").textContent = entry.address;
+    showBalance(entry.balanceSompi);
+    showFound(found);
+  };
+  // Address #0 for the passphrase as typed, on a short debounce (the derivation is PBKDF2), then a
+  // further pause, so only the passphrase someone stopped typing is looked up.
   let previewTimer = null;
   let previewSeq = 0;
   const schedulePreview = () => {
     clearTimeout(previewTimer);
     const typed = pp.value;
+    flow.chattingIndex = 0;
     $("#preview-note").textContent = typed
       ? "A different passphrase gives a different address, and a different account."
-      : "This is the account your seed phrase opens on its own.";
+      : "This is the account your 12 or 24 words open on their own.";
+    $("#preview-balance").innerHTML = '<span class="spinner small-spin"></span>';
+    $("#preview-hint").hidden = true;
+    $("#preview-found").innerHTML = "";
     const seq = ++previewSeq;
     previewTimer = setTimeout(async () => {
       const address = await wallet.previewMainAddress(flow.phrase, typed, flow.family);
       if (seq !== previewSeq || !$("#preview")) return;
       $("#preview").textContent = address || "Checking...";
+      const failed = () => { $("#preview-balance").innerHTML = '<span class="muted small">Couldn\'t check</span>'; };
+      if (!address) return failed();
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      if (seq !== previewSeq) return;
+      if (!create) {
+        const found = await wallet.findChattingAddresses(flow.phrase, typed, flow.family);
+        if (seq !== previewSeq || !$("#preview")) return;
+        const first = found?.find((entry) => entry.balanceSompi > 0n) || found?.[0];
+        if (!first) return failed();
+        select(found, first);
+        return;
+      }
+      let balances = null;
+      try { balances = await wallet.balancesFor([address]); } catch { balances = null; }
+      if (seq !== previewSeq || !$("#preview")) return;
+      if (balances) showBalance(balances[address] ?? 0n); else failed();
     }, 250);
   };
   pp.oninput = () => { $("#continue").disabled = !pp.value; schedulePreview(); };
@@ -486,13 +509,13 @@ function showPassphraseEntry(flow) {
 
 function showPassphraseExplainer(flow) {
   const sections = [
-    ["The short version", "A passphrase is an extra word or sentence you add on top of your seed phrase. It is optional, and most people do not use one."],
-    ["It does not lock your account", "This is the part people get wrong. A passphrase does not put a password on your account. It opens a completely different account. Your seed phrase with no passphrase opens one account. The same seed phrase with the word \"apple\" opens another one. With \"banana\", another one again. Every passphrase is its own separate account, with its own address and its own balance."],
-    ["Why anyone bothers", "If someone finds your written seed phrase, they get the account it opens on its own. They do not get the one behind your passphrase, because they do not know there is one, and they could not guess it anyway."],
-    ["The catch", "There is no reset and no recovery. If you forget your passphrase, the account it opened is gone for good. Your seed phrase alone will not bring it back, and nobody can help you. Treat it exactly like the seed phrase itself: written down, somewhere safe, before you rely on it."],
+    ["The short version", "A passphrase is an extra word or sentence you add on top of your 12 or 24 words. It is optional, and most people do not use one."],
+    ["It does not lock your account", "This is the part people get wrong. A passphrase does not put a password on your account. It opens a completely different account. Your 12 or 24 words with no passphrase open one account. The same words with the word \"apple\" opens another one. With \"banana\", another one again. Every passphrase is its own separate account, with its own address and its own balance."],
+    ["Why anyone bothers", "If someone finds your written 12 or 24 words, they get the account those words open on their own. They do not get the one behind your passphrase, because they do not know there is one, and they could not guess it anyway."],
+    ["The catch", "There is no reset and no recovery. If you forget your passphrase, the account it opened is gone for good. Your 12 or 24 words alone will not bring it back, and nobody can help you. Treat it exactly like the words themselves: written down, somewhere safe, before you rely on it."],
     ["One more thing to know", "If you type the wrong passphrase, nothing will tell you. You will simply land in a different account, and it will look empty. That is not a bug and your money is not lost - it just means you are in the wrong account."],
     ["So do you need one?", flow.mode === "create"
-      ? "If you are not sure, choose No. Your account is still protected by your seed phrase, and you can always create another account with a passphrase later."
+      ? "If you are not sure, choose No. Your account is still protected by your 12 or 24 words, and you can always create another account with a passphrase later."
       : "If you never set one up, choose No. A passphrase is something you would have typed in on purpose, so if this is the first you are hearing of it, you do not have one."],
   ];
   render(`
@@ -550,8 +573,8 @@ function showImportSource() {
     <section class="screen import-source">
       <div class="source-head">
         <span class="source-head-icon">${ICONS.wallet}</span>
-        <h2>Where is this seed phrase from?</h2>
-        <p class="muted">Different wallets store your Kaspa on different address paths. Pick where this seed phrase comes from so KaPay finds your funds and domains.</p>
+        <h2>Where are your 12 or 24 words from?</h2>
+        <p class="muted">Different wallets store your Kaspa on different address paths. Pick where these words come from so KaPay finds your funds and domains.</p>
       </div>
       <div class="source-list" role="radiogroup" aria-label="Wallet">
         ${IMPORT_SOURCES.map((source) => `
@@ -593,9 +616,9 @@ function showImportLength() {
     ${navHeader()}
     <section class="screen">
       <h1 class="large-title">Import Account</h1>
-      <div class="field-group" role="radiogroup" aria-label="Choose seed phrase length">
-        <h2 class="step-title">Choose seed phrase length</h2>
-        <p class="muted small">How many words is the seed phrase you're importing?</p>
+      <div class="field-group" role="radiogroup" aria-label="Choose 12 or 24 words">
+        <h2 class="step-title">Choose 12 or 24 words</h2>
+        <p class="muted small">How many words are you importing?</p>
         ${lengthChoice(12, d.wordCount)}
         ${lengthChoice(24, d.wordCount)}
       </div>
@@ -626,9 +649,9 @@ function parsePastedPhrase(text) {
     .map((t) => t.replace(/[.)]+$/, ""))
     .filter((t) => t && !/^\d+$/.test(t));
   if (!tokens.length) throw new Error("Nothing to paste.");
-  if (tokens.length !== 12 && tokens.length !== 24) throw new Error(`A recovery phrase is 12 or 24 words - the clipboard holds ${tokens.length}.`);
+  if (tokens.length !== 12 && tokens.length !== 24) throw new Error(`You need 12 or 24 words - the clipboard holds ${tokens.length}.`);
   const unknown = tokens.filter((t) => !isBip39Word(t));
-  if (unknown.length) throw new Error(`Not a recovery phrase word: ${unknown.slice(0, 3).join(", ")}.`);
+  if (unknown.length) throw new Error(`Not one of the 12 or 24 words: ${unknown.slice(0, 3).join(", ")}.`);
   return tokens;
 }
 
@@ -640,7 +663,7 @@ function showImportWords() {
     ${navHeader({ title: "Import Account" })}
     <section class="screen import-words">
       <div class="words-head">
-        <span>Enter your recovery phrase</span>
+        <span>Enter your 12 or 24 words</span>
         <button class="mini-button" id="paste" type="button">${ICONS.clipboard}<span>Paste</span></button>
         <span class="words-count ${count && valid === count ? "good" : ""}" id="count">${count ? `${valid}/${count}` : ""}</span>
       </div>
@@ -653,7 +676,7 @@ function showImportWords() {
             </label>`).join("")}
         </div>
         <div class="suggest" id="suggest" aria-label="Suggestions"></div>`
-        : '<p class="muted small">Choose 12 or 24 words, or paste your recovery phrase.</p>'}
+        : '<p class="muted small">Choose 12 or 24 words, or paste them.</p>'}
       <p class="error" id="error"></p>
       <button id="continue" class="with-icon" ${canImport(d) ? "" : "disabled"}>${ICONS.arrowRightCircle}<span>Continue</span></button>
     </section>`, "import");
@@ -769,13 +792,14 @@ function showImportWords() {
     try {
       phrase = await wallet.validateRecoveryPhrase(d.words.slice(0, d.wordCount).join(" "));
     } catch {
-      $("#error").textContent = "This recovery phrase is invalid. Double-check the words - the last word encodes a checksum, so one wrong word fails validation.";
+      $("#error").textContent = "These words are invalid. Double-check the words - the last word encodes a checksum, so one wrong word fails validation.";
       button.disabled = false;
       return;
     }
-    const flow = { mode: "import", phrase, family: d.family, onBack: showImportWords, onProceed: null };
+    const flow = { mode: "import", phrase, family: d.family, chattingIndex: 0, onBack: showImportWords, onProceed: null };
     flow.onProceed = (passphrase) => finishAccount(
-      { mnemonic: phrase, passphrase, family: d.family, name: d.name.trim(), imported: true },
+      // the address the passphrase step found or was told (KaPay iOS 4f5dfd2); No is address #0
+      { mnemonic: phrase, passphrase, family: d.family, name: d.name.trim(), imported: true, identityIndex: passphrase ? flow.chattingIndex : 0 },
       () => showPassphraseQuestion(flow),
       "Import Account",
     );
@@ -789,7 +813,7 @@ function showSetPassword(account, onBack, buttonLabel = "Create Account") {
     ${navHeader({ title: "Wallet Password" })}
     <section class="screen">
       <h2>Set a wallet password</h2>
-      <p class="muted">This password unlocks KaPay in this browser and keeps your seed phrase encrypted on this computer. It can't recover your account - only your seed phrase can.</p>
+      <p class="muted">This password unlocks KaPay in this browser and keeps your 12 or 24 words encrypted on this computer. It can't recover your account - only your 12 or 24 words can.</p>
       <input id="pw" type="password" autocomplete="new-password" placeholder="Password (at least ${vault.MIN_PASSWORD_LENGTH} characters)" aria-label="Password" autofocus />
       <input id="pw2" type="password" autocomplete="new-password" placeholder="Re-enter password" aria-label="Re-enter password" />
       <p class="error" id="error"></p>
@@ -808,9 +832,9 @@ function showSetPassword(account, onBack, buttonLabel = "Create Account") {
     button.innerHTML = '<span class="spinner"></span> Encrypting…';
     try {
       const view = await vault.createVault(pw, account);
+      await noteBackupOwed(account);
       await markUsed(view.activeAccountId);
       await setLoggedOut(false);
-      createDraft = null;
       importDraft = null;
       noteActivity();
       goHome();
@@ -861,8 +885,8 @@ function showReset() {
   render(`
     <header class="topbar"><button class="icon" id="back" aria-label="Back">${ICONS.back}</button><div class="title">Reset wallet</div></header>
     <section class="screen">
-      <p>Without the password, the only way back in is your recovery phrase.</p>
-      <p class="muted">Resetting removes KaPay's data from this browser. Your Kaspa stays on the network - import your recovery phrase afterwards to get it back. If you don't have the phrase, resetting loses access for good.</p>
+      <p>Without the password, the only way back in is your 12 or 24 words.</p>
+      <p class="muted">Resetting removes KaPay's data from this browser. Your Kaspa stays on the network - import your 12 or 24 words afterwards to get it back. If you don't have them, resetting loses access for good.</p>
       <label class="field">Type RESET to confirm
         <input id="confirm" autocomplete="off" autocapitalize="characters" />
       </label>

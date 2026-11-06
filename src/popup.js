@@ -14,7 +14,7 @@ import { showRequestPayment } from "./request-payment.js";
 import { loadOwnAddresses } from "./own-addresses.js";
 import { showManageAddress, showManageAddresses, openSpendingAddress } from "./manage.js";
 import { cachedOwnedNames, ownedNames, otherNamesCount } from "./names.js";
-import { showWelcome, showUnlock, enterApp, setHandlers, setLoggedOut } from "./onboarding.js";
+import { showWelcome, showUnlock, enterApp, setHandlers, setLoggedOut, deleteAccount } from "./onboarding.js";
 import { showDomains } from "./domains.js";
 import { showKachatMarket } from "./market.js";
 import { watchRegistrations, scheduleLapse, showLiveNameDetail } from "./kachat-live.js";
@@ -26,21 +26,19 @@ import { cachedOwnedCount } from "./kachat-owned-cache.js";
 // Amount fields show thousands commas as you type ("12,345.5"), the value underneath plain (iOS 40c5258).
 installGroupedAmountInputs();
 import { startKachatNamesNotifier } from "./kachat-notifier.js";
-import { kachatLive, kachatNames, kachatLabelOf, forgetKachatSigner, kachatSocial, ownKachatProfile } from "./kachat-names.js";
-import { showKachatProfileEditor } from "./kachat-profile.js";
+import { kachatLive, kachatNames, forgetKachatSigner } from "./kachat-names.js";
 import { KachatNamesRegistry } from "../shared/engine/kachat-names/registry.js";
 import { faucetCardHtml, startFaucetClaim, noteFaucetBalance, faucetPending } from "./faucet.js";
-import { showSettings, showLicenses } from "./settings.js";
+import { showSettings } from "./settings.js";
+import { setBackupContext, backupBannerHtml, bindBackupBanner, hygieneCardHtml, bindHygieneCard } from "./account-backup.js";
 import { showApproval } from "./approve.js";
 import { confirmSpend } from "./spend-auth.js";
 
 // The password before every KAS you send (KaChat-Desktop Build 228): the prompt every send asks.
 wallet.setSpendAuthorizer(confirmSpend);
 import * as dock from "./dock.js";
-import { NETWORK, NETWORK_MIRROR_KEY, IS_TESTNET, syncNetworkMirror, toActiveNetworkAddress } from "./net.js";
+import { NETWORK, NETWORK_MIRROR_KEY, IS_TESTNET, syncNetworkMirror } from "./net.js";
 
-/** KaChat's donation address, pinned (iOS 8bc86f8): the address kachat.kas has always paid. */
-const DONATION_ADDRESS = "kaspa:qzy7da4589avjwmmnqfvkhp5p8p268gc7rvr9lg2xxpuhj75sy8kgdqmpd2fu";
 import { showColdStorage, coldWatchAddresses } from "./cold.js";
 import { showPortfolio } from "./portfolio.js";
 import { showCameraPermissionPage } from "./camera.js";
@@ -78,7 +76,7 @@ dock.registerTab("portfolio", () => showPortfolio());
 // the .kachat marketplace, its own tab right of Wallet
 dock.registerTab("kachat", () => showKachatMarket());
 // Settings as a dock tab (iOS 040f91a SettingsView(isDockTab: true)): no Back, Log Out last.
-dock.registerTab("settings", () => showSettings({ isDockTab: true, onLogOut: confirmLogOut }));
+dock.registerTab("settings", () => showSettings({ isDockTab: true, onLogOut: confirmLogOut, onDelete: deleteCurrentAccount }));
 // A contact's Send KAS: Send Kaspa from the chatting address, to the saved address.
 addressBook.setAddressBookSend((address, onClose) => {
   const main = homeState?.addresses?.main;
@@ -109,16 +107,17 @@ ext?.storage?.onChanged?.addListener((changes, area) => {
 
 // --- home: KaPay iOS's Wallet tab -----------------------------------------------------------
 //
-// Section for section as ProfileView lays it out: the toolbar (connection dot, balance in the
-// middle, the bell, then lock and expand), the pinned "Wallet" title with the share button
-// (iOS 1314382), then account name, profile hero, the two QR buttons, Manage Addresses, Your
-// Domains, Contacts (iOS 040f91a / 8118f09) and About; the floating up/down arrow, bottom right,
-// opens Send and Receive (iOS 6d4bf75 / 5bab351). Settings and Log Out are the Settings tab's
-// now (iOS 040f91a). Help is left out: its only guide is the .kachat names guide.
+// Section for section as ProfileView lays it out since KaPay iOS 953b255, KaChat's Wallet tab: the
+// toolbar (connection dot, the whole hot wallet's balance in the middle, the bell, then expand and
+// lock), the backup banner while it's owed and the pinned "Wallet" title; then the total balance
+// split into chatting and spending (WalletBalanceCard), Send, Receive and Request, Backup Hygiene
+// when it's due, the Manage Addresses and Chatting Address squares, Your Domains and Contacts. No
+// profile card, share button or floating arrows: a profile belongs to KaChat and KaPost. About and
+// the account's name are in Settings. Help is left out: its only guide is the .kachat names guide.
+// Swap (ChangeNOW, KaChat-Desktop Build 217) has no place in KaPay iOS; it stays here, a fourth
+// button beside Request, so it is still reachable.
 //
-// No Create / Edit KNS Profile: profile creation is moving to .kachat names, which do not exist
-// yet. Like iOS (5.2), only a .kas domain's NAME is read - no avatar, banner or bio: full
-// profiles will come from .kachat. Your Domains counts .kas, .k and .kaspa names together.
+// Your Domains counts .kachat, .kas, .k and .kaspa names together.
 
 let homeState = null;
 
@@ -151,10 +150,11 @@ async function showHome() {
     otherNames: cached?.main ? cachedOwnedNames(cached.main) : null,
     // the saved .kachat list's count at once; the registry read corrects it (iOS f4f5c0f)
     kachatCount: kachatLive && cached?.main ? cachedOwnedCount(cached.main) ?? 0 : 0,
+    price: wallet.cachedPrice(currency),
     connection: "busy",
-    editingName: false,
     error: "",
   };
+  noteBackupContext(homeState);
   paintHome();
   refreshHome();
 }
@@ -196,38 +196,21 @@ function bindGraceBanner(s) {
   };
 }
 
-function spendingTotal(balances) {
-  if (!balances) return null;
-  return Object.values(balances.spending || {}).reduce((sum, value) => sum + BigInt(value || 0n), 0n);
-}
-
-function profileLinkFor(address) {
-  return `https://kachat.app/u/${String(address || "").replace(/^kaspa:/, "")}`;
-}
-
 function paintHome() {
   const s = homeState;
   if (!s) return;
   const main = s.addresses?.main || null;
-  const primary = s.addresses?.spending?.[s.spending.activeIndex] || null;
-  const mainSompi = s.balances?.main;
-  const primarySompi = s.balances ? (s.balances.spending[s.spending.activeIndex] ?? 0n) : null;
-  const totalSpending = spendingTotal(s.balances);
   const kns = s.kns || {};
-  // What other people see you as (iOS profileHeroSection): your .kachat name once you have one
-  // (live on testnet: your primary name while active, else your oldest active name), else your
-  // short address - never the account name (your own label), and since 5.2 not your .kas name
-  // either (that is managed in Your Domains).
-  const kachatName = kachatLive && s.kachatLabel ? `${s.kachatLabel}.kachat` : null;
-  // The address profile (avatar, banner and bio looked up from its social links) - every network
-  // (iOS d36fc42); the .kachat label only where names are live.
-  const social = s.kachatSocial || {};
-  const displayName = kachatName || shortIdentity(main);
   // Every name the account owns: .kachat (iOS 10e4a1a - 0 where the registry isn't launched), KNS,
   // .k and .kaspa.
   const domainCount = kns.known ? (s.kachatCount || 0) + kns.domainCount + otherNamesCount(s.otherNames) : null;
-  const created = s.account.createdAt ? new Date(s.account.createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "—";
-  const version = ext?.runtime?.getManifest?.().version || "";
+  // Both parts or a dash: a total missing one of them would read as the whole balance (iOS
+  // HotWalletBalance). The total counts hidden addresses too, Cold Storage not.
+  const totalSompi = s.balances?.total ?? null;
+  const chattingSompi = s.balances?.main ?? null;
+  const spendingSompi = s.balances ? s.balances.total - s.balances.main : null;
+  // what the total is worth in your currency; testnet coins aren't worth anything
+  const fiat = totalSompi != null && !IS_TESTNET ? wallet.formatFiat(totalSompi, s.price) : "";
 
   render(`
     <div class="profile">
@@ -235,7 +218,7 @@ function paintHome() {
         ${connectionDot(s.connection)}
         <button class="toolbar-balance" id="balance" aria-label="Copy balance">
           <img src="icons/kaspa-logo.png" alt="" />
-          <span>${mainSompi != null ? esc(wallet.formatKas(mainSompi, 8)) : "--"} KAS</span>
+          <span>${totalSompi != null ? esc(wallet.formatKas(totalSompi, 8)) : "--"} KAS</span>
         </button>
         <div class="toolbar-right">
           ${bell.bellButtonHtml()}
@@ -243,118 +226,73 @@ function paintHome() {
           <button class="icon" id="lock" aria-label="Lock" title="Lock">${ICONS.lock}</button>
         </div>
       </header>
-      <div class="profile-title">
-        <h1>Wallet</h1>
-        <button class="share-circle" id="share" aria-label="Share your profile" title="Copy your profile link" ${main ? "" : "disabled"}>${ICONS.share}</button>
-      </div>
+      ${backupBannerHtml()}
+      <div class="profile-title"><h1>Wallet</h1></div>
       <section class="profile-body">
-        <div class="account-row">
-          ${s.editingName
-            ? `<input id="account-name" value="${esc(s.account.name)}" maxlength="40" aria-label="Account name" autofocus />
-               <button class="icon plain" id="save-name" aria-label="Save name">${ICONS.checkCircle}</button>`
-            : `<span class="account-name">${esc(s.account.name)}</span>
-               <button class="icon plain" id="edit-name" aria-label="Rename account">${ICONS.pencilCircle}</button>`}
-        </div>
-
         ${graceBannerHtml(s)}
-        <div class="glass hero">
-          ${social.banner
-            ? `<div class="fit-banner" style="--placeholder: 140px"><img src="${esc(social.banner)}" alt="" referrerpolicy="no-referrer" /></div>`
-            : '<div class="banner gradient"></div>'}
-          <div class="hero-row">
-            ${social.avatar
-              ? `<div class="avatar"><img src="${esc(social.avatar)}" alt="" referrerpolicy="no-referrer" /></div>`
-              : `<div class="avatar avatar-glyph">${ICONS.person}</div>`}
-            <button class="hero-edit" id="edit-kachat-profile">Edit KaChat Profile</button>
+        <div class="wallet-balance-card">
+          <div class="wallet-balance-head">
+            <span class="muted">Total Balance</span>
+            <button class="wallet-balance-total" id="total-balance" aria-label="Copy balance">${totalSompi != null ? `${esc(wallet.formatKas(totalSompi, 8))} KAS` : "--"}</button>
+            ${fiat ? `<span class="muted">${esc(fiat)}</span>` : ""}
           </div>
-          <div class="hero-text">
-            <div class="hero-name">${esc(displayName)}</div>
-            ${social.bio ? `<div class="hero-bio muted small">${esc(social.bio)}</div>` : ""}
-            ${social.linktree ? `<a class="hero-link" href="${esc(social.linktree)}" target="_blank" rel="noopener noreferrer">${ICONS.link || ""}<span>${esc(social.linktree.replace("https://", ""))}</span></a>` : ""}
+          <div class="wallet-balance-parts">
+            <div><span class="muted tiny">Chatting</span><span class="strong small mono-digits">${chattingSompi != null ? `${esc(wallet.formatKas(chattingSompi, 8))} KAS` : "--"}</span></div>
+            <div><span class="muted tiny">Spending</span><span class="strong small mono-digits">${spendingSompi != null ? `${esc(wallet.formatKas(spendingSompi, 8))} KAS` : "--"}</span></div>
           </div>
         </div>
-
-        <div class="qr-buttons">
-          <button class="qr-button" id="receive" ${primary ? "" : "disabled"}>
-            <span class="qr-circle">${ICONS.qrBig}</span><span>Receive Kaspa</span>
-          </button>
-          <button class="qr-button" id="chatting-qr" ${main ? "" : "disabled"}>
-            <span class="qr-circle">${ICONS.qrBig}</span><span>Chatting Address</span>
-          </button>
+        <div class="wallet-actions">
+          ${actionButton("send", "Send", ACTION.send)}
+          ${actionButton("receive", "Receive", ACTION.receive)}
+          ${actionButton("request", "Request", ACTION.request)}
+          ${actionButton("swap", "Swap", ACTION.swap)}
         </div>
-
+        ${hygieneCardHtml()}
         ${IS_TESTNET && main ? faucetCardHtml(main) : ""}
-        <!-- One card for every address of this account (iOS 6333dd3): it opens Manage Addresses;
-             which address a send comes from is picked on the send screen (From). -->
-        <button class="glass nav-row manage-card" id="manage-addresses">
-          <span class="nav-row-label">${ICONS.list || ICONS.wallet}<span class="manage-text"><span>Manage Addresses</span>${s.balances ? `<span class="muted tiny">${esc(wallet.formatKas(s.balances.total, 8))} KAS</span>` : ""}</span></span>${ICONS.chevron}
-        </button>
-
+        <!-- Which address a send comes from is picked on the send screen (From), so this tab
+             doesn't split Main from Spending or have a "primary". -->
+        <div class="address-squares">
+          <button class="address-square" id="manage-addresses"><span class="address-square-icon">${SQUARE.list}</span><span>Manage Addresses</span></button>
+          <button class="address-square" id="chatting-qr" ${main ? "" : "disabled"}><span class="address-square-icon">${SQUARE.qr}</span><span>Chatting Address</span></button>
+        </div>
         <button class="glass nav-row" id="domains">
           <span class="nav-row-label">${ICONS.at}<span>Your Domains</span></span>
           <span class="nav-row-value">${domainCount != null ? esc(String(domainCount)) : ""}</span>${ICONS.chevron}
         </button>
         <button class="glass nav-row" id="address-book">
-          <span class="nav-row-label">${addressBook.CONTACTS_ICON}<span>Contacts</span></span>
-          <span class="nav-row-value">${addressBook.addressBookEntries().length || ""}</span>${ICONS.chevron}
+          <span class="nav-row-label">${addressBook.CONTACTS_ICON}<span>Contacts</span></span>${ICONS.chevron}
         </button>
-
-        <div class="section-header">About</div>
-        <div class="glass list">
-          <div class="list-row"><span>Created</span><span class="muted">${esc(created)}</span></div>
-          <div class="list-row"><span>Version</span><span class="muted">${esc(version)}</span></div>
-          <a class="list-row" href="https://home.kachat.app" target="_blank" rel="noopener noreferrer"><span>Website</span><span class="muted">home.kachat.app</span></a>
-          <a class="list-row" href="mailto:kaspasilver@gmail.com"><span>Support Email</span><span class="muted">kaspasilver@gmail.com</span></a>
-          <button class="list-row" id="donate"><span>Donate</span><span class="muted">kachat.kachat</span></button>
-          <button class="list-row" id="licenses"><span>Open Source Licenses</span>${ICONS.chevron}</button>
-        </div>
-        <!-- room to scroll the last row out from under the floating button -->
-        <div class="fab-room"></div>
       </section>
-      <button class="fab" id="send-receive" aria-label="Send and Receive" title="Send and Receive" ${main ? "" : "disabled"}>${ARROW_UP_DOWN}</button>
     </div>`, "home");
 
   $("#dot").onclick = () => toast(s.connection === "ok" ? `Connected to ${wallet.connectedNodeUrl().replace(/^wss:\/\//, "")}` : s.connection === "bad" ? "Can't reach a Kaspa node - retrying" : "Connecting to the Kaspa network…");
-  $("#balance").onclick = () => { if (mainSompi != null) copyText(wallet.formatKas(mainSompi, 8), "Balance"); };
+  const copyBalance = () => { if (totalSompi != null) copyText(wallet.formatKas(totalSompi, 8), "Balance"); };
+  $("#balance").onclick = copyBalance;
+  $("#total-balance").onclick = copyBalance;
   $("#lock").onclick = lockWallet;
   $("#bell").onclick = openBell;
   bindGraceBanner(s);
+  bindBackupBanner(showHome);
+  bindHygieneCard(showHome);
   const expand = $("#expand");
   if (expand) expand.onclick = async () => { await ext.tabs.create({ url: ext.runtime.getURL("popup.html?view=tab") }); window.close(); };
-  if (main) $("#share").onclick = () => copyText(profileLinkFor(main), "Profile link");
-
-  if (s.editingName) {
-    const input = $("#account-name");
-    const commit = async () => {
-      const name = input.value.trim();
-      s.editingName = false;
-      if (name && name !== s.account.name) {
-        const view = await vault.renameAccount(s.account.id, name);
-        s.account = view.accounts.find((a) => a.id === s.account.id) || s.account;
-        toast("Account renamed.");
-      }
-      paintHome();
-    };
-    $("#save-name").onclick = commit;
-    input.onkeydown = (event) => { if (event.key === "Enter") commit(); if (event.key === "Escape") { s.editingName = false; paintHome(); } };
-    input.select();
-  } else {
-    $("#edit-name").onclick = () => { s.editingName = true; paintHome(); };
-  }
 
   // Receive hands out a never-used address (iOS ReceiveKaspaQRView over freshReceiveAddress):
   // "Preparing a fresh address" while it is worked out, then the white QR page with the
-  // address's balance in the bar.
-  if (primary) $("#receive").onclick = () => openReceive(showHome);
+  // address's balance in the bar. Each comes back to the Wallet tab.
+  const back = () => dock.returnToTab();
+  $("#send").onclick = () => { if (main) showSend({ source: { kind: "main" }, fromAddress: main, navTitle: "Send Kaspa", onClose: back }); };
+  $("#receive").onclick = () => openReceive(back);
+  $("#request").onclick = () => showRequestPayment();
+  // ChangeNOW Swap (KaChat-Desktop Build 217)
+  $("#swap").onclick = () => import("./swaps.js").then((m) => m.showSwap());
   if (main) $("#chatting-qr").onclick = () => openChattingQr(s, paintHome);
-  const mainSource = { kind: "main" };
   $("#manage-addresses").onclick = () => showManageAddresses({
     onBack: showHome,
     onChangeIdentity: s.account.imported ? () => { homeState = null; showHome(); } : null,
   });
   $("#address-book").onclick = () => addressBook.showAddressBook({ onBack: showHome });
   $("#domains").onclick = () => { if (main) showDomains({ address: main, onBack: showHome, atCards: true }); };
-  $("#edit-kachat-profile").onclick = () => showKachatProfileEditor({ onSaved: () => refreshHome() });
   // Claim Testnet Kaspa (testnet only): the faucet opens in a tab; a wallet open in its own tab
   // watches the chatting balance for a minute, the popup checks it next time it opens.
   const faucet = $("#faucet");
@@ -368,13 +306,25 @@ function paintHome() {
       if (!faucetPending(main)) return;
     }
   };
-  $("#send-receive").onclick = openSendReceive;
-  // iOS Donate (8bc86f8, IOS-067): the Send screen with KaChat's pinned donation address - the one
-  // kachat.kas has always paid, its kaspatest: form on testnet. Not the name: .kachat names are
-  // first-come, so resolving kachat.kachat would pay whoever registered it.
-  $("#donate").onclick = () => { if (main) showSend({ source: mainSource, fromAddress: main, recipient: toActiveNetworkAddress(DONATION_ADDRESS), title: "Donate to KaChat", onClose: showHome }); };
-  $("#licenses").onclick = () => showLicenses({ onBack: showHome });
 }
+
+/** One of Send, Receive and Request (iOS walletActionButton): a filled accent circle, its name under. */
+function actionButton(id, title, icon) {
+  return `<button class="wallet-action" id="${id}"><span class="wallet-action-circle">${icon}</span><span>${esc(title)}</span></button>`;
+}
+const stroke = (body, size = 24) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
+// arrow.up / arrow.down / doc.text, and Swap's arrows
+const ACTION = {
+  send: stroke('<path d="M12 19V5M6 11l6-6 6 6"/>'),
+  receive: stroke('<path d="M12 5v14M6 13l6 6 6-6"/>'),
+  request: stroke('<path d="M14 3.5H7.4A1.9 1.9 0 0 0 5.5 5.4v13.2a1.9 1.9 0 0 0 1.9 1.9h9.2a1.9 1.9 0 0 0 1.9-1.9V8Z"/><path d="M14 3.5V8h4.5M9 13h6M9 16.5h4"/>', 22),
+  swap: stroke('<path d="M4 8h15M15 4l4 4-4 4"/><path d="M20 16H5M9 12l-4 4 4 4"/>', 22),
+};
+// list.bullet.rectangle / qrcode
+const SQUARE = {
+  list: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="4" width="19" height="16" rx="2.5"/><path d="M10 9h7.5M10 12h7.5M10 15h7.5"/><circle cx="6.5" cy="9" r=".6" fill="currentColor"/><circle cx="6.5" cy="12" r=".6" fill="currentColor"/><circle cx="6.5" cy="15" r=".6" fill="currentColor"/></svg>',
+  qr: ICONS.qrBig,
+};
 
 /** Settings' last row (iOS 040f91a): a half sheet with the consequence beside the action. */
 function confirmLogOut() {
@@ -388,6 +338,23 @@ function confirmLogOut() {
       onClick: logOut,
     }],
   });
+}
+
+/** Delete Account, once the password confirmed it (KaPay iOS 99ab88a deleteCurrentAccount): the
+ *  account and everything kept for it go, and the sign-in screen comes up. */
+async function deleteCurrentAccount(accountId, main) {
+  dock.enableDock(false);
+  homeState = null;
+  forgetKachatSigner();
+  try {
+    await deleteAccount(accountId, main);
+    toast("Account deleted.");
+  } catch (error) {
+    toast(error.message);
+  }
+  // Signed out: the next account is picked on the sign-in screen, as after Log Out.
+  if (await vault.hasVault()) await setLoggedOut(true);
+  showWelcome();
 }
 
 // iOS Log Out: back to the accounts screen, where you pick an account (or add one). The vault
@@ -409,19 +376,6 @@ async function lockWallet() {
   await wallet.disconnect();
   showUnlock();
 }
-
-/** iOS Contact.generateDefaultAlias: "kaspa:" + the first 4 and last 4 of the address body. */
-function shortIdentity(address) {
-  const text = String(address || "");
-  const colon = text.indexOf(":");
-  if (colon < 0) return text || "…";
-  const prefix = text.slice(0, colon);
-  const body = text.slice(colon + 1);
-  return body.length > 12 ? `${prefix}:${body.slice(0, 4)}....${body.slice(-4)}` : text;
-}
-
-// SF Symbol arrow.up.arrow.down: the Wallet tab's floating button (iOS 5bab351).
-const ARROW_UP_DOWN = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 20V5M4 9l4-4 4 4M16 4v15M12 15l4 4 4-4"/></svg>';
 
 // Receive hands out a never-used address (iOS ReceiveKaspaQRView over freshReceiveAddress):
 // "Preparing a fresh address" while it is worked out, then the white QR page with the
@@ -455,62 +409,6 @@ async function openChattingQr(s, onBack) {
     onBack,
   });
 }
-
-/** The Wallet tab's floating up/down arrow (iOS 5bab351 walletActionsSheet): Send Kaspa, Receive
- *  Kaspa, Request Payment. Each screen it opens comes back to the Wallet tab. Fund Chatting
- *  Address left with the dock's "+": funding it is the Chatting Address QR button beside Receive,
- *  as on iOS. Swap (ChangeNOW, KaChat-Desktop Build 217) has no place in KaPay iOS; it stays here,
- *  the fourth tile, so it is still reachable. */
-function openSendReceive() {
-  const s = homeState;
-  const main = s?.addresses?.main;
-  if (!main) return;
-  const back = () => dock.returnToTab();
-  showWalletActions({
-    send: () => showSend({ source: { kind: "main" }, fromAddress: main, navTitle: "Send Kaspa", onClose: back }),
-    receive: () => openReceive(back),
-    request: () => showRequestPayment(),
-    // ChangeNOW Swap (KaChat-Desktop Build 217)
-    swap: () => import("./swaps.js").then((m) => m.showSwap()),
-  });
-}
-const TILE = {
-  swap: '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h15M15 4l4 4-4 4"/><path d="M20 16H5M9 12l-4 4 4 4"/></svg>',
-  // arrow.up.circle / arrow.down.circle / doc.text
-  send: '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M12 16.5v-9M8 11l4-4 4 4"/></svg>',
-  receive: '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M12 7.5v9M8 13l4 4 4-4"/></svg>',
-  request: '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3.5H7.4A1.9 1.9 0 0 0 5.5 5.4v13.2a1.9 1.9 0 0 0 1.9 1.9h9.2a1.9 1.9 0 0 0 1.9-1.9V8Z"/><path d="M14 3.5V8h4.5M9 13h6M9 16.5h4"/></svg>',
-};
-
-/** The Send and Receive half sheet: the wallet actions as tiles (iOS WalletActionTile). */
-function showWalletActions(actions) {
-  document.querySelector(".wallet-plus-backdrop")?.remove();
-  const backdrop = document.createElement("div");
-  backdrop.className = "sheet-backdrop wallet-plus-backdrop";
-  const tile = (id, title, hint, icon) => `<button class="wallet-tile" data-tile="${id}" title="${esc(hint)}"><span class="accent">${icon}</span><span class="small strong">${esc(title)}</span></button>`;
-  backdrop.innerHTML = `
-    <div class="sheet wallet-plus-sheet" role="dialog" aria-modal="true" aria-label="Send and Receive">
-      <div class="sheet-grabber"></div>
-      <div class="sheet-title center-text">Send and Receive</div>
-      <div class="wallet-tiles">
-        ${tile("send", "Send Kaspa", "Send Kaspa from any of your addresses.", TILE.send)}
-        ${tile("receive", "Receive Kaspa", "Show a fresh address to get paid.", TILE.receive)}
-        ${tile("request", "Request Payment", "A link asking for an exact amount, with what it's for.", TILE.request)}
-        ${tile("swap", "Swap", "Swap KAS for another coin with ChangeNOW.", TILE.swap)}
-      </div>
-    </div>`;
-  const close = () => { backdrop.remove(); document.removeEventListener("keydown", onKey); };
-  const onKey = (event) => { if (event.key === "Escape") close(); };
-  document.addEventListener("keydown", onKey);
-  backdrop.addEventListener("click", (event) => {
-    const t = event.target.closest("[data-tile]");
-    if (t) { close(); actions[t.dataset.tile]?.(); return; }
-    if (event.target === backdrop) close();
-  });
-  document.body.appendChild(backdrop);
-  backdrop.querySelector("[data-tile]")?.focus();
-}
-
 
 // --- The bell (iOS GlobalNotificationListView): received Kaspa and .kachat news -------------
 
@@ -618,12 +516,10 @@ async function refreshHome() {
             watchRegistrations();
             // the bell's .kachat news: offers, sales, renewal and expiry (iOS 86471dd)
             startKachatNamesNotifier();
-            return kachatLabelOf(main);
           })
-          .then((label) => { if (s.addresses?.main === main && s.kachatLabel !== label) { s.kachatLabel = label; paintHomeIfShowing(s); } })
           .catch(() => {});
       }
-      loadKachatSocial(s, s.addresses.main);
+      if (!IS_TESTNET) wallet.price(s.currency).then((entry) => { if (entry && entry.price !== s.price?.price) { s.price = entry; paintHomeIfShowing(s); } }).catch(() => {});
       // the account total counts hidden addresses too, so nothing disappears from it (iOS 245a5d2)
       s.balances = await wallet.balances(s.addresses, []);
       // The bell: Kaspa that arrived in any of this account's addresses since the last look.
@@ -634,8 +530,10 @@ async function refreshHome() {
       loadOwnAddresses();
       // A faucet visit's payment landed: Claim Testnet Kaspa locks for 24 hours.
       if (IS_TESTNET) noteFaucetBalance(s.addresses.main, s.balances.main);
-      // The other tabs' toolbars show the chatting wallet's balance, as iOS does.
-      dock.setStatus({ balanceText: wallet.formatKas(s.balances.main, 8) });
+      // Every tab's toolbar shows the whole hot wallet: the chatting address and every spending
+      // address, hidden ones too (KaPay iOS 953b255 HotWalletBalance).
+      dock.setStatus({ balanceText: wallet.formatKas(s.balances.total, 8) });
+      noteBackupContext(s);
     } catch (error) {
       s.connection = "bad";
       dock.setStatus({ connection: "bad" });
@@ -650,32 +548,15 @@ async function refreshHome() {
   }
 }
 
-/** Testnet: the hero's .kachat avatar, banner, bio and Linktree from the account's profile record,
- *  each piece looked up from its social link (cached 24 h; repainted when a lookup lands). */
-async function loadKachatSocial(s, main) {
-  const profile = await ownKachatProfile(main);
-  if (s.addresses?.main !== main) return;
-  const resolver = kachatSocial();
-  const read = async () => {
-    const piece = async (kind) => (profile?.[kind] ? (await resolver.profile(profile[kind]))?.[kind] ?? null : null);
-    const next = { avatar: await piece("avatar"), banner: await piece("banner"), bio: await piece("bio"), linktree: profile?.linktree ?? null };
-    if (JSON.stringify(next) !== JSON.stringify(s.kachatSocial || {})) {
-      s.kachatSocial = next;
-      paintHomeIfShowing(s);
-    }
-  };
-  if (!s.kachatSocialUnsubscribe) {
-    s.kachatSocialUnsubscribe = resolver.onChange((link) => {
-      if (homeState === s && profile && [profile.avatar, profile.banner, profile.bio].includes(link)) read();
-    });
-  }
-  await read();
+/** The backup banner follows the signed-in account; it turns red once the account holds funds,
+ *  spending addresses included (iOS AccountBackupBanner.hasFunds). */
+function noteBackupContext(s) {
+  setBackupContext({ address: s.addresses?.main || null, hasFunds: Boolean(s.balances && s.balances.total > 0n) });
 }
 
 function paintHomeIfShowing(state) {
-  // Only repaint when the home screen for this state is what's on screen, and never under
-  // someone typing a new account name.
-  if (homeState === state && app.dataset.screen === "home" && !state.editingName) {
+  // Only repaint when the home screen for this state is what's on screen.
+  if (homeState === state && app.dataset.screen === "home") {
     const scroller = app.querySelector(".profile-body");
     const scrollTop = scroller?.scrollTop || 0;
     paintHome();

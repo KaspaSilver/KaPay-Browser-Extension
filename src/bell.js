@@ -18,7 +18,7 @@
 
 import { esc } from "./ui.js";
 import { SYMBOLS, openPanel } from "./kachat-ui.js";
-import { NETWORK, KAS_UNIT } from "./net.js";
+import { NETWORK, KAS_UNIT, reencodeAddress } from "./net.js";
 import * as wallet from "./wallet.js";
 
 const MAX_ENTRIES = 100;
@@ -58,6 +58,19 @@ export function useAccount(main) {
   entries = Array.isArray(stored) ? stored.filter((e) => e && (e.source === "wallet" || e.source === "kachat")) : [];
   lastSeenAt = scope ? Number(read(seenKey(), 0)) || 0 : 0;
   changed();
+}
+
+/** A deleted account's notifications go with it (KaPay iOS 99ab88a), on both networks. */
+export function forgetAccount(main) {
+  for (const [network, hrp] of [["mainnet", "kaspa"], ["testnet", "kaspatest"]]) {
+    const address = reencodeAddress(main, hrp);
+    if (!address) continue;
+    const key = `${network}:${address.toLowerCase()}`;
+    for (const name of ["kachat_bell_entries", "kachat_bell_seen", "kachat_bell_balances", "kachat_bell_handled"]) {
+      try { localStorage.removeItem(`${name}:${key}`); } catch { /* nothing kept */ }
+    }
+    if (key === scope) useAccount(null);
+  }
 }
 
 export function onBellChange(fn) {

@@ -28,6 +28,7 @@ import { kachatLive, kachatLaunched, kachatNames } from "./kachat-names.js";
 import { IS_TESTNET } from "./net.js";
 import * as dock from "./dock.js";
 import * as live from "./kachat-live.js";
+import { backupBannerHtml, bindBackupBanner } from "./account-backup.js";
 
 export { kachatWordmark };
 
@@ -121,6 +122,7 @@ export function showKachatMarket({ onBack = null } = {}) {
         <button class="icon plain accent" id="how" aria-label="How it works">${SYMBOLS.question}</button>
       </div>
     </header>
+    ${backupBannerHtml()}
     <section class="km">
       <div class="km-hero compact">
         ${kachatWordmark(64)}
@@ -130,6 +132,8 @@ export function showKachatMarket({ onBack = null } = {}) {
     </section>`, "kachat:market");
   dock.remember(back);
   if (onBack) $("#back").onclick = onBack;
+  // .kachat has no title: the backup banner sits under the bar (KaPay iOS 953b255)
+  bindBackupBanner(back);
   $("#how").onclick = () => showHowItWorks(isLive());
   bindClaims();
   for (const card of app.querySelectorAll("[data-open-page]")) {

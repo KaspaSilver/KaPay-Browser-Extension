@@ -13,6 +13,7 @@
 // ("profile" is the Wallet tab).
 
 import { esc, toast, onRender } from "./ui.js";
+import { backupBannerHtml, bindBackupBanner } from "./account-backup.js";
 
 const ICON = {
   // lock.shield
@@ -111,6 +112,8 @@ const status = { connection: "busy", balanceText: null, nodeUrl: "" };
 
 export function setStatus(patch) { Object.assign(status, patch); }
 
+/** Between the toolbar and the title, the backup banner while the backup is owed (KaPay iOS 953b255
+ *  pinnedTabHeader): every tab shows it. */
 export function tabTopHtml(title, { rightHtml = "" } = {}) {
   const cls = status.connection === "ok" ? "ok" : status.connection === "bad" ? "bad" : "busy";
   return `
@@ -119,10 +122,13 @@ export function tabTopHtml(title, { rightHtml = "" } = {}) {
       <div class="toolbar-balance"><img src="icons/kaspa-logo.png" alt="" /><span>${status.balanceText != null ? esc(status.balanceText) : "--"} KAS</span></div>
       <div class="toolbar-right">${rightHtml}</div>
     </header>
+    ${backupBannerHtml()}
     <h1 class="large-tab-title">${esc(title)}</h1>`;
 }
 
 export function bindTabTop() {
   const dot = document.getElementById("tab-dot");
   if (dot) dot.onclick = () => toast(status.connection === "ok" ? `Connected to ${status.nodeUrl.replace(/^wss:\/\//, "")}` : status.connection === "bad" ? "Can't reach a Kaspa node - retrying" : "Connecting to the Kaspa network…");
+  // the steps come back to this tab's first screen, the banner gone once they're finished
+  bindBackupBanner(() => roots[current]?.());
 }

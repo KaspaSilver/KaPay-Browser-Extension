@@ -1,20 +1,25 @@
-// Settings - iOS SettingsView, cut down to the wallet. The pages kept, in the iOS order:
+// Settings - iOS SettingsView, cut down to the wallet. Alphabetical rows with no descriptive text,
+// as in KaChat (KaPay iOS 953b255):
 //
-//   Customization    Currency (iOS also has Appearance and Language; the extension is dark and
-//                    English only for now)
-//   Security         Auto-Lock and Change Password - the browser's stand-ins for the three Face ID
-//                    toggles: every secret is behind the wallet password instead
+//   About            Created, Version, Website, Support Email, Privacy Policy, Open Source
+//                    Licenses (moved here from the Wallet tab)
+//   Account Name     your own label for this account, saved when you leave the page
+//   Back Up Account  Complete Your Backup while it's owed (account-backup.js), View 12 or 24 Words
+//   Connected Sites  the extension's own addition: websites connected through window.kachat
 //   Connection       Connection Settings (Kaspa Node and its IP Address Book; Domains: the .kachat
 //                    indexer, KNS and the other name services; the Kaspa REST API) and Kaspa
 //                    Explorer
-//   Connected Sites  the extension's own addition: websites connected through window.kachat
-//   View Seed Phrase the password, then iOS SeedPhraseView
-//   Log Out          the last row, as on KaPay iOS (040f91a)
+//   Customization    Currency (iOS also has Appearance and Language; the extension is dark and
+//                    English only for now)
+//   Security         Auto-Lock and Change Password - the browser's stand-ins for the Face ID
+//                    toggles: every secret is behind the wallet password instead
+//
+// then Delete Account (KaPay iOS 99ab88a, delete-account.js) and Log Out, apart.
 //
 // Settings is a dock tab (iOS SettingsView(isDockTab: true)): the tab toolbar and large title, no
-// Back. Pages the extension has nothing for (Notifications - the extension sends none -, Storage
-// and Nextcloud, Danger Zone, Diagnostics) are left out. "App Settings" - the gear on the accounts
-// screen - is the same list without View Seed Phrase or Log Out, as on iOS.
+// Back. Pages the extension has nothing for (Diagnostics, Notifications - the extension sends
+// none -, Storage and Nextcloud) are left out. "App Settings" - the gear on the accounts screen -
+// keeps only the pages that need no account, as on iOS.
 
 import * as vault from "./vault.js";
 import * as wallet from "./wallet.js";
@@ -27,6 +32,8 @@ import { tabTopHtml, bindTabTop } from "./dock.js";
 import { kachatRegistry } from "./kachat-names.js";
 import { KachatNamesService } from "../shared/engine/kachat-names/service.js";
 import { connections, removeConnection } from "./approve.js";
+import { backupPending, openAccountBackup } from "./account-backup.js";
+import { showDeleteAccountSheet } from "./delete-account.js";
 import { IS_TESTNET, TESTNET_REST, switchNetwork } from "./net.js";
 
 const BOOK_KEY = IS_TESTNET ? "nodeBookTestnet" : "nodeBook";
@@ -63,21 +70,28 @@ function rowHtml(id, icon, label, value = "", danger = false) {
  * @param {boolean} [opts.appSettings]  the accounts screen's gear: no account-specific rows
  * @param {boolean} [opts.isDockTab]    the Settings tab: its toolbar and large title, no Back
  * @param {Function} [opts.onLogOut]    the Log Out row (the tab only)
+ * @param {Function} [opts.onDelete]    Delete Account (the tab only): gets the account's id and
+ *                                      chatting address once the password confirms it
  */
 export async function showSettings(opts) {
-  const { onBack, appSettings = false, isDockTab = false, onLogOut = null } = opts;
+  const { onBack, appSettings = false, isDockTab = false, onLogOut = null, onDelete = null } = opts;
   const back = () => showSettings(opts);
   render(`
     ${isDockTab ? tabTopHtml("Settings") : navHeader({ title: appSettings ? "App Settings" : "Settings" })}
     <section class="screen settings ${isDockTab ? "settings-tab" : ""}">
       <div class="glass list">
+        ${appSettings ? "" : rowHtml("about", ICONS.info, "About")}
+        ${appSettings ? "" : rowHtml("account-name", ICONS.pencil, "Account Name")}
+        ${appSettings ? "" : rowHtml("backup", ICONS.key, "Back Up Account")}
+        ${appSettings ? "" : rowHtml("sites", ICONS.safari, "Connected Sites")}
+        ${rowHtml("connection", ICONS.antenna, "Connection")}
         ${rowHtml("customization", ICONS.paintbrush, "Customization")}
         ${rowHtml("security", ICONS.lockShieldSmall, "Security")}
-        ${rowHtml("connection", ICONS.antenna, "Connection")}
-        ${appSettings ? "" : rowHtml("sites", ICONS.safari, "Connected Sites")}
       </div>
-      ${appSettings ? "" : `<div class="glass list">${rowHtml("seed", ICONS.key, "View Seed Phrase", "", true)}</div>`}
       ${onLogOut ? `<div class="glass list">
+        ${onDelete ? `<button class="list-row settings-row danger-text" id="delete-account">
+          <span class="settings-label">${ICONS.trash}<span>Delete Account</span></span>
+        </button>` : ""}
         <button class="list-row settings-row danger-text" id="logout">
           <span class="settings-label">${ICONS.logout}<span>Log Out</span></span>
         </button>
@@ -87,18 +101,120 @@ export async function showSettings(opts) {
   else $("#back").onclick = onBack;
   const logout = $("#logout");
   if (logout) logout.onclick = onLogOut;
+  const remove = $("#delete-account");
+  if (remove) remove.onclick = () => confirmDeleteAccount({ onBack: back, onDelete });
   $("#customization").onclick = () => showCustomization({ onBack: back });
   $("#security").onclick = () => showSecurity({ onBack: back, appSettings });
   $("#connection").onclick = () => showConnectionHub({ onBack: back });
   const sites = $("#sites");
   if (sites) sites.onclick = () => showConnectedSites({ onBack: back });
-  const seed = $("#seed");
-  if (seed) seed.onclick = () => passwordGate({
-    title: "View Seed Phrase",
-    message: "Enter your wallet password to view your seed phrase.",
+  const about = $("#about");
+  if (about) about.onclick = () => showAbout({ onBack: back });
+  const name = $("#account-name");
+  if (name) name.onclick = () => showAccountName({ onBack: back });
+  const backup = $("#backup");
+  if (backup) backup.onclick = () => showBackUpAccount({ onBack: back });
+}
+
+/** View 12 or 24 Words, behind the wallet password (iOS unlockSeedPhrase's biometric gate). */
+function gateSeedPhrase(onBack) {
+  passwordGate({
+    title: "12 or 24 Words",
+    message: "Enter your wallet password to view your 12 or 24 words.",
     verify: (password) => vault.verifyPassword(password),
-    onBack: back,
-    onUnlocked: (password) => showSeedPhrase({ password, onBack: back }),
+    onBack,
+    onUnlocked: (password) => showSeedPhrase({ password, onBack }),
+  });
+}
+
+// --- Back Up Account (iOS backUpAccountPage) ------------------------------------------------
+
+function showBackUpAccount({ onBack }) {
+  const again = () => showBackUpAccount({ onBack });
+  render(`
+    ${navHeader({ title: "Back Up Account" })}
+    <section class="screen settings">
+      ${backupPending() ? `<div class="glass list">
+        <button class="list-row settings-row" id="complete">
+          <span class="settings-label"><span class="warn-icon">${ICONS.warning}</span><span>Complete Your Backup</span></span>${ICONS.chevron}
+        </button>
+      </div>` : ""}
+      <div class="glass list">${rowHtml("seed", ICONS.key, "View 12 or 24 Words")}</div>
+    </section>`, "settings");
+  $("#back").onclick = onBack;
+  const complete = $("#complete");
+  if (complete) complete.onclick = () => openAccountBackup({ onClose: again });
+  $("#seed").onclick = () => gateSeedPhrase(again);
+}
+
+// --- Account Name (iOS AccountNamePage) -----------------------------------------------------
+
+async function showAccountName({ onBack }) {
+  const view = await vault.readAccounts();
+  const account = view.accounts.find((a) => a.id === view.activeAccountId) || view.accounts[0];
+  render(`
+    ${navHeader({ title: "Account Name" })}
+    <section class="screen settings">
+      <form id="name-form" class="glass list">
+        <input id="name" class="list-input" value="${esc(account.name)}" placeholder="Account name" maxlength="40" autocomplete="off" aria-label="Account name" />
+      </form>
+    </section>`, "settings");
+  const input = $("#name");
+  // saved when you leave the page, as on iOS
+  const save = async () => {
+    const name = input.value.trim();
+    if (name && name !== account.name) await vault.renameAccount(account.id, name).catch(() => {});
+  };
+  $("#back").onclick = async () => { await save(); onBack(); };
+  $("#name-form").onsubmit = async (event) => { event.preventDefault(); await save(); onBack(); };
+  input.focus();
+  input.select();
+}
+
+// --- About (iOS AccountAboutPage, moved here from the Wallet tab in KaPay iOS 953b255) --------
+
+async function showAbout({ onBack }) {
+  const view = await vault.readAccounts().catch(() => null);
+  const account = view?.accounts.find((a) => a.id === view.activeAccountId);
+  const created = account?.createdAt
+    ? new Date(account.createdAt).toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })
+    : "";
+  const version = ext?.runtime?.getManifest?.().version || "";
+  render(`
+    ${navHeader({ title: "About" })}
+    <section class="screen settings">
+      <div class="glass list">
+        ${created ? `<div class="list-row"><span>Created</span><span class="muted">${esc(created)}</span></div>` : ""}
+        <div class="list-row"><span>Version</span><span class="muted">${esc(version)}</span></div>
+        <a class="list-row" href="https://home.kachat.app" target="_blank" rel="noopener noreferrer"><span>Website</span><span class="muted">home.kachat.app</span></a>
+        <a class="list-row" href="mailto:kaspasilver@gmail.com"><span>Support Email</span><span class="muted">kaspasilver@gmail.com</span></a>
+        <a class="list-row" href="https://home.kachat.app/privacy/" target="_blank" rel="noopener noreferrer"><span>Privacy Policy</span>${ICONS.chevron}</a>
+        <button class="list-row" id="licenses"><span>Open Source Licenses</span>${ICONS.chevron}</button>
+      </div>
+    </section>`, "settings");
+  $("#back").onclick = onBack;
+  $("#licenses").onclick = () => showLicenses({ onBack: () => showAbout({ onBack }) });
+}
+
+// --- Delete Account (KaPay iOS 99ab88a) -------------------------------------------------------
+
+async function confirmDeleteAccount({ onBack, onDelete }) {
+  const view = await vault.readAccounts();
+  const account = view.accounts.find((a) => a.id === view.activeAccountId) || view.accounts[0];
+  const main = (await wallet.cachedAddresses(account.id))?.main || null;
+  showDeleteAccountSheet({
+    confirmSubtitle: "Removes this account and its data from this browser.",
+    notBackedUp: backupPending(),
+    onBackUp: () => openAccountBackup({ onClose: onBack }),
+    onViewSeed: () => gateSeedPhrase(onBack),
+    // iOS asks Face ID: "Confirm deleting this account"
+    onConfirm: () => passwordGate({
+      title: "Delete Account",
+      message: "Enter your wallet password to confirm deleting this account.",
+      verify: (password) => vault.verifyPassword(password),
+      onBack,
+      onUnlocked: () => onDelete(account.id, main),
+    }),
   });
 }
 
@@ -153,7 +269,7 @@ async function showSecurity({ onBack, appSettings }) {
         ${rowHtml("autolock", "", "Auto-Lock", label)}
         ${unlocked ? rowHtml("password", "", "Change Password") : ""}
       </div>
-      <p class="form-footer">KaPay locks itself after this long without use, and whenever the browser closes. Your seed phrase and private keys always ask for the wallet password.</p>
+      <p class="form-footer">KaPay locks itself after this long without use, and whenever the browser closes. Your 12 or 24 words and private keys always ask for the wallet password.</p>
     </section>`, "settings");
   $("#back").onclick = onBack;
   const again = () => showSecurity({ onBack, appSettings });
@@ -597,7 +713,7 @@ async function showConnectedSites({ onBack }) {
   }
 }
 
-// --- View Seed Phrase: iOS SeedPhraseView -------------------------------------------------
+// --- View 12 or 24 Words: iOS SeedPhraseView -------------------------------------------------
 
 async function showSeedPhrase({ password, onBack }) {
   const view = await vault.readAccounts();
@@ -615,19 +731,20 @@ async function showSeedPhrase({ password, onBack }) {
   let hideTimer = null;
   const paint = () => {
     render(`
-      ${navHeader({ title: "Seed Phrase" })}
+      ${navHeader({ title: "12 or 24 Words" })}
       <section class="screen">
         <div class="callout warn">
           <div class="callout-title">${ICONS.warning}<span>Security Warning</span></div>
-          <p>Anyone with your seed phrase can access your account. Never share it with anyone.</p>
+          <p>Anyone with your 12 or 24 words can access your account. Never share them with anyone.</p>
+          <p>Best practice is to write your 12 or 24 words down to back them up, and never store it online.</p>
         </div>
         ${secrets.passphrase ? `<p class="passphrase-note">${ICONS.key}<span>This wallet also uses a passphrase. You need it together with these words to restore it.</span></p>` : ""}
         ${revealed ? `
           <div class="seed-grid">${words.map((w, i) => `<div class="seed-word"><span class="n">${i + 1}.</span><span class="w">${esc(w)}</span></div>`).join("")}</div>
           ${secrets.passphrase ? `<div class="glass key-box"><div class="muted small">Passphrase</div><div class="mono">${esc(secrets.passphrase)}</div></div>` : ""}
-          <button id="copy-seed" class="with-icon soft">${ICONS.copy}<span>Copy Seed Phrase</span></button>
+          <button id="copy-seed" class="with-icon soft">${ICONS.copy}<span>Copy 12 or 24 Words</span></button>
           <button id="copy-key" class="with-icon soft">${ICONS.key}<span>Copy Private Key Hex</span></button>`
-          : `<button class="reveal-box" id="reveal">${ICONS.eyeSlash}<span>Tap to reveal seed phrase</span></button>
+          : `<button class="reveal-box" id="reveal">${ICONS.eyeSlash}<span>Tap to reveal your 12 or 24 words</span></button>
 `}
       </section>`, "seed");
     $("#back").onclick = () => { clearTimeout(hideTimer); onBack(); };
@@ -635,11 +752,11 @@ async function showSeedPhrase({ password, onBack }) {
     if (reveal) reveal.onclick = () => {
       revealed = true;
       paint();
-      // iOS hides the words again after seven seconds.
-      hideTimer = setTimeout(() => { revealed = false; if (app.dataset.screen === "seed") paint(); }, 7000);
+      // iOS hides the words again after 20 seconds (KaPay iOS 99ab88a).
+      hideTimer = setTimeout(() => { revealed = false; if (app.dataset.screen === "seed") paint(); }, 20_000);
     };
     const copySeed = $("#copy-seed");
-    if (copySeed) copySeed.onclick = () => copySecret(secrets.mnemonic, "Seed phrase copied. Clipboard will clear in 30s.");
+    if (copySeed) copySeed.onclick = () => copySecret(secrets.mnemonic, "Words copied. Clipboard will clear in 30s.");
     const copyKey = $("#copy-key");
     if (copyKey) copyKey.onclick = async () => {
       try {

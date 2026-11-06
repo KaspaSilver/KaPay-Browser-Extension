@@ -13,7 +13,9 @@ import {
   importMnemonicWithFamily,
   deriveSpendingWallet,
   deriveSpendingAddressRange,
+  deriveIdentityAddressRange,
 } from "../shared/engine/wallet.js";
+import { IMPORT_ADDRESS_SEARCH_DEPTH, foundChattingAddresses } from "../shared/ui/account-import.js";
 import {
   QUANTUM_INDEX_BASE, QUANTUM_SCAN_FLOOR, KIP22_SIGNATURE_SCRIPT_SIZE, isQuantumIndex, chainLocalIndex, spendingIndexTitle,
   spendingStateFromRecord, spendingRecordFromState, revealedSpendingIndices, nextFreshQuantumIndex, spendingChangeIndex,
@@ -21,7 +23,7 @@ import {
 } from "../shared/engine/quantum.js";
 import { createRpc, probeRpc, disconnectRpc, getNodeRegistrySnapshot, forgetEndpoint, markBadNode, knownPublicNodes } from "../shared/engine/rpc.js";
 import { getEndpoint } from "../shared/engine/endpoints.js";
-import { getBalance, sendKaspa, sendMaxKaspa, sweepAllToSelf, estimateSendFeeDetail, estimateOnchainFeeDetail, submitConfirmingAcceptance } from "../shared/engine/transactions.js";
+import { getBalance, sendKaspa, sendMaxKaspa, sweepAllToSelf, estimateSendFeeDetail, estimateOnchainFeeDetail, submitConfirmingAcceptance, SEND_OUTCOME_UNKNOWN } from "../shared/engine/transactions.js";
 import { checkedUtxoAnswer } from "../shared/engine/amounts.js";
 import { calculateMass, calculateFee, fetchQuotedFeeRateSompiPerGram } from "../shared/ui/kspt.js";
 import { looksLikeName, resolveEverywhere, primaryResolution, notFoundMessage, ownsAnyName, ownedNamesOfMany } from "./names.js";
@@ -64,10 +66,10 @@ export async function newRecoveryPhrase(wordCount = 24) {
  * The main address a phrase + passphrase open, for the passphrase screen's live preview (iOS
  * `previewChattingAddress`). Nothing is stored. Null when it cannot be derived.
  */
-export async function previewMainAddress(phrase, passphrase = "", family = "kaspaStandard") {
+export async function previewMainAddress(phrase, passphrase = "", family = "kaspaStandard", index = 0) {
   try {
     // NFKD, as the account will be stored and as iOS derives it (audit EXT-010)
-    const derived = await importMnemonicWithFamily(await kaspa(), phrase, String(passphrase || "").normalize("NFKD"), { family, index: 0 });
+    const derived = await importMnemonicWithFamily(await kaspa(), phrase, String(passphrase || "").normalize("NFKD"), { family, index });
     return derived.address;
   } catch {
     return null;
@@ -622,14 +624,12 @@ export async function send({ source, destination, amountKas = null, tipKas = "0"
   const node = await connection();
   const log = (...parts) => console.info("[KaPay]", ...parts);
   if (max) {
-    const result = await sendMaxKaspa({
+    return afterSend(sendMaxKaspa({
       kaspa: k, rpc: node, withRpc, privateKey: from.privateKeyHex, sourceAddress: from.address,
       destinationAddress: destination,
       totalFeeSompi: totalFeeKas != null ? kasToSompi(String(totalFeeKas)) : null,
       selectedOutpoints, redeemScript: from.redeemScript, log,
-    });
-    if (from.quantum) await markQuantumSpent(from.accountId, from.address);
-    return result;
+    }), async () => { if (from.quantum) await markQuantumSpent(from.accountId, from.address); });
   }
   // Where a spending address's change goes (iOS sendFromSpendingAddress, bba1b1e; engine
   // spendingChangeIndex): a quantum-safe source - its spend reveals its key - and the primary send
@@ -653,34 +653,45 @@ export async function send({ source, destination, amountKas = null, tipKas = "0"
       if (!fresh && from.quantum) throw new Error(QUANTUM_CHANGE_UNAVAILABLE);
     }
   }
-  const result = await sendKaspa({
+  return afterSend(sendKaspa({
     kaspa: k, rpc: node, withRpc, privateKey: from.privateKeyHex, sourceAddress: from.address,
     destinationAddress: destination, amountKas: String(amountKas), feeKas: String(tipKas || "0"),
     selectedOutpoints, changeAddress: fresh?.address || null, redeemScript: from.redeemScript, log,
+  }), async () => {
+    if (from.quantum) await markQuantumSpent(from.accountId, from.address);
+    if (fresh) {
+      const state = await spendingState(from.accountId);
+      await saveSpendingState(from.accountId, { ...boundPatchFor(fresh.index, state), ...(wasPrimary ? { activeIndex: fresh.index } : {}) });
+      await cacheSpendingAddress(from.accountId, fresh.index, fresh.address);
+    }
   });
-  if (from.quantum) await markQuantumSpent(from.accountId, from.address);
-  if (fresh) {
-    const state = await spendingState(from.accountId);
-    await saveSpendingState(from.accountId, { ...boundPatchFor(fresh.index, state), ...(wasPrimary ? { activeIndex: fresh.index } : {}) });
-    await cacheSpendingAddress(from.accountId, fresh.index, fresh.address);
+}
+
+/** What a send records once it's out: also after "Not confirmed", since that one may still land
+ *  (KaPay iOS 953b255 noteSpend) - a quantum key it revealed, the fresh change slot it paid. */
+async function afterSend(sending, record) {
+  try {
+    const result = await sending;
+    await record();
+    return result;
+  } catch (error) {
+    if (error?.code === SEND_OUTCOME_UNKNOWN) await record().catch(() => {});
+    throw error;
   }
-  return result;
 }
 
 /** Merges every coin at the source into one (a self-send with no change). */
 export async function compound(source, totalFeeKas = null) {
   const from = await sourceWallet(source);
   await confirmSpend({ title: "Confirm Compound", amountText: "Every coin into one", recipient: from.address });
-  const result = await sweepAllToSelf({
+  // consolidating spends too: the key is on chain now (the shield comes off)
+  return afterSend(sweepAllToSelf({
     kaspa: await kaspa(), rpc: await connection(), withRpc,
     privateKey: from.privateKeyHex, sourceAddress: from.address,
     totalFeeSompi: totalFeeKas != null ? kasToSompi(String(totalFeeKas)) : null,
     redeemScript: from.redeemScript,
     log: (...parts) => console.info("[KaPay]", ...parts),
-  });
-  // consolidating spends too: the key is on chain now (the shield comes off)
-  if (from.quantum) await markQuantumSpent(from.accountId, from.address);
-  return result;
+  }), async () => { if (from.quantum) await markQuantumSpent(from.accountId, from.address); });
 }
 
 /** The source's private key as hex - for the reveal screen, behind the password. */
@@ -1389,6 +1400,25 @@ export function discardDomainTransfer(assetId) {
 }
 
 // --- Chatting address picker (iOS ChattingAddressPickerView) ---------------------------------
+
+/**
+ * For an import's passphrase step, before there's an account (KaPay iOS 4f5dfd2
+ * WalletManager.findChattingAddresses): address #0 plus every other address among the first
+ * IMPORT_ADDRESS_SEARCH_DEPTH of the identity chain holding funds, in index order, each with its
+ * balance (`sompi` a Number for the rules, `balanceSompi` the exact BigInt). Null when the words
+ * are invalid or the balances couldn't be checked.
+ */
+export async function findChattingAddresses(phrase, passphrase = "", family = "kaspaStandard") {
+  try {
+    const derived = await deriveIdentityAddressRange(await kaspa(), phrase, String(passphrase || "").normalize("NFKD"), { family, start: 0, count: IMPORT_ADDRESS_SEARCH_DEPTH });
+    if (!derived.length) return null;
+    const balancesByAddress = await balancesFor(derived.map((d) => d.address));
+    const found = foundChattingAddresses(derived, new Map(Object.entries(balancesByAddress).map(([address, sompi]) => [address, Number(sompi)])));
+    return found.map((entry) => ({ ...entry, balanceSompi: balancesByAddress[entry.address] ?? 0n }));
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Identity addresses `start..start+count-1` of the active account's family, each with its

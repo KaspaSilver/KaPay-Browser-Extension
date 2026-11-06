@@ -612,7 +612,6 @@ button.domain-send { background: var(--kaspa); color: #000; border-radius: 999px
 .km-search-field input { flex: 1; min-width: 0; background: transparent; border: 0; padding: 0; font-size: 15px; box-shadow: none; }
 .km-search-field input:focus-visible { outline: none; }
 .km-search-result { display: flex; align-items: center; gap: 12px; padding: 12px; border-radius: 12px; }
-.km .underline-tabs { padding: 0 16px; }
 .km-page { display: flex; flex-direction: column; gap: 18px; padding-top: 4px; }
 .km-header { padding: 0 16px; display: flex; flex-direction: column; gap: 2px; }
 .km-title { font-weight: 700; font-size: 16px; }
@@ -1178,3 +1177,53 @@ body.dock-on #app[data-screen="settings"] .form > * { flex-shrink: 0; }
 /* Connection > Domains: where .kachat names are read from. */
 .settings-source { display: inline-flex; flex-direction: column; align-items: flex-end; text-align: right; }
 .dock-item span { white-space: nowrap; }
+
+/* --- The Wallet tab, as KaChat's (KaPay iOS 953b255) ------------------------------------------ */
+/* WalletBalanceCard: the total, its worth, then chatting and spending; an accent gradient. */
+.wallet-balance-card {
+  display: flex; flex-direction: column; gap: 14px; padding: 18px; border-radius: 22px;
+  background: linear-gradient(135deg, rgba(112, 199, 186, .32), rgba(112, 199, 186, .08));
+  border: .8px solid rgba(112, 199, 186, .35);
+}
+.wallet-balance-head { display: flex; flex-direction: column; gap: 4px; }
+.wallet-balance-total {
+  align-self: flex-start; background: transparent; color: var(--text); padding: 0; border-radius: 0;
+  font-size: 30px; font-weight: 800; letter-spacing: -.5px; font-variant-numeric: tabular-nums;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left;
+}
+.wallet-balance-parts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding-top: 14px; border-top: .5px solid var(--line); }
+.wallet-balance-parts > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.wallet-balance-parts .strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Send, Receive and Request (and Swap): accent circles, black glyphs, the name under. */
+.wallet-actions { display: flex; gap: 12px; }
+.wallet-action { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 8px; background: transparent; color: var(--text); padding: 0; font-weight: 400; font-size: 13px; }
+.wallet-action-circle { width: 56px; height: 56px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: var(--kaspa); color: #000; }
+/* The Manage Addresses and Chatting Address squares. */
+.address-squares { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.address-square {
+  aspect-ratio: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  padding: 0 10px; border-radius: 18px; background: rgba(44, 44, 46, .72); border: .8px solid rgba(255, 255, 255, .18);
+  color: var(--text); font-size: 14px; font-weight: 650; text-align: center;
+}
+@media (prefers-color-scheme: light) { .address-square { background: rgba(255, 255, 255, .8); border-color: rgba(0, 0, 0, .08); } }
+.address-square-icon { width: 48px; height: 48px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; color: var(--kaspa); background: rgba(118, 118, 128, .24); }
+.address-square-icon svg { width: 22px; height: 22px; }
+
+/* --- Onboarding: Advanced create; the passphrase preview's balance and found addresses --------- */
+.advanced-create { font-size: 13px; padding: 6px; }
+.preview-balance { display: flex; align-items: center; gap: 6px; padding-top: 4px; }
+.good-text { color: #30d158; }
+.warn-text { color: var(--orange); }
+.found-lead { padding-top: 8px; }
+.found-row { display: flex; align-items: center; gap: 8px; width: 100%; background: transparent; color: var(--text); padding: 6px 0; font-weight: 400; text-align: left; }
+.found-mark { color: var(--kaspa); display: inline-flex; }
+.found-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.screen.passphrase-entry { overflow-y: auto; }
+.screen.passphrase-entry > * { flex-shrink: 0; }
+
+/* --- Settings: Complete Your Backup, Account Name; the Delete Account warning ------------------ */
+.warn-icon { color: var(--orange); display: inline-flex; }
+.list-input { background: transparent; border: 0; padding: 14px 16px; border-radius: 0; }
+.sheet-title:empty { display: none; }
+.delete-warning { display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; padding: 8px 4px 6px; }
+.delete-warning-alert { color: #ff453a; font-size: 13px; font-weight: 650; }

@@ -18,9 +18,9 @@
 // one (iOS SendKaspaComponents).
 
 import { app, esc, render, $, toast, ICONS, navHeader, showSheet, showAlert, isTab, onRender } from "./ui.js";
-import { getLocal, setLocal, ext } from "./browser.js";
+import { getLocal, setLocal, removeLocal, ext } from "./browser.js";
 import { openPanel } from "./kachat-ui.js";
-import { isValidKaspaAddress, networkOfAddress, NETWORK } from "./net.js";
+import { isValidKaspaAddress, networkOfAddress, NETWORK, reencodeAddress } from "./net.js";
 import { scanQr } from "./camera.js";
 import { looksLikeName, resolveEverywhere, primaryResolution, notFoundMessage, otherDomainsHtml, bindOtherDomains, splitTypedName } from "./names.js";
 import * as dock from "./dock.js";
@@ -69,6 +69,13 @@ export function useWallet(main) {
     changed();
   })();
   return loading;
+}
+
+/** A deleted account's contacts go with it (KaPay iOS 99ab88a), on both networks. */
+export async function forgetWallet(main) {
+  const keys = [main, reencodeAddress(main, "kaspa"), reencodeAddress(main, "kaspatest")].filter(Boolean).map(normalize);
+  await removeLocal([...new Set(keys)].flatMap((key) => [ENTRIES_PREFIX + key, DELETED_PREFIX + key, PHOTOS_PREFIX + key]));
+  if (keys.includes(walletKey)) useWallet(null);
 }
 
 export function onAddressBookChange(fn) { listeners.add(fn); return () => listeners.delete(fn); }
