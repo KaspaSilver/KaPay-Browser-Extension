@@ -4,6 +4,7 @@
 // coins, and a node's rejection is reported as one even when another node timed out first
 // (KaPay iOS 0799cec). No DOM and no wallet here, so tools/test-send-coins.mjs runs it in node.
 
+import { isRpcConnectionError } from "../shared/engine/rpc.js";
 import { MAX_SEND_INPUT_LIMIT, SEND_OUTCOME_UNKNOWN, outpointKeysFrom } from "../shared/engine/transactions.js";
 import { utxoAmountSompi } from "../shared/engine/amounts.js";
 
@@ -70,12 +71,16 @@ export function withoutHeldCoins(coins, holds, now = Date.now()) {
 }
 
 /** The engine's words for "every coin is reserved" are about scheduled KaPosts, which the extension
- *  doesn't have: there it means every coin is held by the last send. */
-export function heldCoinsError(error) {
-  if (!/reserved by a scheduled post/i.test(String(error?.message || ""))) return error;
-  const held = new Error(HELD_COINS_MESSAGE);
-  held.code = error?.code;
-  return held;
+ *  doesn't have: there it means every coin is held by the last send. Since KaChat-Desktop Build 268
+ *  the engine also leaves just-spent coins out itself and then says it found none: with coins of
+ *  this address held (`holding`), that means the same. */
+export function heldCoinsError(error, { holding = false } = {}) {
+  const message = String(error?.message || "");
+  const held = /reserved by a scheduled post/i.test(message) || (holding && /^No UTXOs/i.test(message));
+  if (!held) return error;
+  const settling = new Error(HELD_COINS_MESSAGE);
+  settling.code = error?.code;
+  return settling;
 }
 
 // --- One transaction's worth (iOS WalletService.oneTransactionChunk) ----------------------------
@@ -170,6 +175,38 @@ export function recordBuiltInputs(kaspa) {
 /** The Kaspa module words a node's answer "RPC Server (remote error) -> Rejected transaction ...". */
 export const isNodeRejection = (error) => /remote error|rejected/i.test(String(error?.message || error || ""));
 
+// Since KaChat-Desktop Build 268 the engine itself calls any submit error that isn't one of its
+// connection patterns (shared/engine/rpc.js) a rejection, and a dropped socket the module words
+// "WebSocket disconnected" or "RPC: channel receive error" isn't one of them: after a timeout it
+// turned a send that may have gone out into a plain failure, inviting a second payment. Inside the
+// node call such an error is handed to the engine as the lost connection it is, so the engine looks
+// for the transaction and ends "Not confirmed" if it can't tell. (Belongs in the engine's patterns;
+// until then, here.)
+const SOCKET_FAILURE = /websocket|disconnect|socket|channel (receive|send)|rpc client/i;
+/** The node as the engine's submit sees it: the same client, its submit's socket failures worded
+ *  as a lost connection (the engine reads them before any wrapper around it can). */
+function submittingAsLost(node) {
+  if (!node || typeof node.submitTransaction !== "function") return node;
+  return new Proxy(node, {
+    get(target, key) {
+      if (key === "submitTransaction") {
+        return async (...args) => {
+          try { return await target.submitTransaction(...args); } catch (error) { throw asConnectionLoss(error); }
+        };
+      }
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+export function asConnectionLoss(error, isConnectionError = isRpcConnectionError) {
+  const message = String(error?.message || error || "");
+  if (isConnectionError(error) || isNodeRejection(error) || !SOCKET_FAILURE.test(message)) return error;
+  const lost = new Error(`Connection lost: ${message}`);
+  lost.cause = error;
+  return lost;
+}
+
 /** -> { withRpc, verdict(error) }: `withRpc` for the engine, `verdict` for what it threw. */
 export function rejectionAwareRpc(withRpc, isRejection = isNodeRejection) {
   let rejection = null;
@@ -178,7 +215,7 @@ export function rejectionAwareRpc(withRpc, isRejection = isNodeRejection) {
     rejection = null;
     return withRpc(async (node) => {
       try {
-        const result = await fn(node);
+        const result = await fn(submittingAsLost(node));
         rejection = null;
         return result;
       } catch (error) {
@@ -201,7 +238,7 @@ export function rejectionAwareRpc(withRpc, isRejection = isNodeRejection) {
  * is the verdict, with the engine's scheduled-post words for held coins rewritten. The holding is
  * bookkeeping: if it fails, the send still reads as it went.
  */
-export async function watchedSend({ kaspa, withRpc, start, onSpent = async () => {}, isRejection = isNodeRejection }) {
+export async function watchedSend({ kaspa, withRpc, start, onSpent = async () => {}, holding = () => false, isRejection = isNodeRejection }) {
   const built = recordBuiltInputs(kaspa);
   const guard = rejectionAwareRpc(withRpc, isRejection);
   const spent = async (keys) => { try { await onSpent(keys); } catch { /* the send's outcome stands */ } };
@@ -209,7 +246,7 @@ export async function watchedSend({ kaspa, withRpc, start, onSpent = async () =>
   try {
     result = await start({ kaspa: built.kaspa, withRpc: guard.withRpc });
   } catch (error) {
-    const verdict = heldCoinsError(guard.verdict(error));
+    const verdict = heldCoinsError(guard.verdict(error), { holding: holding() });
     if (verdict?.code === SEND_OUTCOME_UNKNOWN) await spent(built.keys());
     throw verdict;
   }

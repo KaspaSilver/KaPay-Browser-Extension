@@ -712,7 +712,7 @@ export async function estimateMax({ address, destination = null, selectedOutpoin
       totalFeeSompi: totalFeeKas != null ? kasToSompi(String(totalFeeKas)) : null,
     });
   } catch (error) {
-    throw heldCoinsError(error);
+    throw heldCoinsError(error, { holding: heldCoinCount(address) > 0 });
   }
 }
 
@@ -721,7 +721,7 @@ export async function estimateMax({ address, destination = null, selectedOutpoin
  *  another node timed out first. `start({ kaspa, withRpc })` calls the engine with those two. */
 async function spendFrom(address, start) {
   await currentHolds();
-  return watchedSend({ kaspa: await kaspa(), withRpc, start, onSpent: (keys) => holdCoins(keys, address) });
+  return watchedSend({ kaspa: await kaspa(), withRpc, start, onSpent: (keys) => holdCoins(keys, address), holding: () => heldCoinCount(address) > 0 });
 }
 
 /**

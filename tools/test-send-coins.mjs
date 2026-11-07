@@ -12,14 +12,15 @@ import {
 } from "../src/send-coins.js";
 import {
   SEND_OUTCOME_UNKNOWN, MAX_SEND_INPUT_LIMIT, MAX_AMOUNT_CHANGED, setReservedOutpoints, estimateMaxSend, sendMaxKaspa, sendKaspa,
-  submitConfirmingAcceptance, planMaxSend, sanitizeUtxoEntries,
+  submitConfirmingAcceptance, planMaxSend, sanitizeUtxoEntries, clearJustSpentOutpoints,
 } from "../shared/engine/transactions.js";
 import { isRpcConnectionError } from "../shared/engine/rpc.js";
 import { quantumRedeemScript, quantumScriptPublicKey, quantumAddressForRedeem } from "../shared/engine/quantum.js";
 import { hex } from "../shared/engine/kachat-names/codec.js";
 
 let passed = 0;
-async function check(name, fn) { await fn(); passed += 1; console.log(`ok - ${name}`); }
+// each check starts with nothing held: the engine keeps its own just-spent list too (Build 268)
+async function check(name, fn) { clearJustSpentOutpoints(); await fn(); passed += 1; console.log(`ok - ${name}`); }
 
 const A = "kaspa:qpaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B = "kaspa:qpbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -140,15 +141,15 @@ const submitVia = (withRpc) => submitConfirmingAcceptance({
   withRpc, txid: "f".repeat(64), submit: (rpc, options) => rpc.submitTransaction(options), lostAnswerWaitMs: 0, orphanWaitMs: 0, recheckMs: 0,
 });
 
-await check("the engine alone: a rejection after a timeout ends 'Not confirmed' (what's fixed around it)", async () => {
+await check("the engine itself now reports a rejection after a timeout as the rejection (KaChat-Desktop Build 268)", async () => {
   const node = scripted([timedOut(), rejected()]);
-  await assert.rejects(submitVia(reconnectingWithRpc(node)), (error) => error.code === SEND_OUTCOME_UNKNOWN);
+  await assert.rejects(submitVia(reconnectingWithRpc(node)), (error) => error.code !== SEND_OUTCOME_UNKNOWN && /fee is below the minimum/.test(error.message));
 });
 await check("with the send's wrapper, that rejection is the verdict", async () => {
   const node = scripted([timedOut(), rejected()]);
   const guard = rejectionAwareRpc(reconnectingWithRpc(node));
   const error = await submitVia(guard.withRpc).catch((e) => e);
-  assert.equal(error.code, SEND_OUTCOME_UNKNOWN);
+  // the engine already says so; the wrapper keeps saying so whichever way the engine answers
   const verdict = guard.verdict(error);
   assert.match(verdict.message, /fee is below the minimum/);
   assert.notEqual(verdict.code, SEND_OUTCOME_UNKNOWN);
@@ -261,6 +262,7 @@ await check("held coins stay out of the next Max; when every coin is held, the h
   let holds = {};
   const send = () => watchedSend({
     kaspa, withRpc: engineWithRpc(node), onSpent: (keys) => { holds = holdSpentCoins(holds, keys, SOURCE); setReservedOutpoints(heldKeys(holds)); },
+    holding: () => Object.keys(holds).length > 0,
     start: (engine) => sendMaxKaspa({ ...engine, rpc: node, privateKey: KEY, sourceAddress: SOURCE, destinationAddress: SOURCE }),
   });
   const first = await send();
