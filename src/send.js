@@ -284,6 +284,7 @@ export function showSend(opts) {
       if (available != null && amount >= available) amount = available > 100_000n ? available - 100_000n : 1n;
       const result = await wallet.estimateFee({
         address: opts.fromAddress,
+        destination: state.recipient?.address || null,
         amountKas: wallet.sompiToKasText(amount),
         selectedOutpoints: selectedOutpoints(),
       });

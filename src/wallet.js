@@ -684,7 +684,7 @@ export async function resolveRecipient(input) {
  * (mass x 100 sompi/gram, as on iOS) is what is shown and paid; the SDK adds its own base fee
  * automatically, so the send passes the difference as a priority tip.
  */
-export async function estimateFee({ address, amountKas = "0.2", selectedOutpoints = null }) {
+export async function estimateFee({ address, destination = null, amountKas = "0.2", selectedOutpoints = null }) {
   // the send leaves out coins just spent, so the estimate does too (KaPay iOS 0799cec)
   await currentHolds();
   const detail = await estimateSendFeeDetail({
@@ -692,6 +692,9 @@ export async function estimateFee({ address, amountKas = "0.2", selectedOutpoint
     rpc: await connection(),
     withRpc,
     sourceAddress: address,
+    // the recipient's own output script, so the fee shown is the fee paid (KaChat-Desktop Build
+    // 272, iOS 4922804); the change still goes to the source in the estimate
+    destinationAddress: destination || null,
     amountKas: String(amountKas),
     payloadBytes: 0,
     selectedOutpoints,

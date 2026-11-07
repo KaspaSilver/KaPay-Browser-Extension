@@ -159,11 +159,13 @@ export function pendingInputKeys(transactions) {
 // nothing is sent; the Review then shows that fee, and the next swipe pays it. (Max and Compound are
 // pinned already.)
 //
-// iOS works the Review's fee out with the real recipient and change address; the engine's estimate
-// here sends both to the source (shared/engine/transactions.js estimateOnchainFeeDetail), so a P2SH
-// or ECDSA script (35 bytes against Schnorr's 34) costs the real send 1,100 sompi more per output.
-// The margin covers both outputs differing, with room for rounding; a real difference - another coin
-// the tip needs, say - is far bigger (an input is about 0.0011 KAS).
+// iOS works the Review's fee out with the real recipient and change address. The engine's estimate
+// prices the recipient's own output since KaChat-Desktop Build 272 (wallet.estimateFee passes it),
+// but its change still goes to the source, so a primary's change to a fresh quantum-safe P2SH slot
+// (35-byte script against Schnorr's 34) costs the real send 1,100 sompi more. The margin covers that
+// with room for rounding; a real difference - another coin the tip needs, say - is far bigger (an
+// input is about 0.0011 KAS). This is why the engine's own check (sendKaspa's expectedFeeSompi, a
+// 1,000-sompi margin) isn't used here: it would refuse every such primary send.
 export const REVIEW_FEE_MARGIN_SOMPI = 5_000n;
 export const SEND_FEE_CHANGED = "sendFeeChanged";
 

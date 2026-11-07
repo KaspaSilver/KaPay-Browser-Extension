@@ -457,7 +457,7 @@ async function showSendApproval(request, ctx) {
   } catch { /* shown as unknown */ }
   // No made-up fee when the estimate fails (KaPay iOS 0799cec): Approve stays off and says why.
   try {
-    const estimate = await wallet.estimateFee({ address: connection.address, amountKas: wallet.sompiToKasText(amount) });
+    const estimate = await wallet.estimateFee({ address: connection.address, destination: to, amountKas: wallet.sompiToKasText(amount) });
     if (estimate?.policyKas == null) throw new Error("no estimate");
     state.fee = estimate.policyKas;
     state.sdkBase = estimate?.sdkBaseKas ?? 0.00002;
