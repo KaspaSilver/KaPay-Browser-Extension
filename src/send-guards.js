@@ -1,7 +1,8 @@
-// What a send checks before anything is built, and how a run of sends reads back. No DOM and no
-// wallet here, so tools/test-send-guards.mjs runs it in node.
+// What a send checks before anything is built (Cold Storage: before its QR is shown), and how a run
+// of sends reads back. No DOM and no wallet here, so tools/test-send-guards.mjs runs it in node.
 
 import { MAX_AMOUNT_CHANGED, SEND_OUTCOME_UNKNOWN, SEND_OUTCOME_UNKNOWN_MESSAGE } from "../shared/engine/transactions.js";
+import { fitsStorageMass, SMALL_SEND_MASS_MESSAGE } from "../shared/ui/kspt.js";
 
 export const SOURCE_CHANGED = "SOURCE_CHANGED";
 export const SOURCE_CHANGED_MESSAGE = "The account changed after you reviewed this. Nothing was sent. Check the From address and try again.";
@@ -73,4 +74,23 @@ export function consolidateOutcome(results) {
     }
   }
   return out;
+}
+
+/**
+ * Cold Storage's no-change path (KaPay iOS 0799cec, KaChatTransactionBuilder
+ * fitsStorageMass(inputAmounts:outputAmounts:[amount])): an unsigned transaction built with no change
+ * output - its change folded into the fee, or none left - must fit the storage-mass budget with the
+ * recipient's output alone. A small send carved from a bigger coin breaks it without any change
+ * (0.03 KAS from one 0.1 KAS coin), and the node would refuse it after KasSigner had signed what the
+ * QR showed. shared/ui/kspt.js planSendOutputs doesn't check this, so the built transaction is
+ * checked here before its QR is shown. iOS adds another coin first, which lowers that mass; the
+ * build (kspt.js) can't be asked to, so the send is refused with kspt's own words, which suggest a
+ * larger amount or a compound. -> an Error to show, or null.
+ */
+export function coldRecipientMassError(unsigned) {
+  const outputs = unsigned?.outputs || [];
+  if (outputs.length !== 1) return null;
+  const inputAmounts = (unsigned.inputs || []).map((input) => BigInt(input.amountSompi));
+  const amount = BigInt(unsigned.finalAmountSompi ?? outputs[0].valueSompi);
+  return fitsStorageMass(inputAmounts, [amount]) ? null : new Error(SMALL_SEND_MASS_MESSAGE);
 }

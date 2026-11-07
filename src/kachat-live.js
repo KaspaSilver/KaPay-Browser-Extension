@@ -21,6 +21,7 @@ import { looksLikeName, resolveEverywhere, primaryResolution, notFoundMessage, o
 import { sompiFromUserText } from "./amounts.js";
 import * as vault from "./vault.js";
 import * as wallet from "./wallet.js";
+import { heldCoinsError } from "./send-coins.js";
 import { kachatNames, kachatProfiles, kachatRegistry, kachatLaunched, prepareSigner, prepareOfferSigners } from "./kachat-names.js";
 import { SYMBOLS, openPanel, kachatWordmark, showTileSheet } from "./kachat-ui.js";
 import { Operation, Stage, isOpen, needsDriving, KachatNamesActions, FeeTier, FeeChoice, TxStage } from "../shared/engine/kachat-names/actions.js";
@@ -251,7 +252,8 @@ function invalidReason(name) {
   return null;
 }
 
-const errorText = (error) => String(error?.message || error || "Something went wrong.");
+// the engine's "reserved by a scheduled post" means, here, coins the last send still holds (send-coins.js)
+const errorText = (error) => String(heldCoinsError(error)?.message || error || "Something went wrong.");
 
 function statusPill(status) {
   // past grace a name is free to claim: "Available" (iOS eea52b2)

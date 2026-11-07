@@ -26,6 +26,7 @@ import { KAS_UNIT } from "./net.js";
 import { parsePaymentRequestLink, paymentRequestAmountText } from "../shared/engine/payment-request.js";
 import { SEND_OUTCOME_UNKNOWN, SEND_OUTCOME_UNKNOWN_MESSAGE, MAX_AMOUNT_CHANGED, MAX_AMOUNT_CHANGED_MESSAGE } from "../shared/engine/transactions.js";
 import { maxPinCurrent, selectionKey } from "./send-guards.js";
+import { oneTransactionChunk } from "./send-coins.js";
 import { entryFor, entryName } from "./address-book.js";
 import {
   FEE_TIERS, recipientCardHtml, recipientStatusHtml, recipientLookup, bindAddressBookButton, amountState, feeControlsHtml,
@@ -96,7 +97,17 @@ export function showSend(opts) {
     const list = state.selected ? state.coins.filter((c) => state.selected.has(c.key)) : state.coins;
     return list.reduce((sum, c) => sum + c.amount, 0n);
   };
-  const inputCount = () => (state.selected ? state.selected.size : (state.coins?.length || 1));
+  /** The coins a Max (or Compound) spends: the coin-control pick, else past 80 coins the largest 80
+   *  (one transaction's worth, KaPay iOS 0799cec oneTransactionChunk; wallet.js picks the same ones
+   *  for the send), else every coin. */
+  const maxCoins = () => {
+    if (!state.coins) return null;
+    if (state.selected) return state.coins.filter((c) => state.selected.has(c.key));
+    return oneTransactionChunk(state.coins) || state.coins;
+  };
+  const inputCount = () => Math.max(1, maxCoins()?.length || 0);
+  /** Coins the last send spent are held at the From address (KaPay iOS 0799cec). */
+  const coinsHeld = () => wallet.heldCoinCount(opts.fromAddress) > 0;
   const tierMultiplier = () => FEE_TIERS.find((t) => t.id === state.tier)?.multiplier || 1;
   const totalFeeKas = () => {
     if (state.customFeeKas != null) return state.customFeeKas;
@@ -264,8 +275,10 @@ export function showSend(opts) {
   // (KaChat-Desktop sendKaspaPinnedMax). Compound keeps every coin and has no pin.
   let maxSeq = 0;
   const fillMax = async () => {
-    const available = spendableSompi();
-    if (available == null) return;
+    // what Max can spend: past 80 coins, the largest 80
+    const coins = maxCoins();
+    if (coins == null) return;
+    const available = coins.reduce((sum, c) => sum + c.amount, 0n);
     // a typed amount's estimate still waiting or on its way no longer applies
     clearTimeout(estimateTimer);
     estimateSeq += 1;
@@ -314,7 +327,7 @@ export function showSend(opts) {
     state.estimating = false;
     state.fillingMax = false;
     if (amount <= 0n) {
-      state.error = "Balance too low after network fees.";
+      state.error = available === 0n && coinsHeld() ? wallet.HELD_COINS_MESSAGE : "Balance too low after network fees.";
       setAmountKas("");
       state.maxMode = false;
       return;
@@ -607,7 +620,7 @@ export function showSend(opts) {
   const amountFootnote = () => {
     if (state.coinsUnread) return COINS_UNREAD;
     if (state.error) return state.error;
-    if (exceedsBalance()) return "This is more than the address you're sending from holds.";
+    if (exceedsBalance()) return coinsHeld() ? wallet.HELD_COINS_MESSAGE : "This is more than the address you're sending from holds.";
     const available = spendableSompi();
     return available != null ? `Available: ${trimmedKas(available)} ${KAS_UNIT}` : "";
   };
@@ -803,7 +816,9 @@ export function showSend(opts) {
     try {
       let result;
       if (opts.compound) {
-        result = await wallet.compound(opts.source, fee.toFixed(8), { fromAddress });
+        // past 80 coins, the largest 80 the amount was worked out from, in one transaction
+        const chunk = state.coins ? oneTransactionChunk(state.coins) : null;
+        result = await wallet.compound(opts.source, fee.toFixed(8), { fromAddress, outpoints: chunk ? chunk.map((c) => c.key) : null });
       } else if (state.maxMode) {
         const pin = state.maxPin;
         if (!maxPinCurrent(pin, { sourceAddress: fromAddress, totalFeeSompi: totalFeeSompi(), selection: selectedOutpoints() }) || pin.amountSompi !== amountSompi()) {
@@ -838,6 +853,7 @@ export function showSend(opts) {
       state.sending = false;
       // the password prompt was cancelled: nothing was sent, the review comes back as it was
       if (error?.code === wallet.SEND_CANCELLED) { swipe?.returnToForm(); return; }
+      if (error?.code === MAX_AMOUNT_CHANGED && opts.compound) { compoundChanged(swipe); return; }
       if (error?.code === MAX_AMOUNT_CHANGED) { maxChanged(error, swipe); return; }
       console.warn("[KaPay] send failed:", error);
       state.error = friendlySendError(error);
@@ -845,6 +861,16 @@ export function showSend(opts) {
       // Try Again shows the review with the error under the fee.
       if (handle?.swipe === swipe) paintReview({ force: true });
     }
+  };
+
+  /** Nothing was sent: one of the coins a Compound was reviewed with is gone. The coins are read
+   *  again and the review shows what's there now. */
+  const compoundChanged = (swipe) => {
+    state.error = MAX_AMOUNT_CHANGED_MESSAGE;
+    const address = opts.fromAddress;
+    wallet.utxos(address).then((coins) => { if (address === opts.fromAddress) { state.coins = coins; paint(); } }).catch(() => {});
+    swipe?.returnToForm();
+    if (handle?.swipe === swipe) paintReview({ force: true });
   };
 
   /** Nothing was sent: Max no longer matched the coins or the fee. The review comes back with the

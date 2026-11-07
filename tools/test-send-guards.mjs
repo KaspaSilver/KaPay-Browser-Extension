@@ -1,11 +1,13 @@
 // What a send checks before it's built and how Consolidate's run reads back (src/send-guards.js):
 // the reviewed source against the key the vault gives now, the Max pin against what the review
-// shows, and every Consolidate source accounted for. Run: node tools/test-send-guards.mjs
+// shows, every Consolidate source accounted for, and Cold Storage's no-change recipient output
+// against the storage-mass budget. Run: node tools/test-send-guards.mjs
 import assert from "node:assert/strict";
 import {
   SOURCE_CHANGED, SOURCE_CHANGED_MESSAGE, sourceChangedError, selectionKey, maxPinCurrent, sameCoinSet,
-  consolidateOutcome, CONSOLIDATE_CHANGED_MESSAGE,
+  consolidateOutcome, CONSOLIDATE_CHANGED_MESSAGE, coldRecipientMassError,
 } from "../src/send-guards.js";
+import { planSendOutputs, SMALL_SEND_MASS_MESSAGE } from "../shared/ui/kspt.js";
 import { MAX_AMOUNT_CHANGED, SEND_OUTCOME_UNKNOWN, SEND_OUTCOME_UNKNOWN_MESSAGE, sendOutcomeUnknownError } from "../shared/engine/transactions.js";
 
 let passed = 0;
@@ -74,6 +76,36 @@ check("Consolidate: a Not confirmed source is never dropped once another succeed
   assert.equal(outcome.txids.length, 1);
   assert.equal(outcome.unconfirmed.length, 1);
   assert.equal(outcome.unconfirmed[0].txid, null);
+});
+
+// Cold Storage's no-change path (KaPay iOS 0799cec KaChatTransactionBuilder: the recipient's output
+// alone must fit the storage-mass budget)
+const P2PK = { version: 0, scriptHex: `20${"ab".repeat(32)}ac` };
+const unsignedFrom = (selection) => {
+  const planned = planSendOutputs(selection, P2PK, P2PK);
+  return { inputs: selection.utxos.map((u) => ({ amountSompi: u.amountSompi })), outputs: planned.outputs.map((o) => ({ valueSompi: o.valueSompi })), finalAmountSompi: selection.finalAmount, foldedChangeSompi: planned.foldedChangeSompi };
+};
+check("cold: 0.03 KAS from one 0.1 KAS coin - kspt folds the change, and the recipient alone is refused before the QR", () => {
+  const unsigned = unsignedFrom({ utxos: [{ amountSompi: 10_000_000n }], finalAmount: 3_000_000n, feeSompi: 200_000n, changeSompi: 6_800_000n });
+  assert.equal(unsigned.outputs.length, 1);
+  assert.ok(unsigned.foldedChangeSompi > 0n);
+  assert.equal(coldRecipientMassError(unsigned)?.message, SMALL_SEND_MASS_MESSAGE);
+});
+check("cold: a folded change whose recipient output fits goes ahead", () => {
+  // 1 KAS from a 1.00001 KAS coin: a sliver of change folded, the recipient's output near the input
+  const unsigned = unsignedFrom({ utxos: [{ amountSompi: 100_001_000n }], finalAmount: 100_000_000n, feeSompi: 300n, changeSompi: 700n });
+  assert.equal(unsigned.outputs.length, 1);
+  assert.equal(coldRecipientMassError(unsigned), null);
+});
+check("cold: a send that keeps its change, a Max and a compound are never refused here", () => {
+  const withChange = unsignedFrom({ utxos: [{ amountSompi: 500_000_000n }], finalAmount: 100_000_000n, feeSompi: 300_000n, changeSompi: 399_700_000n });
+  assert.equal(withChange.outputs.length, 2);
+  assert.equal(coldRecipientMassError(withChange), null);
+  const amounts = Array.from({ length: 32 }, (_, i) => BigInt(1_000_000 * (i + 1)));
+  const total = amounts.reduce((sum, a) => sum + a, 0n);
+  const compound = unsignedFrom({ utxos: amounts.map((amountSompi) => ({ amountSompi })), finalAmount: total - 3_000_000n, feeSompi: 3_000_000n, changeSompi: 0n });
+  assert.equal(coldRecipientMassError(compound), null);
+  assert.equal(coldRecipientMassError(null), null);
 });
 
 console.log(`\n${passed} passed`);

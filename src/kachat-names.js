@@ -77,10 +77,13 @@ async function loadWalletAddresses() {
   } catch { walletState.kasSigner = []; }
 }
 
-/** A spending address's key, ready for the engine's synchronous `spendingPrivateKey` hook. */
+/** A spending address's key, ready for the engine's synchronous `spendingPrivateKey` hook. The
+ *  address this wallet listed for that index is the one the key must open: an account switched in
+ *  another window since is refused (wallet.js SOURCE_CHANGED, audit 2026-11-07). */
 async function loadSpendingKey(index) {
   if (Number.isInteger(index) && !walletState.keys.has(index)) {
-    walletState.keys.set(index, await privateKeyHex({ kind: "spending", index }));
+    const fromAddress = walletState.spending.find((s) => s.index === index)?.address || null;
+    walletState.keys.set(index, await privateKeyHex({ kind: "spending", index }, { fromAddress }));
   }
 }
 
@@ -108,9 +111,7 @@ export async function prepareOfferSigners(offers) {
 /** Derives the spending key an action signs with when a spending address holds the name. */
 export async function prepareSigner(op) {
   const payer = actions?.payerFor(op);
-  if (payer?.kind === "spending" && !walletState.keys.has(payer.index)) {
-    walletState.keys.set(payer.index, await privateKeyHex({ kind: "spending", index: payer.index }));
-  }
+  if (payer?.kind === "spending") await loadSpendingKey(payer.index);
 }
 
 // One service, registry and actions on every network. Where the registry isn't launched (mainnet)

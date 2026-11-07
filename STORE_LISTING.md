@@ -25,15 +25,17 @@ KaPay, the Kaspa wallet from KaChat. Send and receive KAS, manage addresses and 
 
 **Description:**
 
-KaPay brings the wallet from the KaPay and KaChat apps to your browser. Your recovery phrase opens
+KaPay brings the wallet from the KaPay and KaChat apps to your browser. Your 12 or 24 words open
 the same addresses as KaPay on iPhone and KaChat on iPhone, Android and desktop.
 
-- Create a new account or import one from KaChat, KasWare, Kaspium, Kastle, KDX, OKX, OneKey,
-  Ledger or the Kaspa CLI wallet
+- Create a new account in one tap, or import one from KaChat, KasWare, Kaspium, Kastle, KDX, OKX,
+  OneKey, Ledger or the Kaspa CLI wallet
+- Back up your 12 or 24 words step by step, with a check that your paper copy is right, and a
+  Backup Hygiene check every six months
 - Send Kaspa step by step: a keypad for the amount, .kas and .kachat name lookup, Max, coin
   control, a review with Normal / Fast / Priority fees, and swipe up to send
 - A fresh receiving address every time, and Manage Addresses for your spending addresses:
-  generate, discover, rename, hide, set the primary, and send everything to it
+  generate, discover, rename, hide and set the primary
 - History, coins (UTXOs) and Compound for every address
 - Contacts: save the people you pay by address or name
 - Your domains on every Kaspa name service (.kas, .k, .kaspa) and .kachat names: claim a .kachat
@@ -45,11 +47,11 @@ the same addresses as KaPay on iPhone and KaChat on iPhone, Android and desktop.
   network hashrate, CSV import/export, and import from any Kaspa address
 - Several accounts in one wallet
 - Connect to Kaspa websites: they ask, you approve every connection, payment and signature
-- Your recovery phrase is encrypted with your password and never leaves your computer
+- Your 12 or 24 words are encrypted with your password and never leave your computer
 - No accounts, no tracking, no ads
 
-KaPay is self-custody: only you hold your keys. Keep your recovery phrase written down and
-safe - it is the only way to restore your wallet.
+KaPay is self-custody: only you hold your keys. Keep your 12 or 24 words written down and
+safe - they are the only way to restore your wallet.
 
 **Graphics:**
 
@@ -65,15 +67,14 @@ signatures with the user's approval.
 
 **Permission justifications:**
 
-- `storage` - Stores the password-encrypted wallet (recovery phrases), account names, derived
+- `storage` - Stores the password-encrypted wallet (the 12 or 24 words), account names, derived
   public addresses, contacts, portfolios, settings and connected websites in the browser.
 - `alarms` - Locks the wallet automatically after the auto-lock time the user chooses, and
   schedules the clipboard clear below.
-- `offscreen`, `clipboardWrite` - 30 seconds after the user copies their recovery phrase or a
+- `offscreen`, `clipboardWrite` - 30 seconds after the user copies their 12 or 24 words or a
   private key, an offscreen page clears the clipboard (the popup has closed by then).
 - Host permission `indexer.kachat.app` - KaChat's own indexer: .kachat names (look up, claim,
-  offers) and the public KaChat profile (avatar, banner and bio links, .kachat name) of the user's
-  own chatting address for the Wallet screen. The request carries that public address.
+  offers, set the primary name) for the user's addresses. The request carries those public addresses.
 - Host permission `api.kaspa.org` - Kaspa REST API: transaction history and address usage.
 - Host permissions `*.kaspa.green`, `*.kaspa.red`, `*.kaspa.stream`, `*.kaspa.blue`, `*.kaspa.ws` -
   the public Kaspa node resolver and nodes, for balances and sending transactions.
@@ -93,10 +94,6 @@ signatures with the user's approval.
   nothing else. Every request needs the user's approval in the wallet.
 - Optional host permission `https://*/*` - never requested up front. The wallet asks for one
   origin at a time, only after the user taps to allow it:
-  - the public profile sites the user linked in their KaChat profile (`x.com`,
-    `api.fxtwitter.com`, `www.youtube.com`, `discord.com`, `api.github.com`, `t.me`,
-    `www.twitch.tv`, `www.instagram.com`, `www.tiktok.com`, `www.facebook.com`,
-    `www.linkedin.com`), to show that profile's picture, banner or bio;
   - `desktop.kachat.app`, KaChat's relay to ChangeNOW, when the user opens Swap (swap KAS for
     another coin; the user pays the ChangeNOW deposit address themselves);
   - a custom Kaspa REST API or .kachat names indexer the user types into Settings.
@@ -107,7 +104,7 @@ signatures with the user's approval.
 **Data usage:** tick "Financial and payment information" (public blockchain addresses) only.
 Public Kaspa addresses are sent to the Kaspa network and the APIs above to show balances and send
 transactions, and the user's chatting address is sent to KaChat's indexer (`indexer.kachat.app`)
-to read its public KaChat profile and .kachat names. Nothing else is sent, nothing is stored about
+to read its .kachat names. Nothing else is sent, nothing is stored about
 the user, and the address is not sold, not used for unrelated purposes and not used for
 creditworthiness. Like any web request, these services see the user's IP address. Tick all three
 certifications (not sold to third parties, not used for unrelated purposes, not used for credit).

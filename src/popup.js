@@ -117,6 +117,14 @@ ext?.storage?.onChanged?.addListener((changes, area) => {
     return;
   }
   if (changes[LOGGED_OUT_KEY]?.newValue && shownAccount().id) leaveAccount().then(() => showWelcome());
+  // signed in from another window while this one sits on the accounts screen: it follows in too
+  else if (LOGGED_OUT_KEY in changes && !changes[LOGGED_OUT_KEY].newValue && app.dataset.screen === "accounts") {
+    // a moment later, so this window's own sign-in (which fires this too) has already moved on
+    setTimeout(() => {
+      if (app.dataset.screen !== "accounts" || shownAccount().id) return;
+      vault.isUnlocked().then((open) => { if (open && app.dataset.screen === "accounts") enterApp(); }).catch(() => {});
+    }, 600);
+  }
 });
 
 // Bumped whenever this window leaves the account it showed: a screen still loading for that

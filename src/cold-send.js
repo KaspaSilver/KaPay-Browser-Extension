@@ -38,6 +38,7 @@ import { loadOwnAddresses } from "./own-addresses.js";
 import { SF } from "./cold-common.js";
 import { KAS_UNIT } from "./net.js";
 import { sompiFromUserText } from "./amounts.js";
+import { coldRecipientMassError } from "./send-guards.js";
 import {
   recipientCardHtml, recipientStatusHtml, recipientLookup, bindAddressBookButton, amountState, feeControlsHtml, trimmedKas,
 } from "./send-pieces.js";
@@ -486,6 +487,10 @@ export function showColdSend(opts) {
         manualUtxoKeys: s.manualKeys ?? s.preview?.utxoKeys ?? null,
       });
       if (closed) return;
+      // no change output: the recipient's alone must fit the storage-mass budget, or the node would
+      // refuse what KasSigner signs (KaPay iOS 0799cec) - refused before the QR is shown
+      const massError = coldRecipientMassError(unsigned);
+      if (massError) throw massError;
       s.building = false;
       // Left the review while it built: nothing to show it on.
       if (flow.current !== "review") return;
