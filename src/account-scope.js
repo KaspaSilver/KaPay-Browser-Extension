@@ -112,3 +112,12 @@ export function mergeContacts(into, from) {
   for (const entry of Array.isArray(from) ? from : []) if (entry?.address && !have.has(entry.address)) list.push(entry);
   return list;
 }
+
+/** The date an imported contact that was deleted here gets (iOS AddressBookManager.importExport,
+ *  KaPay iOS 1652437): bringing it back is a new edit, so it's dated after the deletion - past the
+ *  deletion's second, since the files keep whole seconds - and never before now. With the file's
+ *  older date, a merge would let the deletion win again. All in ms. */
+export function datedAfterDeletion(deletedAt, now = Date.now()) {
+  const afterDeletion = (Math.floor(Number(deletedAt) / 1000) + 1) * 1000;
+  return Number.isFinite(afterDeletion) ? Math.max(now, afterDeletion) : now;
+}

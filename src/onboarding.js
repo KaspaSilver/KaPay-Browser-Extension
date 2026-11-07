@@ -450,9 +450,13 @@ function showPassphraseQuestion(flow) {
  * underneath (KaPay iOS 99ab88a PassphraseAddressPreview): the only direct evidence that a
  * passphrase opens a different account, and how someone importing tells they typed the right one.
  * On import it checks the first 50 chatting addresses, picks the first with funds and lists any
- * others to choose from (iOS 4f5dfd2); the import lands on the chosen one. Creating opens here
+ * others to choose from (iOS 4f5dfd2); the import lands on the chosen one. The search is a network
+ * round trip, so it's never the only way forward (KaPay iOS 1652437): "Skip the Search" imports on
+ * #0 at once, and a search that fails or takes past PASSPHRASE_SEARCH_TIMEOUT_MS lets Import go onto
+ * #0, says so, and offers Search Again; an answer that comes later is ignored. Creating opens here
  * (Advanced: Create with a Passphrase), so its Back is the accounts screen.
  */
+const PASSPHRASE_SEARCH_TIMEOUT_MS = 12_000;
 function showPassphraseEntry(flow) {
   const create = flow.mode === "create";
   render(`
@@ -473,10 +477,12 @@ function showPassphraseEntry(flow) {
         <div class="preview-balance"><span class="muted small">Balance</span><span id="preview-balance"><span class="spinner small-spin"></span></span></div>
         <div class="small" id="preview-hint" hidden></div>
         <div id="preview-found"></div>
+        <div id="preview-incomplete"></div>
         <div class="muted small" id="preview-note">This is the account your 12 or 24 words open on their own.</div>
       </div>
       <p class="error" id="error"></p>
       <button id="continue" class="big" disabled>${create ? "Continue" : "Import"}</button>
+      ${create ? "" : '<button id="skip-search" class="ghost" hidden>Skip the Search: Import on Address #0</button>'}
       <button id="what" class="ghost">What is a passphrase?</button>
     </section>`, "passphrase");
   // iOS clears what was typed when you go back; reading the explainer keeps it.
@@ -492,12 +498,15 @@ function showPassphraseEntry(flow) {
   // #0 while the funds sit on another address. Held from the first keystroke, not only once the
   // lookup starts (KaPay iOS 0799cec).
   let searching = false;
+  let busy = false;
   const paintContinue = () => {
     const button = $("#continue");
     if (!button) return;
     const waiting = !create && searching && Boolean(pp.value);
-    button.disabled = !pp.value || waiting;
+    button.disabled = busy || !pp.value || waiting;
     button.innerHTML = waiting ? '<span class="spinner"></span><span>Finding your address...</span>' : (create ? "Continue" : "Import");
+    const skip = $("#skip-search");
+    if (skip) skip.hidden = !waiting || busy;
   };
   const setSearching = (on) => { searching = on; paintContinue(); };
   let revealed = false;
@@ -543,8 +552,20 @@ function showPassphraseEntry(flow) {
   // further pause, so only the passphrase someone stopped typing is looked up.
   let previewTimer = null;
   let previewSeq = 0;
+  let searchTimer = null;
+  /** The funds search failed or ran out of time: Import goes to #0, and the screen says so. */
+  const searchIncomplete = () => {
+    const box = $("#preview-incomplete");
+    if (!box) return;
+    box.innerHTML = `
+      <p class="small warn-text">The search for funds on this account's other addresses didn't finish, so Import uses address #0.</p>
+      <button type="button" class="link-button small" id="search-again">Search Again</button>`;
+    $("#search-again").onclick = () => schedulePreview();
+  };
   const schedulePreview = () => {
     clearTimeout(previewTimer);
+    clearTimeout(searchTimer);
+    $("#preview-incomplete").innerHTML = "";
     const typed = pp.value;
     flow.chattingIndex = 0;
     $("#preview-note").textContent = typed
@@ -564,10 +585,18 @@ function showPassphraseEntry(flow) {
       await new Promise((resolve) => setTimeout(resolve, 450));
       if (seq !== previewSeq) return;
       if (!create) {
+        // A slow or unreachable node lets Import go after the timeout, onto #0, and says so.
+        searchTimer = setTimeout(() => {
+          if (seq !== previewSeq || !$("#preview")) return;
+          previewSeq += 1; // the answer that comes later is ignored
+          failed();
+          searchIncomplete();
+        }, PASSPHRASE_SEARCH_TIMEOUT_MS);
         const found = await wallet.findChattingAddresses(flow.phrase, typed, flow.family);
+        clearTimeout(searchTimer);
         if (seq !== previewSeq || !$("#preview")) return;
         const first = found?.find((entry) => entry.balanceSompi > 0n) || found?.[0];
-        if (!first) return failed();
+        if (!first) { failed(); searchIncomplete(); return; }
         select(found, first);
         setSearching(false);
         return;
@@ -581,22 +610,31 @@ function showPassphraseEntry(flow) {
   pp.oninput = () => { schedulePreview(); paintContinue(); };
   schedulePreview();
   paintContinue();
-  $("#continue").onclick = () => {
-    if (!create && searching) return;
+  /** `skippingSearch`: Import on address #0 without waiting for the funds search. */
+  const proceed = (skippingSearch = false) => {
+    if (!create && searching && !skippingSearch) return;
     const error = $("#error");
     error.textContent = "";
     if (!pp.value) { error.textContent = "Enter a passphrase, or go back and choose No."; return; }
     if (create && pp.value !== pp2.value) { error.textContent = "The passphrases do not match. Please re-enter them."; return; }
+    // the import reads the address now: a search answer after this only redraws the preview
+    if (skippingSearch) { flow.chattingIndex = 0; searching = false; }
     flow.typed = null;
     // nothing changes the account once it is being made (KaPay iOS 0799cec)
-    const fields = [pp, pp2, $("#eye"), $("#what"), $("#continue")].filter(Boolean);
+    busy = true;
+    const fields = [pp, pp2, $("#eye"), $("#what"), $("#continue"), $("#skip-search")].filter(Boolean);
     for (const field of fields) field.disabled = true;
+    paintContinue();
     Promise.resolve(flow.onProceed(pp.value)).finally(() => {
+      busy = false;
       if (!pp.isConnected) return;
       for (const field of fields) field.disabled = false;
       paintContinue();
     });
   };
+  $("#continue").onclick = () => proceed(false);
+  const skipSearch = $("#skip-search");
+  if (skipSearch) skipSearch.onclick = () => proceed(true);
 }
 
 /** Back returns to the screen it was opened from: the question, or the entry screen, which links it

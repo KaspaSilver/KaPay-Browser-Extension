@@ -1,8 +1,9 @@
 // The portfolio CSV's text cells (src/csv-text.js): a note or portfolio name that a spreadsheet
 // would run as a formula is written with a leading ', and an import of the export takes exactly
-// that ' off again. Run: node tools/test-csv-text.mjs
+// that ' off again. An import replaces a row the portfolio already had in the same second, each at
+// most once (KaPay iOS 1652437). Run: node tools/test-csv-text.mjs
 import assert from "node:assert/strict";
-import { csvText, csvTextBack } from "../src/csv-text.js";
+import { csvText, csvTextBack, csvRowMatcher } from "../src/csv-text.js";
 
 let passed = 0;
 function check(name, fn) { fn(); passed += 1; console.log(`ok - ${name}`); }
@@ -35,6 +36,30 @@ check("the import leaves text the export didn't mark alone", () => {
   assert.equal(csvTextBack("'plain"), "'plain");
   assert.equal(csvTextBack("Long Term"), "Long Term");
   assert.equal(csvTextBack(undefined), "");
+});
+
+check("an import matches a row on its second: the export writes whole seconds, the row has milliseconds", () => {
+  const take = csvRowMatcher([{ portfolioId: "p", timestamp: 1_700_000_000_456 }]);
+  assert.equal(take("p", 1_700_000_000_000), 0);
+});
+check("each row is replaced at most once; two file rows of one second are two transactions", () => {
+  const take = csvRowMatcher([
+    { portfolioId: "p", timestamp: 1_700_000_000_100 },
+    { portfolioId: "p", timestamp: 1_700_000_000_900 },
+    { portfolioId: "p", timestamp: 1_700_000_005_000 },
+  ]);
+  assert.equal(take("p", 1_700_000_000_000), 0);
+  assert.equal(take("p", 1_700_000_000_000), 1);
+  assert.equal(take("p", 1_700_000_000_000), -1);
+  assert.equal(take("p", 1_700_000_005_000), 2);
+  assert.equal(take("p", 1_700_000_005_000), -1);
+});
+check("another portfolio's row, or another second, is never matched", () => {
+  const take = csvRowMatcher([{ portfolioId: "p", timestamp: 1_700_000_000_000 }]);
+  assert.equal(take("q", 1_700_000_000_000), -1);
+  assert.equal(take("p", 1_700_000_001_000), -1);
+  assert.equal(take("p", 1_699_999_999_999), -1);
+  assert.equal(csvRowMatcher(undefined)("p", 0), -1);
 });
 
 console.log(`${passed} passed`);

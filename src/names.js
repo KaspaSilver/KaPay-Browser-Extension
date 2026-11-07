@@ -23,6 +23,7 @@ import { kachatRegistry, kachatService, kachatLaunched } from "./kachat-names.js
 import { resolveHeldChecked } from "./kachat-resolve.js";
 import { normalize as kachatNormalize, isValid as kachatIsValid } from "../shared/engine/kachat-names/codec.js";
 import { KachatNamesRegistry } from "../shared/engine/kachat-names/registry.js";
+import { logInfo } from "./log.js";
 
 // The KNS API for the running network (testnet reads /tn10, iOS knsBaseURL).
 function knsBase() {
@@ -80,7 +81,7 @@ async function getJson(url) {
     if (!response.ok) return { status: "failed" };
     return { status: "found", body: await response.json() };
   } catch (error) {
-    console.info("[KaPay] name lookup failed:", new URL(url).host, error?.message || error);
+    logInfo("name lookup failed:", new URL(url).host, error?.message || error);
     return { status: "failed" };
   } finally {
     clearTimeout(timer);
@@ -137,7 +138,7 @@ async function resolveKachat(label) {
     const address = await resolveHeldChecked(registry, canonical, kachatService());
     return { tld: "kachat", display, address: address || null, failed: false };
   } catch (error) {
-    console.info("[KaPay] .kachat lookup failed:", error?.message || error);
+    logInfo(".kachat lookup failed:", error?.message || error);
     return { tld: "kachat", display, address: null, failed: true };
   }
 }

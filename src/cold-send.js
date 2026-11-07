@@ -33,12 +33,14 @@ import * as wallet from "./wallet.js";
 import { app, esc, toast, settings, unitText } from "./ui.js";
 import { otherDomainsHtml, bindOtherDomains, splitTypedName } from "./names.js";
 import { scanQr } from "./camera.js";
-import { showCoinControl } from "./send.js";
+import { showCoinControl, heldCoinReason } from "./send.js";
 import { loadOwnAddresses } from "./own-addresses.js";
 import { SF } from "./cold-common.js";
 import { KAS_UNIT } from "./net.js";
 import { sompiFromUserText } from "./amounts.js";
 import { coldRecipientMassError } from "./send-guards.js";
+import { logWarn } from "./log.js";
+import { SEND_OUTCOME_UNKNOWN } from "../shared/engine/transactions.js";
 import {
   recipientCardHtml, recipientStatusHtml, recipientLookup, bindAddressBookButton, amountState, feeControlsHtml, trimmedKas,
 } from "./send-pieces.js";
@@ -430,17 +432,19 @@ export function showColdSend(opts) {
     if (s.building) return;
     let list;
     try {
-      list = await wallet.utxos(from);
+      // the coins the last broadcast spent too, greyed out (KaPay iOS 1652437)
+      list = await wallet.utxos(from, { withHeld: true });
     } catch (error) {
       toast(error.message || "Could not read this address's UTXOs.");
       return;
     }
     const labels = await wallet.utxoLabels(from).catch(() => ({}));
     if (!here() || flow.current !== "review") return;
-    const live = new Set(list.map((c) => c.key));
+    const live = new Set(list.filter((c) => !c.held).map((c) => c.key));
     handle = null;
     showCoinControl({
       coins: list,
+      unavailable: heldCoinReason,
       selected: s.manualKeys ? new Set(s.manualKeys.filter((k) => live.has(k))) : null,
       labels,
       onCancel: () => go("review"),
@@ -595,7 +599,7 @@ export function showColdSend(opts) {
         errorCorrectionLevel: "M", margin: 1, width: 560, color: { dark: "#000000", light: "#ffffff" },
       });
     } catch (error) {
-      console.warn("[KaPay] KSPT QR failed:", error);
+      logWarn("[KaPay] KSPT QR failed:", error);
     }
     canvas.style.width = "";
     canvas.style.height = "";
@@ -670,8 +674,12 @@ export function showColdSend(opts) {
     s.broadcasting = true;
     s.broadcastError = "";
     swipe?.setBusy(true);
+    // every node-pool submit holds its coins, Cold Storage's too (KaPay iOS 1652437): out of the
+    // next Cold Storage build for two minutes, also after "Not confirmed", which may still land
+    const spends = (s.unsigned.inputs || []).map((input) => `${input.prevTxId}:${input.prevIndex}`);
     try {
       const txid = String(await broadcastSigned({ engine: await getEngine(), unsigned: s.unsigned, decoded: s.decoded }) || "");
+      await wallet.holdSubmittedCoins(spends, from);
       if (closed) return;
       s.broadcasting = false;
       s.sent = true;
@@ -684,8 +692,9 @@ export function showColdSend(opts) {
       swipe?.setBusy(false);
       swipe?.setEnabled(false);
     } catch (error) {
+      if (error?.code === SEND_OUTCOME_UNKNOWN) await wallet.holdSubmittedCoins(spends, from);
       if (closed) return;
-      console.warn("[KaPay] cold broadcast failed:", error);
+      logWarn("[KaPay] cold broadcast failed:", error);
       s.broadcasting = false;
       s.broadcastError = String(error?.message || error || "");
       swipe?.setBusy(false);

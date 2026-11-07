@@ -20,6 +20,7 @@ import { KachatSocialImageResolver } from "../shared/engine/kachat-names/social-
 import { chattingSigner, namesNodeMethods, cachedAddresses, privateKeyHex, knownUsedAddresses, addressUsed } from "./wallet.js";
 import { ext } from "./browser.js";
 import { readAccounts } from "./vault.js";
+import { logInfo } from "./log.js";
 
 const localStorageAdapter = {
   get(key) { try { return localStorage.getItem(key); } catch { return null; } },
@@ -132,7 +133,7 @@ function base() {
       // otherwise the registry walks the chain itself (iOS 7aa6c6d)
       virtualDaaScore: () => engine.currentVirtualDaaScore(),
       storage: localStorageAdapter,
-      log: (...parts) => console.info("[KaPay]", ...parts),
+      log: logInfo,
     });
     actions = new KachatNamesActions({ engine, service, registry, storage: localStorageAdapter, wallet: walletHooks });
   }
@@ -172,7 +173,8 @@ async function bind() {
   const runtime = base();
   const signer = await chattingSigner();
   const address = signer.address.toLowerCase();
-  engine.kaspa = signer.kaspa;
+  // what each build spends is noted, so a broadcast holds its coins (KaPay iOS 1652437)
+  engine.kaspa = engine.recording(signer.kaspa);
   engine.address = address;
   engine.privateKey = signer.privateKeyHex;
   engine.privateKeyHex = signer.privateKeyHex;

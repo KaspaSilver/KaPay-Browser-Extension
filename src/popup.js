@@ -43,6 +43,7 @@ import { NETWORK, NETWORK_MIRROR_KEY, IS_TESTNET, syncNetworkMirror } from "./ne
 import { showColdStorage, coldWatchAddresses } from "./cold.js";
 import { showPortfolio } from "./portfolio.js";
 import { showCameraPermissionPage } from "./camera.js";
+import { logWarn } from "./log.js";
 
 const params = new URLSearchParams(location.search);
 const isApproval = params.get("view") === "approve";
@@ -617,7 +618,7 @@ async function refreshHome() {
       if (stale()) return;
       s.connection = "bad";
       dock.setStatus({ connection: "bad" });
-      console.warn("[KaPay] network:", error);
+      logWarn("[KaPay] network:", error);
     }
   } catch (error) {
     if (stale()) return;

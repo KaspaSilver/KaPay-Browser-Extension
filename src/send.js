@@ -24,9 +24,10 @@ import { scanQr } from "./camera.js";
 import { loadOwnAddresses } from "./own-addresses.js";
 import { KAS_UNIT } from "./net.js";
 import { parsePaymentRequestLink, paymentRequestAmountText } from "../shared/engine/payment-request.js";
-import { SEND_OUTCOME_UNKNOWN, SEND_OUTCOME_UNKNOWN_MESSAGE, MAX_AMOUNT_CHANGED, MAX_AMOUNT_CHANGED_MESSAGE } from "../shared/engine/transactions.js";
+import { SEND_OUTCOME_UNKNOWN, SEND_OUTCOME_UNKNOWN_MESSAGE, MAX_AMOUNT_CHANGED, MAX_AMOUNT_CHANGED_MESSAGE, MAX_SEND_INPUT_LIMIT } from "../shared/engine/transactions.js";
 import { maxPinCurrent, selectionKey } from "./send-guards.js";
-import { oneTransactionChunk } from "./send-coins.js";
+import { oneTransactionChunk, SEND_FEE_CHANGED } from "./send-coins.js";
+import { logWarn } from "./log.js";
 import { entryFor, entryName } from "./address-book.js";
 import {
   FEE_TIERS, recipientCardHtml, recipientStatusHtml, recipientLookup, bindAddressBookButton, amountState, feeControlsHtml,
@@ -41,6 +42,15 @@ import {
 const ORDER = ["to", "from", "amount", "review", "fee"];
 /** The From address's coins couldn't be read (iOS, KaPay iOS 0799cec). */
 const COINS_UNREAD = "Couldn't load the coins at this address";
+/** Why Max (or Compound) isn't the whole balance: one transaction spends at most 80 coins, and this
+ *  address holds more (iOS maxCappedNote, KaPay iOS 1652437). */
+const MAX_CAPPED_NOTE = `Max is what one transaction can carry: its largest ${MAX_SEND_INPUT_LIMIT} coins. Compound UTXOs combines the rest.`;
+const COMPOUND_CAPPED_NOTE = `One transaction can combine ${MAX_SEND_INPUT_LIMIT} coins, so this combines the largest ${MAX_SEND_INPUT_LIMIT}. Compound again for the rest.`;
+const NOT_ENOUGH_FOR_FEE = "Not enough Kaspa for this amount plus the network fee.";
+/** Coin Control's word for a coin the last send spent (iOS CoinControlView.hotWalletReason). */
+const HELD_REASON = "Just spent by a send";
+/** A coin wallet.utxos({ withHeld }) marked held: listed greyed out, never picked. */
+export const heldCoinReason = (coin) => (coin?.held ? HELD_REASON : null);
 const short = (a) => `${a.slice(0, 14)}...${a.slice(-6)}`;
 
 /**
@@ -69,7 +79,9 @@ export function showSend(opts) {
     maxMode: false,
     fillingMax: false,
     maxPin: null,           // what Max was worked out from (coins, amount, fee): what the slide sends
+    maxCapped: false,       // Max used only the largest 80 coins (KaPay iOS 1652437 maxCapped)
     coins: null,            // all spendable coins at the source
+    heldCoins: [],          // the ones the last send holds: Coin Control greys them out
     coinsUnread: false,     // they couldn't be read: said so, never Available 0 (KaPay iOS 0799cec)
     selected: null,         // Set of coin keys, or null for Automatic
     tier: "normal",
@@ -115,8 +127,14 @@ export function showSend(opts) {
   };
   const kasNumberToSompi = (kas) => wallet.kasToSompi(kas.toFixed(8));
   const totalFeeSompi = () => { const fee = totalFeeKas(); return fee == null ? null : kasNumberToSompi(fee); };
-  /** The fee the review shows: a Max's own (the engine raises a fee under the network floor). */
-  const shownFeeSompi = () => (state.maxMode && state.maxPin && !opts.compound ? state.maxPin.feeSompi : totalFeeSompi());
+  /** What the review's fee is for: a fee the send itself said it now costs (feeChanged) holds only
+   *  while all of this stays as it was. */
+  const reviewKey = () => [opts.fromAddress, state.recipient?.address, state.amountText, totalFeeSompi(), selectionKey(selectedOutpoints())].join("|");
+  /** The fee a send built at the swipe said it pays, above the review's estimate, for this review. */
+  const risenFeeSompi = () => (state.feeRise && state.feeRise.key === reviewKey() ? state.feeRise.sompi : null);
+  /** The fee the review shows: a Max's own (the engine raises a fee under the network floor), else
+   *  what the send said it now costs, else the estimate at this speed. */
+  const shownFeeSompi = () => (state.maxMode && state.maxPin && !opts.compound ? state.maxPin.feeSompi : risenFeeSompi() ?? totalFeeSompi());
   /** The Normal fee for these coins: the network minimum the fee editor holds to. */
   const normalFeeSompi = () => (state.base ? kasNumberToSompi(state.base.policyKas) : null);
   const amountSompi = () => wallet.kasToSompi(state.amountText);
@@ -145,6 +163,15 @@ export function showSend(opts) {
     if (amount == null || amount <= 0n || fee == null || available == null) return false;
     if (state.maxMode || opts.compound) return true;
     return amount + kasNumberToSompi(fee) <= available;
+  };
+  /** A typed amount the fee at this speed doesn't fit beside (iOS tippedFeeError, KaPay iOS
+   *  1652437): said, not just a swipe that stays off. */
+  const overBalance = () => {
+    if (state.maxMode || opts.compound || state.estimating || state.feeError) return false;
+    const amount = amountSompi();
+    const fee = shownFeeSompi();
+    const available = spendableSompi();
+    return amount != null && amount > 0n && fee != null && available != null && amount <= available && amount + fee > available;
   };
   const isChattingSource = () => opts.source?.kind !== "spending";
   const sourceTitle = () => (isChattingSource() ? "Chatting Address" : (state.sourceLabel || `Address #${opts.source.index}`));
@@ -201,12 +228,10 @@ export function showSend(opts) {
     wallet.utxoLabels(address).then((labels) => { state.labels = labels; }).catch(() => {});
     state.coinsUnread = false;
     try {
-      const coins = await wallet.utxos(address);
-      if (address !== opts.fromAddress) return; // another address was picked meanwhile
-      state.coins = coins;
+      if (!(await readCoins(address))) return; // another address was picked meanwhile
     } catch (error) {
       if (address !== opts.fromAddress) return;
-      console.warn("[KaPay] coins unreadable:", error);
+      logWarn("[KaPay] coins unreadable:", error);
       state.coinsUnread = true;
     }
     const currency = (await settings()).currency || "usd";
@@ -220,6 +245,15 @@ export function showSend(opts) {
     }
     if (opts.compound || state.maxMode) await fillMax(); else await estimate();
     paint();
+  };
+  /** The From address's coins: the spendable ones, and the ones the last send holds (Coin Control
+   *  lists those greyed out, KaPay iOS 1652437). False when another address was picked meanwhile. */
+  const readCoins = async (address) => {
+    const all = await wallet.utxos(address, { withHeld: true });
+    if (address !== opts.fromAddress) return false;
+    state.coins = all.filter((c) => !c.held);
+    state.heldCoins = all.filter((c) => c.held);
+    return true;
   };
   const loadChatting = async () => {
     if (state.chatting) return state.chatting;
@@ -285,6 +319,8 @@ export function showSend(opts) {
     // only the newest Max answers: a fee tapped twice must not leave the first one's pin
     const mine = ++maxSeq;
     state.maxPin = null;
+    // Compound has no plan here: past 80 coins it combines the largest 80 (doSend's chunk)
+    state.maxCapped = Boolean(opts.compound && !state.selected && state.coins && oneTransactionChunk(state.coins));
     state.estimating = true;
     state.fillingMax = true;
     paint();
@@ -313,9 +349,11 @@ export function showSend(opts) {
         });
         if (mine !== maxSeq) return;
         state.maxPin = { ...plan, sourceAddress: opts.fromAddress, totalFeeSompi: fee, selectionKey: selectionKey(selection) };
+        state.maxCapped = Boolean(plan.cappedAtInputLimit);
         amount = plan.amountSompi;
       } catch (error) {
         if (mine !== maxSeq) return;
+        state.maxCapped = false;
         state.estimating = false;
         state.fillingMax = false;
         state.error = friendlySendError(error);
@@ -580,6 +618,7 @@ export function showSend(opts) {
     clearTimeout(estimateTimer);
     estimateSeq += 1;
     state.coins = null;
+    state.heldCoins = [];
     state.selected = null;
     state.customFeeKas = null;
     state.maxMode = false;
@@ -621,6 +660,7 @@ export function showSend(opts) {
     if (state.coinsUnread) return COINS_UNREAD;
     if (state.error) return state.error;
     if (exceedsBalance()) return coinsHeld() ? wallet.HELD_COINS_MESSAGE : "This is more than the address you're sending from holds.";
+    if (state.maxMode && state.maxCapped) return MAX_CAPPED_NOTE;
     const available = spendableSompi();
     return available != null ? `Available: ${trimmedKas(available)} ${KAS_UNIT}` : "";
   };
@@ -723,7 +763,21 @@ export function showSend(opts) {
         coinSummary: coinSummary(state.selected),
         editPill: true,
       })}
-      ${state.coinsUnread || state.error || state.feeError ? `<p class="error-text small center-text">${esc(state.coinsUnread ? COINS_UNREAD : (state.error || state.feeError))}</p>` : ""}`;
+      ${reviewNoteHtml()}`;
+  };
+  /** Under the fee: what's wrong, with Try Again when it's the fee (or the coins) that couldn't be
+   *  worked out, which would otherwise keep the swipe off for good (KaPay iOS 1652437); else why
+   *  Max or Compound isn't the whole balance. */
+  const reviewNoteHtml = () => {
+    const message = state.coinsUnread ? COINS_UNREAD : (state.error || state.feeError || (overBalance() ? NOT_ENOUGH_FOR_FEE : ""));
+    if (message) {
+      return `<p class="error-text small center-text">${esc(message)}</p>
+        ${state.error && !state.coinsUnread ? "" : '<p class="center-text"><button class="link-button small" id="fee-retry">Try Again</button></p>'}`;
+    }
+    if ((state.maxMode || opts.compound) && state.maxCapped && !state.estimating) {
+      return `<p class="ss-footnote">${esc(opts.compound ? COMPOUND_CAPPED_NOTE : MAX_CAPPED_NOTE)}</p>`;
+    }
+    return "";
   };
   const drawReview = (direction) => {
     const back = backFrom("review");
@@ -762,12 +816,23 @@ export function showSend(opts) {
         paint();
       };
     }
+    const retry = body.querySelector("#fee-retry");
+    if (retry) retry.onclick = () => {
+      // the coins read again, then the fee (or Max) worked out again
+      state.feeError = "";
+      state.coinsUnread = false;
+      if (!state.maxMode && !opts.compound) state.estimating = true;
+      paint();
+      load();
+    };
     const edit = body.querySelector("#fee-edit");
     if (edit) edit.onclick = () => { if (totalFeeSompi() != null) go("fee"); };
     const coins = body.querySelector("#coins");
     if (coins) coins.onclick = () => {
       showCoinControl({
-        coins: state.coins || [],
+        // the held ones too, greyed out (KaPay iOS 1652437)
+        coins: [...(state.coins || []), ...(state.heldCoins || [])].sort((a, b) => (a.amount > b.amount ? -1 : a.amount < b.amount ? 1 : 0)),
+        unavailable: heldCoinReason,
         selected: state.selected,
         labels: state.labels,
         onCancel: () => flow.go("review"),
@@ -837,11 +902,13 @@ export function showSend(opts) {
         result = await wallet.send({
           source: opts.source, destination: state.recipient.address,
           amountKas: state.amountText, tipKas: tip.toFixed(8), selectedOutpoints: selectedOutpoints(), fromAddress,
+          // what the review shows: a send rebuilt from other coins that would pay more stops
+          expectedFeeSompi: shownFeeSompi(),
         });
       }
       const txid = (result?.txids || [])[result?.txids?.length - 1] || "";
       // the payment is out: whatever the caller does next can't turn it into "Failed"
-      try { opts.onSent?.(); } catch (error) { console.warn("[KaPay] after a send:", error); }
+      try { opts.onSent?.(); } catch (error) { logWarn("[KaPay] after a send:", error); }
       swipe?.setSent({
         txid,
         amountSompi: result?.amountSompi ?? result?.result?.summary?.amountSompi ?? amountSompi(),
@@ -855,7 +922,8 @@ export function showSend(opts) {
       if (error?.code === wallet.SEND_CANCELLED) { swipe?.returnToForm(); return; }
       if (error?.code === MAX_AMOUNT_CHANGED && opts.compound) { compoundChanged(swipe); return; }
       if (error?.code === MAX_AMOUNT_CHANGED) { maxChanged(error, swipe); return; }
-      console.warn("[KaPay] send failed:", error);
+      if (error?.code === SEND_FEE_CHANGED) { feeChanged(error, swipe); return; }
+      logWarn("[KaPay] send failed:", error);
       state.error = friendlySendError(error);
       swipe?.setBusy(false);
       // Try Again shows the review with the error under the fee.
@@ -863,12 +931,24 @@ export function showSend(opts) {
     }
   };
 
+  /** Nothing was sent: built from today's coins the send would pay more than the review showed
+   *  (KaPay iOS 1652437 SendFeeChangedError). The review now shows the fee the send said it pays,
+   *  with the error under it, and the next swipe pays exactly that. Working the estimate out again
+   *  wouldn't do: it would give the same number and refuse again. Anything changed on the review
+   *  (amount, recipient, speed, coins) drops it. */
+  const feeChanged = (error, swipe) => {
+    state.error = error.message;
+    state.feeRise = { sompi: error.feeSompi, key: reviewKey() };
+    swipe?.returnToForm();
+    if (handle?.swipe === swipe) paintReview({ force: true });
+  };
+
   /** Nothing was sent: one of the coins a Compound was reviewed with is gone. The coins are read
    *  again and the review shows what's there now. */
   const compoundChanged = (swipe) => {
     state.error = MAX_AMOUNT_CHANGED_MESSAGE;
     const address = opts.fromAddress;
-    wallet.utxos(address).then((coins) => { if (address === opts.fromAddress) { state.coins = coins; paint(); } }).catch(() => {});
+    readCoins(address).then((current) => { if (current) paint(); }).catch(() => {});
     swipe?.returnToForm();
     if (handle?.swipe === swipe) paintReview({ force: true });
   };
@@ -886,7 +966,7 @@ export function showSend(opts) {
       state.error = MAX_AMOUNT_CHANGED_MESSAGE;
       // the coins behind Available and Coin Control too (the pin above stays the engine's)
       const address = opts.fromAddress;
-      wallet.utxos(address).then((coins) => { if (address === opts.fromAddress) { state.coins = coins; paint(); } }).catch(() => {});
+      readCoins(address).then((current) => { if (current) paint(); }).catch(() => {});
     } else {
       // checked here before anything was asked: Max is worked out again for what's on screen now
       fillMax().then(() => { if (state.maxMode) state.error = MAX_AMOUNT_CHANGED_MESSAGE; paint(); });
@@ -914,18 +994,23 @@ function friendlySendError(error) {
   if (error?.code === SEND_OUTCOME_UNKNOWN) return SEND_OUTCOME_UNKNOWN_MESSAGE;
   const message = String(error?.message || error || "");
   if (/storage mass/i.test(message)) return "This amount can't be sent from these coins without leaving a tiny change output the network rejects. Try a slightly different amount, or Compound UTXOs first.";
-  if (/insufficient/i.test(message)) return "Not enough Kaspa for this amount plus the network fee.";
+  if (/insufficient/i.test(message)) return NOT_ENOUGH_FOR_FEE;
   if (/not connected|timed out|timeout/i.test(message)) return "Couldn't reach the Kaspa network. Try again in a moment.";
   return message || "Send failed.";
 }
 
 // --- Coin Control: iOS CoinControlView --------------------------------------------------------
 
-export function showCoinControl({ coins, selected, labels = {}, onCancel, onDone }) {
-  const picked = new Set(selected || []);
+export function showCoinControl({ coins, selected, labels = {}, unavailable = () => null, onCancel, onDone }) {
+  // Coins a send can't spend (`unavailable(coin)` says why) are listed greyed out and never picked,
+  // so a selection can't be made of coins the send would refuse; coins spent since they were picked
+  // drop out of the selection (KaPay iOS 1652437 CoinControlView).
+  const available = coins.filter((c) => !unavailable(c));
+  const availableKeys = new Set(available.map((c) => c.key));
+  const picked = new Set([...(selected || [])].filter((key) => availableKeys.has(key)));
   let menuOpen = false;
   const paint = () => {
-    const total = coins.filter((c) => picked.has(c.key)).reduce((sum, c) => sum + c.amount, 0n);
+    const total = available.filter((c) => picked.has(c.key)).reduce((sum, c) => sum + c.amount, 0n);
     render(`
       <header class="navbar form-bar">
         <button class="bar-text" id="cancel">Cancel</button>
@@ -940,15 +1025,19 @@ export function showCoinControl({ coins, selected, labels = {}, onCancel, onDone
       <section class="form">
         <div class="form-section">
           <div class="form-card">
-            ${coins.length ? coins.map((coin) => `
-              <button class="form-row coin" data-key="${esc(coin.key)}" role="checkbox" aria-checked="${picked.has(coin.key)}">
+            ${coins.length ? coins.map((coin) => {
+              const reason = unavailable(coin);
+              return `
+              <button class="form-row coin${reason ? " unavailable" : ""}" data-key="${esc(coin.key)}" role="checkbox" aria-checked="${picked.has(coin.key)}"${reason ? " disabled" : ""}>
                 <span class="${picked.has(coin.key) ? "accent" : "muted"}">${picked.has(coin.key) ? ICONS.circleCheck : ICONS.circle}</span>
                 <span class="coin-meta">
                   ${labels[coin.key] ? `<span class="accent tiny strong">${esc(labels[coin.key])}</span>` : ""}
                   <span class="coin-amount">${esc(formatKas8(coin.amount))} KAS</span>
                   <span class="mono tiny muted">${esc(coin.transactionId.slice(0, 10))}...:${coin.index}</span>
+                  ${reason ? `<span class="tiny warn-text">${esc(reason)}</span>` : ""}
                 </span>
-              </button>`).join("") : '<div class="form-row muted">No UTXOs found at this address.</div>'}
+              </button>`;
+            }).join("") : '<div class="form-row muted">No UTXOs found at this address.</div>'}
           </div>
           ${picked.size ? `<div class="form-footer">Selected: ${esc(formatKas8(total))} KAS (${picked.size} UTXO${picked.size === 1 ? "" : "s"})</div>` : ""}
         </div>
@@ -957,13 +1046,14 @@ export function showCoinControl({ coins, selected, labels = {}, onCancel, onDone
     $("#cancel").onclick = onCancel;
     $("#menu").onclick = () => { menuOpen = !menuOpen; paint(); };
     const selectAll = $("#select-all");
-    if (selectAll) selectAll.onclick = () => { for (const c of coins) picked.add(c.key); menuOpen = false; paint(); };
+    if (selectAll) selectAll.onclick = () => { for (const c of available) picked.add(c.key); menuOpen = false; paint(); };
     const clear = $("#clear");
     if (clear) clear.onclick = () => { picked.clear(); menuOpen = false; paint(); };
     $("#confirm").onclick = () => onDone(picked.size ? new Set(picked) : null);
     for (const row of app.querySelectorAll(".coin")) {
       row.onclick = () => {
         const key = row.dataset.key;
+        if (!availableKeys.has(key)) return;
         if (picked.has(key)) picked.delete(key); else picked.add(key);
         paint();
       };

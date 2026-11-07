@@ -25,7 +25,7 @@ import { scanQr } from "./camera.js";
 import { looksLikeName, resolveEverywhere, primaryResolution, notFoundMessage, otherDomainsHtml, bindOtherDomains, splitTypedName } from "./names.js";
 import * as dock from "./dock.js";
 import * as wallet from "./wallet.js";
-import { mergeContacts } from "./account-scope.js";
+import { mergeContacts, datedAfterDeletion } from "./account-scope.js";
 
 const ENTRIES_PREFIX = "kachat_address_book_wallet_";
 const DELETED_PREFIX = "kachat_address_book_deleted_wallet_";
@@ -558,7 +558,8 @@ export function savedNameHtml(address) {
 // entry's photo (base64 JPEG) attached. The file is "KaPay Contacts <date>.json" (KaPay 8118f09);
 // the type inside is unchanged, so a "KaPay Address Book" or "KaChat Address Book" file from
 // before still imports. Import adds every address not saved here (even one deleted
-// since - importing is asking for it back) and updates one already saved only from a newer edit.
+// since - importing is asking for it back, and it's dated after the deletion so the deletion can't
+// win again, KaPay iOS 1652437) and updates one already saved only from a newer edit.
 
 const EXPORT_KIND = "kachat-address-book";
 const IMPORT_PARAM = "book";
@@ -649,7 +650,9 @@ async function importText(text) {
       updated += 1;
     } else {
       const id = typeof incoming.id === "string" && !entries.some((e) => e.id === incoming.id) ? incoming.id : crypto.randomUUID();
-      entries.push({ id, address, name: String(incoming.name ?? "").trim(), note: String(incoming.note ?? "").trim(), createdAt: fromIso(incoming.createdAt), updatedAt });
+      // a contact deleted here comes back as a new edit
+      const dated = deleted[address] != null ? datedAfterDeletion(deleted[address]) : updatedAt;
+      entries.push({ id, address, name: String(incoming.name ?? "").trim(), note: String(incoming.note ?? "").trim(), createdAt: fromIso(incoming.createdAt), updatedAt: dated });
       if (photo) photos[address] = photo;
       added += 1;
     }

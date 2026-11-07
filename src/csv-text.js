@@ -18,3 +18,25 @@ export function csvTextBack(value) {
   const text = String(value ?? "");
   return text.startsWith("'") && FORMULA.test(text) ? text.slice(1) : text;
 }
+
+// --- Which rows an import replaces (iOS PortfolioViewModel.importCsv, KaPay iOS 1652437) -----------
+//
+// A row in the file replaces a row the portfolio already had at that time - on the second, since the
+// export writes whole seconds and rows from an address import or Add to Portfolio carry
+// milliseconds. Only rows from before this import, each at most once: two rows of the same second
+// in the file are two transactions.
+
+/** -> take(portfolioId, timestamp): the index in `transactions` (the rows before the import) of the
+ *  row a file row at `timestamp` (ms) replaces, or -1; each row is handed out once. */
+export function csvRowMatcher(transactions) {
+  const bySecond = new Map(); // "portfolioId|second" -> indexes still to hand out
+  (Array.isArray(transactions) ? transactions : []).forEach((tx, index) => {
+    const key = `${tx?.portfolioId}|${Math.floor(Number(tx?.timestamp) / 1000)}`;
+    if (!bySecond.has(key)) bySecond.set(key, []);
+    bySecond.get(key).push(index);
+  });
+  return (portfolioId, timestamp) => {
+    const waiting = bySecond.get(`${portfolioId}|${Math.floor(Number(timestamp) / 1000)}`);
+    return waiting?.length ? waiting.shift() : -1;
+  };
+}

@@ -21,6 +21,7 @@ import { SYMBOLS, openPanel } from "./kachat-ui.js";
 import { NETWORK, KAS_UNIT, reencodeAddress } from "./net.js";
 import * as wallet from "./wallet.js";
 import { mergeBellEntries } from "./account-scope.js";
+import { logWarn } from "./log.js";
 
 const MAX_ENTRIES = 100;
 const MAX_HANDLED = 500;
@@ -311,7 +312,7 @@ export async function checkReceipts(addresses, { force = false, account = null }
     write(baselineKey(), next);
     write(handledKey(), [...handled].slice(-MAX_HANDLED));
   } catch (error) {
-    console.warn("[KaPay] bell receipts:", error);
+    logWarn("[KaPay] bell receipts:", error);
   } finally {
     receiptsRunning = false;
   }

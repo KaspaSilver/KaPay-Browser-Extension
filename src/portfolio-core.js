@@ -20,7 +20,7 @@ import {
 import { fetchNetworkStats, peekNetworkStats } from "../shared/engine/network-stats.js";
 import { getEndpoint } from "../shared/engine/endpoints.js";
 import { transactionBelongsInHistory } from "../shared/engine/sync.js";
-import { csvText, csvTextBack } from "./csv-text.js";
+import { csvText, csvTextBack, csvRowMatcher } from "./csv-text.js";
 
 export { yearToDateDays, CHART_PAIRS, utcDayKey };
 
@@ -1140,6 +1140,12 @@ export async function importCsv(text) {
     return targetByName.get(key);
   };
   const targets = [];
+  // the rows each portfolio had before this import, matched on the second, each once (KaPay iOS 1652437)
+  const matchers = new Map();
+  const matchIn = (portfolio, timestamp) => {
+    if (!matchers.has(portfolio.id)) matchers.set(portfolio.id, csvRowMatcher(portfolio.transactions));
+    return matchers.get(portfolio.id)(portfolio.id, timestamp);
+  };
   let count = 0;
   for (const f of records) {
     if (f.length < 6) continue;
@@ -1165,10 +1171,18 @@ export async function importCsv(text) {
     if (amountSompi == null) continue;
     const portfolio = target(f);
     if (!targets.includes(portfolio)) targets.push(portfolio);
-    const existing = portfolio.transactions.findIndex((t) => t.timestamp === timestamp);
+    const existing = matchIn(portfolio, timestamp);
     const row = { type, amountSompi, fiatValue: total, timestamp, notes, portfolioId: portfolio.id };
-    if (existing >= 0) portfolio.transactions[existing] = { ...row, id: portfolio.transactions[existing].id };
-    else portfolio.transactions.push({ ...row, id: uuid() });
+    if (existing >= 0) {
+      // the row keeps its own time to the millisecond, and the address and transaction it came from
+      // (how a re-import of the address recognises it)
+      const previous = portfolio.transactions[existing];
+      portfolio.transactions[existing] = { ...row, id: previous.id, timestamp: previous.timestamp };
+      if (previous.sourceAddress) portfolio.transactions[existing].sourceAddress = previous.sourceAddress;
+      if (previous.sourceTxId) portfolio.transactions[existing].sourceTxId = previous.sourceTxId;
+    } else {
+      portfolio.transactions.push({ ...row, id: uuid() });
+    }
     count += 1;
   }
   if (count) {

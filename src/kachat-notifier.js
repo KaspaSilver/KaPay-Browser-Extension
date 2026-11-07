@@ -20,6 +20,7 @@ import { bytesEqual } from "../shared/engine/kachat-names/codec.js";
 import { dayString } from "../shared/engine/kachat-names/actions.js";
 import { amount } from "./kachat-live.js";
 import { record } from "./bell.js";
+import { logWarn } from "./log.js";
 
 const SNAPSHOT_PREFIX = "kachat-names-notifier-v1:";
 /** A check runs at most this often (refreshes and opening the wallet both ask). */
@@ -201,7 +202,7 @@ export async function checkKachatNamesNews() {
     if (!stillMine()) return;
     writeSnapshot(walletAddress, next);
   } catch (error) {
-    console.warn("[KaPay] .kachat news check failed:", error);
+    logWarn("[KaPay] .kachat news check failed:", error);
   } finally {
     checking = false;
   }

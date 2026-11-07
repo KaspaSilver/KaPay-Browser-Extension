@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import {
   setShownAccount, shownAccount, shownActiveAccount, followsSwitch, SWITCHED_ELSEWHERE,
-  accountDataKeys, withoutAccount, mergeBellEntries, mergeContacts,
+  accountDataKeys, withoutAccount, mergeBellEntries, mergeContacts, datedAfterDeletion,
 } from "../src/account-scope.js";
 import { createAccountBackupStatus } from "../shared/ui/account-backup-status.js";
 
@@ -123,5 +123,12 @@ assert.equal(carried.isPending("kaspatest:qnew"), true);
 const shared = accountDataKeys({ accountId: "acc2", chatting: "kaspa:qa", addresses: ["kaspa:qshared", "kaspa:qmine"], variants: (a) => [a], keep: ["kaspa:QShared"] });
 assert.ok(!shared.local.includes("kachat.utxoLabels.kaspa:qshared"));
 assert.ok(shared.local.includes("kachat.utxoLabels.kaspa:qmine"));
+
+// An imported contact that was deleted here is dated after the deletion (KaPay iOS 1652437): past the
+// deletion's second, and never before now.
+assert.equal(datedAfterDeletion(1_700_000_000_500, 1_000), 1_700_000_001_000);
+assert.equal(datedAfterDeletion(1_700_000_000_000, 1_000), 1_700_000_001_000);
+assert.equal(datedAfterDeletion(1_000, 1_700_000_000_123), 1_700_000_000_123);
+assert.equal(datedAfterDeletion(undefined, 42), 42);
 
 console.log("account scope: ok");

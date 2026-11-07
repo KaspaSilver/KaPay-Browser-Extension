@@ -23,7 +23,7 @@ import {
 } from "../shared/engine/quantum.js";
 import { createRpc, probeRpc, disconnectRpc, getNodeRegistrySnapshot, forgetEndpoint, markBadNode, knownPublicNodes } from "../shared/engine/rpc.js";
 import { getEndpoint } from "../shared/engine/endpoints.js";
-import { getBalance, sendKaspa, sendMaxKaspa, estimateSendFeeDetail, estimateOnchainFeeDetail, estimateMaxSend, submitConfirmingAcceptance, SEND_OUTCOME_UNKNOWN, setReservedOutpoints, sanitizeUtxoEntries } from "../shared/engine/transactions.js";
+import { getBalance, sendKaspa, sendMaxKaspa, estimateSendFeeDetail, estimateOnchainFeeDetail, estimateMaxSend, submitConfirmingAcceptance, SEND_OUTCOME_UNKNOWN, setReservedOutpoints, sanitizeUtxoEntries, excludeJustSpentUtxos } from "../shared/engine/transactions.js";
 import { checkedUtxoAnswer } from "../shared/engine/amounts.js";
 import { calculateMass, calculateFee, fetchQuotedFeeRateSompiPerGram } from "../shared/ui/kspt.js";
 import { looksLikeName, resolveEverywhere, primaryResolution, notFoundMessage, ownsAnyName, ownedNamesOfMany } from "./names.js";
@@ -35,14 +35,15 @@ import {
   resumeKnsTransfer, clearPendingKnsTransfer,
 } from "../shared/engine/kns-write.js";
 import { getLocal, setLocal, removeLocal, getSession, setSession } from "./browser.js";
-import { IS_TESTNET, NETWORK as ACTIVE_NETWORK, NETWORK_ID, ADDRESS_PREFIX, netKey, MAINNET_REST, TESTNET_REST, MAINNET_KNS, TESTNET_KNS, isValidKaspaAddress, networkOfAddress } from "./net.js";
+import { IS_TESTNET, NETWORK as ACTIVE_NETWORK, NETWORK_ID, ADDRESS_PREFIX, KAS_UNIT, netKey, MAINNET_REST, TESTNET_REST, MAINNET_KNS, TESTNET_KNS, isValidKaspaAddress, networkOfAddress } from "./net.js";
 import { activeAccountSecrets, accountSecretsById, ACCOUNT_IDS_KEY } from "./vault.js";
 import { sompiFromUserText } from "./amounts.js";
 import { sourceChangedError, SOURCE_CHANGED } from "./send-guards.js";
 import {
   HELD_COINS_MESSAGE, liveHolds, mergeHolds, holdSpentCoins, heldKeys, heldCountAt, nextHoldExpiry, withoutHeldCoins,
-  heldCoinsError, maxCoinKeys, watchedSend,
+  heldCoinsError, maxCoinKeys, watchedSend, recordBuiltInputs, transactionInputKeys,
 } from "./send-coins.js";
+import { logInfo, logWarn } from "./log.js";
 
 let kaspaPromise = null;
 
@@ -245,7 +246,7 @@ export async function deriveAddresses() {
  */
 // Every connection step goes to the console (right-click the popup > Inspect > Console), which
 // is where to look when the dot stays yellow.
-const logConnection = (...parts) => console.info("[KaPay]", ...parts);
+const logConnection = logInfo;
 const LAST_NODE_KEY = netKey("kachat.lastNode");
 
 export async function connection(log = logConnection) {
@@ -560,17 +561,30 @@ async function holdCoins(keys, address) {
     pushHolds();
     await setSession(SPENT_COINS_KEY, spentCoins);
   } catch (error) {
-    console.warn("[KaPay] couldn't keep a send's coins for other windows:", error);
+    logWarn("[KaPay] couldn't keep a send's coins for other windows:", error);
   }
 }
 /** How many of `address`'s coins the last send holds (as last read). */
 export function heldCoinCount(address) { return heldCountAt(spentCoins, address); }
 export { HELD_COINS_MESSAGE };
 
+/** Holds the coins of a transaction this wallet submitted outside a send (Cold Storage's
+ *  broadcast): every node-pool submit holds its coins, on success and on "Not confirmed"
+ *  (KaPay iOS 1652437 NodePoolService.submitTransaction). `keys`: "txid:index". */
+export async function holdSubmittedCoins(keys, address) {
+  try { await holdCoins(keys, address); } catch { /* bookkeeping: the submit stands as it went */ }
+}
+
+/** Node entries less every coin held back: this page's and other windows' holds, and the ones the
+ *  engine itself noted after a submit in this page (a .kas commit, a .kachat combine). */
+function withoutSpentEntries(entries, holds) {
+  return excludeJustSpentUtxos(withoutHeldCoins(entries, holds));
+}
+
 /** The address's coins as node entries, less the held ones. */
 async function spendableEntries(address) {
   const response = await withRpc(async (node) => checkedUtxoAnswer(await node.getUtxosByAddresses([address])));
-  return withoutHeldCoins(sanitizeUtxoEntries(response?.entries), await currentHolds());
+  return withoutSpentEntries(sanitizeUtxoEntries(response?.entries), await currentHolds());
 }
 /** The coins a Max or Compound spends (KaPay iOS 0799cec oneTransactionChunk): the coin-control
  *  pick, else the largest 80 when there are more than one transaction can spend, else null (every
@@ -580,11 +594,15 @@ async function maxPickAt(address, selectedOutpoints = null) {
   return maxCoinKeys(await spendableEntries(address));
 }
 
-/** Spendable coins at an address, sorted largest first; coins the last send spent are left out. */
-export async function utxos(address) {
+/** Spendable coins at an address, sorted largest first; coins the last send spent are left out.
+ *  `withHeld`: those too, marked `held` - Coin Control lists them greyed out, never picked (KaPay
+ *  iOS 1652437 CoinControlView.unavailableReason). */
+export async function utxos(address, { withHeld = false } = {}) {
   const response = await withRpc(async (node) => checkedUtxoAnswer(await node.getUtxosByAddresses([address])));
   const holds = await currentHolds();
-  return withoutHeldCoins(response?.entries || [], holds)
+  const entries = response?.entries || [];
+  const spendable = new Set(withoutSpentEntries(entries, holds));
+  return (withHeld ? entries : [...spendable])
     .map((entry) => ({
       entry,
       key: `${entry?.outpoint?.transactionId}:${entry?.outpoint?.index}`,
@@ -593,6 +611,7 @@ export async function utxos(address) {
       amount: BigInt(entry?.amount ?? 0),
       daaScore: BigInt(entry?.blockDaaScore ?? 0),
       isCoinbase: Boolean(entry?.isCoinbase),
+      held: !spendable.has(entry),
     }))
     .sort((a, b) => (a.amount > b.amount ? -1 : a.amount < b.amount ? 1 : 0));
 }
@@ -699,18 +718,23 @@ export async function maxFee(inputCount, { sourceIndex = null } = {}) {
  * (or the picked ones), one output to `destination`, `totalFeeKas` raised to the network floor.
  * Its `outpoints` and `amountSompi` are the pin a Max send is given, so what's sent is what was
  * shown. Coins the last send spent are left out, and past 80 coins it's the largest 80 (one
- * transaction's worth, KaPay iOS 0799cec): the send picks the same ones.
- * -> { outpoints, totalSompi, feeSompi, amountSompi, inputCount, availableSompi }
+ * transaction's worth, KaPay iOS 0799cec): the send picks the same ones, and `cappedAtInputLimit`
+ * says so (KaPay iOS 1652437: the screen tells why Max isn't the whole balance).
+ * -> { outpoints, totalSompi, feeSompi, amountSompi, inputCount, availableSompi, cappedAtInputLimit }
  */
 export async function estimateMax({ address, destination = null, selectedOutpoints = null, totalFeeKas = null }) {
   await currentHolds();
   try {
-    return await estimateMaxSend({
+    const picked = Array.isArray(selectedOutpoints) && selectedOutpoints.length > 0;
+    const pick = await maxPickAt(address, selectedOutpoints);
+    const plan = await estimateMaxSend({
       kaspa: await kaspa(), rpc: await connection(), withRpc,
       sourceAddress: address, destinationAddress: destination || address,
-      selectedOutpoints: await maxPickAt(address, selectedOutpoints),
+      selectedOutpoints: pick,
       totalFeeSompi: totalFeeKas != null ? kasToSompi(String(totalFeeKas)) : null,
     });
+    // the engine says it only when it chose the 80 itself; here they're picked first (maxPickAt)
+    return { ...plan, cappedAtInputLimit: Boolean(plan.cappedAtInputLimit) || (!picked && Array.isArray(pick)) };
   } catch (error) {
     throw heldCoinsError(error, { holding: heldCoinCount(address) > 0 });
   }
@@ -718,10 +742,15 @@ export async function estimateMax({ address, destination = null, selectedOutpoin
 
 /** One engine send from `address` (send-coins.js watchedSend, KaPay iOS 0799cec): the coins it spent
  *  are held once it's out or "Not confirmed", and a node's rejection is reported as one even when
- *  another node timed out first. `start({ kaspa, withRpc })` calls the engine with those two. */
-async function spendFrom(address, start) {
+ *  another node timed out first. `start({ kaspa, withRpc })` calls the engine with those two.
+ *  `expectedFeeSompi`: the fee the Review showed; a send built that would pay more stops before
+ *  anything is signed (SEND_FEE_CHANGED, KaPay iOS 1652437). */
+async function spendFrom(address, start, { expectedFeeSompi = null } = {}) {
   await currentHolds();
-  return watchedSend({ kaspa: await kaspa(), withRpc, start, onSpent: (keys) => holdCoins(keys, address), holding: () => heldCoinCount(address) > 0 });
+  return watchedSend({
+    kaspa: await kaspa(), withRpc, start, onSpent: (keys) => holdCoins(keys, address), holding: () => heldCoinCount(address) > 0,
+    expectedFeeSompi, unit: KAS_UNIT,
+  });
 }
 
 /**
@@ -732,9 +761,11 @@ async function spendFrom(address, start) {
  * `fromAddress` / `fromAccountId`: the source the review showed - a different key is refused
  * (SOURCE_CHANGED) before anything is built. A Max pins `maxAmountSompi` (the amount shown) and
  * `maxOutpoints` (the coins it was worked out from, estimateMax): coins or a fee that changed
- * meanwhile throw MAX_AMOUNT_CHANGED with the new amount, and nothing is sent.
+ * meanwhile throw MAX_AMOUNT_CHANGED with the new amount, and nothing is sent. `expectedFeeSompi`
+ * (a normal send): the fee the Review showed - rebuilt from other coins, a send that would pay more
+ * throws SEND_FEE_CHANGED and nothing is sent (KaPay iOS 1652437).
  */
-export async function send({ source, destination, amountKas = null, tipKas = "0", totalFeeKas = null, selectedOutpoints = null, max = false, maxAmountSompi = null, maxOutpoints = null, fromAddress = null, fromAccountId = null, totalText = null, extraFeeText = null, beforeBuild = null, onAuthorized = null }) {
+export async function send({ source, destination, amountKas = null, tipKas = "0", totalFeeKas = null, selectedOutpoints = null, max = false, maxAmountSompi = null, maxOutpoints = null, fromAddress = null, fromAccountId = null, totalText = null, extraFeeText = null, beforeBuild = null, onAuthorized = null, expectedFeeSompi = null }) {
   await confirmSpend({ amountText: max ? sompiText(maxAmountSompi) : sompiText(kasToSompi(String(amountKas ?? ""))), recipient: destination, max, totalText, extraFeeText });
   // the caller's last word, after the password (which can sit open for a while) and before anything
   // is built: false stops here (audit 2026-11-07)
@@ -748,7 +779,7 @@ export async function send({ source, destination, amountKas = null, tipKas = "0"
   // derived after the password, which can sit open while another window switches accounts
   const from = await sourceWallet(source, { address: fromAddress, accountId: fromAccountId });
   const node = await connection();
-  const log = (...parts) => console.info("[KaPay]", ...parts);
+  const log = logInfo;
   if (max) {
     // the coins estimateMax worked out from, picked again the same way: past 80 coins the largest 80
     const pick = await maxPickAt(from.address, selectedOutpoints);
@@ -794,7 +825,7 @@ export async function send({ source, destination, amountKas = null, tipKas = "0"
     ...engine, rpc: node, privateKey: from.privateKeyHex, sourceAddress: from.address,
     destinationAddress: destination, amountKas: String(amountKas), feeKas: String(tipKas || "0"),
     selectedOutpoints, changeAddress: fresh?.address || null, redeemScript: from.redeemScript, log,
-  })), async () => {
+  }), { expectedFeeSompi }), async () => {
     if (from.quantum) await markQuantumSpent(from.accountId, from.address);
     if (fresh && wasPrimary) await saveSpendingState(from.accountId, { activeIndex: fresh.index });
   });
@@ -816,7 +847,7 @@ async function afterSend(sending, record) {
   return result;
 }
 async function recordQuietly(record) {
-  try { await record(); } catch (error) { console.warn("[KaPay] couldn't record a send (it went out as reported):", error); }
+  try { await record(); } catch (error) { logWarn("[KaPay] couldn't record a send (it went out as reported):", error); }
 }
 
 /** Merges the source's coins into one (a self-send with no change) in ONE transaction: every coin,
@@ -841,7 +872,7 @@ export async function compound(source, totalFeeKas = null, { fromAddress = null,
     // the 80 coins the review showed, exactly: one spent meanwhile throws MAX_AMOUNT_CHANGED rather
     // than compounding fewer at the fee worked out for all of them
     expectedOutpoints: chunked ? outpoints : null,
-    log: (...parts) => console.info("[KaPay]", ...parts),
+    log: logInfo,
   })), async () => { if (from.quantum) await markQuantumSpent(from.accountId, from.address); });
 }
 
@@ -1326,7 +1357,7 @@ export async function runPendingDiscovery(accountId) {
     await discoverSpendingAddresses();
     await removeLocal(pendingDiscoveryKey(accountId));
   } catch (error) {
-    console.warn("[KaPay] restore discovery (tried again next time):", error);
+    logWarn("[KaPay] restore discovery (tried again next time):", error);
   } finally {
     pendingDiscoveryRunning = false;
   }
@@ -1515,15 +1546,21 @@ export async function transferDomain({ domain, assetId, toAddress, priorityFeeSo
       }
     }
   }
-  const result = await knsTransferDomain({
-    engine, domain, assetId, toAddress,
-    signer: { privateKey: engine.privateKey, address: engine.address },
-    // Who signs, so Finish transfer can rebuild the commit's key after a closed popup.
-    source: { kind: source?.kind || "main", index: source?.index ?? null, accountId: engine.accountId },
-    changeAddress: fresh?.address || null,
-    revealPriorityFeeSompi: priorityFeeSompi,
-    onStatus,
-    log: (...parts) => console.info("[KaPay]", ...parts),
+  // Watched like a send (KaPay iOS 1652437: every node-pool submit holds its coins): the commit's
+  // coins are held once it's out, also when the reveal then fails or the commit is "Not confirmed".
+  const result = await spendFrom(engine.address, (watched) => {
+    engine.kaspa = watched.kaspa;
+    engine.withRpc = watched.withRpc;
+    return knsTransferDomain({
+      engine, domain, assetId, toAddress,
+      signer: { privateKey: engine.privateKey, address: engine.address },
+      // Who signs, so Finish transfer can rebuild the commit's key after a closed popup.
+      source: { kind: source?.kind || "main", index: source?.index ?? null, accountId: engine.accountId },
+      changeAddress: fresh?.address || null,
+      revealPriorityFeeSompi: priorityFeeSompi,
+      onStatus,
+      log: logInfo,
+    });
   });
   if (fresh) {
     // the primary moves to the change slot once it's accepted; a slip here never fails the transfer
@@ -1548,7 +1585,7 @@ export async function finishDomainTransfer(record, onStatus = () => {}) {
     engine, assetId: record.assetId,
     signer: { privateKey: engine.privateKey, address: engine.address },
     onStatus,
-    log: (...parts) => console.info("[KaPay]", ...parts),
+    log: logInfo,
   });
 }
 
@@ -1665,7 +1702,16 @@ export async function ksptEngine() {
     kaspa: k,
     connect: () => connection(),
     withRpc: (fn) => withRpc(fn),
-    balanceForAddress: async (address) => withRpc((node) => getBalance(k, node, address)),
+    // the coins a Cold Storage build may spend: not the ones its last broadcast (or a send) just
+    // spent, which the node still lists (KaPay iOS 1652437 holds every node-pool submit's coins)
+    balanceForAddress: async (address) => {
+      const balance = await withRpc((node) => getBalance(k, node, address));
+      const entries = withoutSpentEntries(balance.entries, await currentHolds());
+      if (entries.length === balance.entries.length) return balance;
+      const totalSompi = entries.reduce((sum, entry) => sum + BigInt(entry?.amount ?? 0), 0n);
+      return { ...balance, entries, totalSompi, utxoCount: entries.length };
+    },
+    log: logInfo,
   };
 }
 
@@ -1711,10 +1757,25 @@ function plainUtxo(e) {
  * No key: the signer is bound separately (chattingSigner).
  */
 export function namesNodeMethods() {
+  // What the bound Kaspa module last built (recording()): a names broadcast's coins are held like a
+  // send's (KaPay iOS 1652437: .kachat names, profile records and combines too).
+  let built = null;
   const methods = {
-    log: (...parts) => console.info("[KaPay]", ...parts),
+    log: logInfo,
     connect: () => connection(),
-    withRpc: (fn) => withRpc(fn),
+    /** The bound Kaspa module, noting what each build spends (kachat-names.js bind). */
+    recording(kaspaModule) {
+      built = kaspaModule ? recordBuiltInputs(kaspaModule) : null;
+      return built ? built.kaspa : kaspaModule;
+    },
+    /** The node call wrapper; a broadcast a node takes holds the coins its build spent, at the
+     *  bound address (called on the engine object, so `this.address` is the signer's). */
+    async withRpc(fn, options) {
+      const keys = built && /broadcast$/i.test(String(options?.label || "")) ? built.keys() : null;
+      const result = await withRpc(fn);
+      if (keys?.length) await holdSubmittedCoins(keys, this?.address || "");
+      return result;
+    },
     async currentDagPoint() {
       return withRpc(async (node) => {
         const dag = await node.getBlockDagInfo();
@@ -1728,6 +1789,9 @@ export function namesNodeMethods() {
       try { return (await methods.currentDagPoint()).virtualDaaScore; } catch { return null; }
     },
     async getUtxosWithCovenants(addresses) {
+      // every window's held coins on the engine's reserved list first: the names' funding leaves
+      // them out (engine fundingUtxos), as iOS's unreservedUtxos (KaPay iOS 1652437)
+      try { await currentHolds(); } catch { /* the engine keeps the list it has */ }
       const list = [...new Set((addresses || []).map(String).filter(Boolean))];
       const out = [];
       for (let start = 0; start < list.length; start += 50) {
@@ -1780,13 +1844,23 @@ export function namesNodeMethods() {
       if (!localId) {
         try { localId = transaction?.id ? String(transaction.id) : null; } catch { localId = null; }
       }
-      return submitConfirmingAcceptance({
-        withRpc,
-        submit: (node, { allowOrphan = false } = {}) => node.submitTransaction({ transaction, allowOrphan }),
-        txid: localId,
-        label: "Transaction submit",
-        log: (...parts) => console.info("[KaPay]", ...parts),
-      });
+      // its coins held once it's out or "Not confirmed" (KaPay iOS 1652437 submitRpcTransaction)
+      const spends = transactionInputKeys(transaction);
+      try {
+        const txid = await submitConfirmingAcceptance({
+          withRpc,
+          submit: (node, { allowOrphan = false } = {}) => node.submitTransaction({ transaction, allowOrphan }),
+          txid: localId,
+          spends,
+          label: "Transaction submit",
+          log: logInfo,
+        });
+        await holdSubmittedCoins(spends, this?.address || "");
+        return txid;
+      } catch (error) {
+        if (error?.code === SEND_OUTCOME_UNKNOWN) await holdSubmittedCoins(spends, this?.address || "");
+        throw error;
+      }
     },
     /** The fee (BigInt sompi) of a 0.2 KAS self-transfer from the bound address carrying
      *  `payloadBytes` of payload (optionally only from `selectedOutpoints`); null when unknown.

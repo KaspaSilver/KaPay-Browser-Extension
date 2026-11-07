@@ -405,6 +405,8 @@ textarea.recipient { background: transparent; border: 0; border-radius: 0; min-h
 .coin .coin-meta { flex: 1; display: flex; flex-direction: column; }
 .coin svg { color: var(--muted); flex: none; }
 .coin-amount { font-weight: 600; }
+/* a coin a send can't spend (just spent by one): listed, greyed out, never picked (KaPay iOS 1652437) */
+.coin.unavailable { opacity: 0.5; cursor: default; }
 
 /* --- Sent sheet ----------------------------------------------------------------------------------- */
 .screen.sent { align-items: center; text-align: center; padding-top: 36px; }
