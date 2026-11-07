@@ -6,10 +6,12 @@
 // counts on the Wallet tab and on Your Domains start from the saved list too.
 //
 // The list itself is kachat-live.js's liveDomainsTab, which keeps its entries in
-// `liveDomainsTab.cache` (address -> { names, offers, loaded, ... }); this seeds an entry from the
-// saved copy before its first load and saves the entry again whenever a load brings new names.
+// `liveDomainsTab.cache` (domainsCacheKey(address) -> { names, offers, loaded, ... }; an address's
+// own .kachat tab keeps a separate entry, so its list is never saved as the wallet's); this seeds
+// an entry from the saved copy before its first load and saves the entry again whenever a load
+// brings new names.
 
-import { liveDomainsTab } from "./kachat-live.js";
+import { liveDomainsTab, domainsCacheKey } from "./kachat-live.js";
 import { kachatRegistry } from "./kachat-names.js";
 import { NameInfo, OfferInfo, Status } from "../shared/engine/kachat-names/registry-state.js";
 import { NETWORK } from "./net.js";
@@ -77,7 +79,7 @@ export function cachedOwnedCount(address) {
 }
 
 /** The list's entry for `address` (`{ names, loaded, ... }`), or undefined before it is asked for. */
-export function ownedDomainsEntry(address) { return liveDomainsTab.cache?.get(address); }
+export function ownedDomainsEntry(address) { return liveDomainsTab.cache?.get(domainsCacheKey(address)); }
 
 /** The names and offers one load started with, per address: a load that answers replaces the
  *  array (kachat-live.js), a failed one leaves it - so a new array is an answer to save. */
@@ -89,19 +91,20 @@ const seen = new Map();
  */
 export function ownedDomainsTab(address, repaint) {
   const cache = liveDomainsTab.cache || (liveDomainsTab.cache = new Map());
-  if (kachatRegistry() && !cache.has(address)) {
+  const cacheKey = domainsCacheKey(address);
+  if (kachatRegistry() && !cache.has(cacheKey)) {
     const saved = loadOwnedNames(address);
     if (saved) {
       // shown at once (iOS showCachedIfNeeded: loaded); revision -1, so the read still runs behind it
-      cache.set(address, { names: withoutLapsed(saved.names), offers: saved.offers, loaded: true, loading: false, revision: -1 });
+      cache.set(cacheKey, { names: withoutLapsed(saved.names), offers: saved.offers, loaded: true, loading: false, revision: -1 });
     }
   }
-  const entry = cache.get(address);
+  const entry = cache.get(cacheKey);
   if (entry && !seen.has(address)) seen.set(address, { names: entry.names, offers: entry.offers });
   return liveDomainsTab({
     address,
     repaint: () => {
-      const now = cache.get(address);
+      const now = cache.get(cacheKey);
       const before = seen.get(address);
       if (now?.loaded && (!before || now.names !== before.names)) {
         saveOwnedNames(address, now.names, now.offers);

@@ -124,15 +124,19 @@ export async function createVault(password, account) {
   if (String(password || "").length < MIN_PASSWORD_LENGTH) {
     throw new Error(`Use a password of at least ${MIN_PASSWORD_LENGTH} characters.`);
   }
-  if (await hasVault()) throw new Error("A wallet already exists in this browser.");
-  const kdf = newKdf();
-  const keyBytes = await deriveKeyBytes(password, fromBase64(kdf.salt), kdf.iterations);
   const stored = { ...normalizeAccount(account), id: newAccountId(), createdAt: Date.now() };
-  const payload = { accounts: [stored], activeAccountId: stored.id };
-  await setLocal(VAULT_KEY, await seal(payload, keyBytes, kdf));
-  await publishAccountIds(payload);
-  await setSession(SESSION_KEY, sessionRecord(keyBytes, kdf));
-  return publicView(payload);
+  // Inside the vault lock, checked again there: two windows making the first account at once
+  // can't both find no vault and the second overwrite the first one's.
+  return withVaultLock(async () => {
+    if (await hasVault()) throw new Error("A wallet already exists in this browser.");
+    const kdf = newKdf();
+    const keyBytes = await deriveKeyBytes(password, fromBase64(kdf.salt), kdf.iterations);
+    const payload = { accounts: [stored], activeAccountId: stored.id };
+    await setLocal(VAULT_KEY, await seal(payload, keyBytes, kdf));
+    await publishAccountIds(payload);
+    await setSession(SESSION_KEY, sessionRecord(keyBytes, kdf));
+    return publicView(payload);
+  });
 }
 
 /** Unlocks with the password. Throws "Wrong password." when it does not open the vault. Inside the
@@ -181,8 +185,16 @@ async function migratePassphrases(payload) {
   for (const account of changed) account.passphrase = nfkd(account.passphrase);
   await writePayload(payload);
   await removeLocal(changed.flatMap((a) => [`kachat.addresses.${a.id}`, `kachat.addresses.${a.id}.testnet`])).catch(() => {});
+  // Their websites still hold the old chatting address: noted here (this file can't derive an
+  // address), and the wallet window moves those connections to the new one (popup.js).
+  const owed = new Set([...((await getLocal(CONNECTIONS_TO_FOLLOW_KEY).catch(() => null)) || []), ...changed.map((a) => a.id)]);
+  await setLocal(CONNECTIONS_TO_FOLLOW_KEY, [...owed]).catch(() => {});
   return payload;
 }
+
+/** Accounts whose chatting address the passphrase migration changed, whose website connections
+ *  still have to follow it (approve.js followAccount). */
+export const CONNECTIONS_TO_FOLLOW_KEY = "kachat.connectionsToFollow";
 
 // Vault changes take turns across every open window - popup, tab, approval window - through one
 // Web Lock (audit EXT-027): an account change reads, edits and writes the vault inside it, and a
@@ -209,13 +221,17 @@ async function writePayload(payload) {
 /** The ids of the accounts in the vault, readable without the password: the background worker
  *  answers websites only for connections whose account still exists (audit EXT-002). */
 export const ACCOUNT_IDS_KEY = "kachat.accountIds";
+/** The active account's id, the same way: every open wallet window follows a switch made in
+ *  another one (popup.js), so none keeps showing an account that is no longer the active one. */
+export const ACTIVE_ACCOUNT_KEY = "kachat.activeAccountId";
 async function publishAccountIds(payload) {
   await setLocal(ACCOUNT_IDS_KEY, payload.accounts.map((a) => a.id));
+  await setLocal(ACTIVE_ACCOUNT_KEY, payload.activeAccountId || null);
 }
 
 function normalizeAccount(account) {
   const mnemonic = String(account?.mnemonic || "").trim().toLowerCase().replace(/\s+/g, " ");
-  if (!mnemonic) throw new Error("A recovery phrase is required.");
+  if (!mnemonic) throw new Error("Your 12 or 24 words are required.");
   return {
     name: String(account?.name || "").trim() || "Account 1",
     mnemonic,

@@ -11,6 +11,10 @@ import jsQR from "jsqr";
 import { ext } from "./browser.js";
 import { esc, isTab } from "./ui.js";
 
+/** Finishes the scan that is open (camera stopped, loop cancelled, its promise resolved null), or
+ *  null when none is: a new scan ends the one it replaces instead of leaving it running. */
+let finishOpenScan = null;
+
 const CLOSE = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>';
 
 /**
@@ -23,6 +27,7 @@ const CLOSE = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" strok
  */
 export function scanQr({ title = "Scan QR Code", hint = "Point camera at a QR code", onBinaryFrame = null } = {}) {
   return new Promise((resolve) => {
+    finishOpenScan?.(null);
     document.querySelector(".scanner")?.remove();
     const overlay = document.createElement("div");
     overlay.className = "scanner";
@@ -45,14 +50,19 @@ export function scanQr({ title = "Scan QR Code", hint = "Point camera at a QR co
     let stream = null;
     let running = true;
     let lastDecode = 0;
+    let frame = 0;
 
     const finish = (value) => {
+      if (!running) return;
       running = false;
+      if (finishOpenScan === finish) finishOpenScan = null;
+      cancelAnimationFrame(frame);
       if (stream) for (const track of stream.getTracks()) track.stop();
       overlay.remove();
       document.removeEventListener("visibilitychange", onHidden);
       resolve(value);
     };
+    finishOpenScan = finish;
     const onHidden = () => { if (document.hidden) finish(null); };
     document.addEventListener("visibilitychange", onHidden);
     overlay.querySelector("[data-cancel]").onclick = () => finish(null);
@@ -113,9 +123,9 @@ export function scanQr({ title = "Scan QR Code", hint = "Point camera at a QR co
             }
           }
         }
-        requestAnimationFrame(tick);
+        frame = requestAnimationFrame(tick);
       };
-      requestAnimationFrame(tick);
+      frame = requestAnimationFrame(tick);
     })();
   });
 }

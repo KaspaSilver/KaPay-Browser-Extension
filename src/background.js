@@ -14,6 +14,10 @@
 // back. Nothing is approved without the user seeing the site's origin.
 
 import { ext } from "./browser.js";
+import {
+  rejected, maybeSent, approvalAnswer, claimDecision, sitePriorityFee, cooldownLeft,
+  connectionChangeEvents, networkSwitchEvents, openStateEvents,
+} from "./site-rules.js";
 
 const ALARM = "kachat.autolock";
 const CLIPBOARD_ALARM = "kachat.clear-clipboard";
@@ -40,6 +44,10 @@ async function lockNow() {
 }
 const NETWORK_MIRROR_KEY = "kachat.network"; // net.js mirrors the pages' choice here (no localStorage in a worker)
 
+// Log Out in KaPay (onboarding.js LOGGED_OUT_KEY) leaves the vault unlocked; for websites it counts
+// as locked (audit 2026-11-07): no address, no approvals, no events carrying the address.
+const LOGGED_OUT_KEY = "kachat.loggedOut";
+
 async function onTestnet() {
   return (await ext.storage.local.get(NETWORK_MIRROR_KEY))?.[NETWORK_MIRROR_KEY] === "testnet";
 }
@@ -49,15 +57,24 @@ async function connectionsKey() {
 }
 const MAX_MESSAGE_LENGTH = 4096;
 
-const rejected = () => ({ error: { code: 4001, message: "The request was rejected in KaPay." } });
-// The approval window went away while it was sending an approved payment: it may have reached the
-// network, so this is never "rejected" (audit EXT-012) - the site must check before asking again.
-const maybeSent = () => ({ error: { code: 4002, message: "The payment may have been sent. Check your wallet before trying again." } });
+// rejected() and maybeSent() (4002, audit EXT-012) live in site-rules.js with the approval answers.
 const unauthorized = () => ({ error: { code: 4100, message: "Connect first: call kachat.requestAccounts()." } });
 const invalid = (message) => ({ error: { code: -32602, message } });
 
-/** Approvals waiting on the user: id -> { id, origin, kind, params, resolve, windowId }. */
+/** Approvals waiting on the user: id -> { id, origin, kind, params, resolve, windowId, done }.
+ *  Kept in memory only, on purpose: the site's call is an open message channel that dies with
+ *  this worker, so after a restart there is no one left to answer - the approval window claims
+ *  the request before acting ("approval-claim") and shows it expired (audit 2026-11-07). */
 const approvals = new Map();
+/** origin -> when its last request was rejected (the cooldown, audit 2026-11-07). */
+const lastRejected = new Map();
+
+/** Answers the site once; later answers (a second click, the window closing) are dropped. */
+function settle(entry, answer) {
+  if (entry.done) return;
+  entry.done = true;
+  entry.resolve(answer);
+}
 
 async function connections() {
   return (await ext.storage.local.get(await connectionsKey()))?.[await connectionsKey()] || {};
@@ -65,6 +82,15 @@ async function connections() {
 
 async function isUnlocked() {
   return Boolean((await ext.storage.session.get(UNLOCK_KEY))?.[UNLOCK_KEY]);
+}
+
+async function isLoggedOut() {
+  return Boolean((await ext.storage.local.get(LOGGED_OUT_KEY))?.[LOGGED_OUT_KEY]);
+}
+
+/** What websites may see: unlocked and signed in (audit 2026-11-07). */
+async function openForSites() {
+  return (await isUnlocked()) && !(await isLoggedOut());
 }
 
 /** The calling site, from the browser's own record of the sender: top frame, http(s) only. */
@@ -104,8 +130,12 @@ async function openApproval(origin, kind, params) {
   for (const entry of approvals.values()) {
     if (entry.origin === origin) return { error: { code: -32002, message: "A request from this site is already waiting in KaPay." } };
   }
+  // just rejected: the site waits a moment before it can open another window (audit 2026-11-07)
+  if (cooldownLeft(lastRejected.get(origin), Date.now()) > 0) {
+    return { error: { code: 4001, message: "The last request from this site was just rejected in KaPay. Wait a few seconds before asking again." } };
+  }
   const id = crypto.randomUUID();
-  const entry = { id, origin, kind, params, createdAt: Date.now(), windowId: null };
+  const entry = { id, origin, kind, params, createdAt: Date.now(), windowId: null, done: false, keepWindow: false };
   const answer = new Promise((resolve) => { entry.resolve = resolve; });
   approvals.set(id, entry);
   try {
@@ -120,7 +150,9 @@ async function openApproval(origin, kind, params) {
   }
   const result = await answer;
   approvals.delete(id);
-  if (entry.windowId != null) ext.windows.remove(entry.windowId).catch(() => {});
+  if (result?.error?.code === 4001) lastRejected.set(origin, Date.now());
+  // a "Not confirmed" send stays on screen until the user closes it
+  if (entry.windowId != null && !entry.keepWindow) ext.windows.remove(entry.windowId).catch(() => {});
   return result;
 }
 
@@ -129,7 +161,7 @@ async function handleSiteRequest(method, params, origin) {
   // A connection to an account no longer in the vault is no connection (audit EXT-002).
   const accountIds = (await ext.storage.local.get("kachat.accountIds"))["kachat.accountIds"];
   if (connection && Array.isArray(accountIds) && !accountIds.includes(connection.accountId)) connection = null;
-  const open = connection && (await isUnlocked());
+  const open = connection && (await openForSites());
   switch (method) {
     case "getNetwork":
       // Only a connected site learns the network (audit EXT-013): anyone else could fingerprint it.
@@ -157,9 +189,10 @@ async function handleSiteRequest(method, params, origin) {
       const prefix = (await onTestnet()) ? "kaspatest:" : "kaspa:";
       if (typeof to !== "string" || !to.trim().toLowerCase().startsWith(prefix) || !/^[a-z]+:[a-z0-9]{50,90}$/.test(to.trim().toLowerCase())) return invalid(`sendKaspa: a ${prefix} address is required.`);
       if (!/^\d{1,19}$/.test(String(sompi)) || BigInt(sompi) <= 0n) return invalid("sendKaspa: the amount is a whole number of sompi above zero.");
-      const priorityFee = String(options?.priorityFee ?? "0");
-      if (!/^\d{1,15}$/.test(priorityFee)) return invalid("sendKaspa: priorityFee is a whole number of sompi.");
-      return openApproval(origin, "sendKaspa", [to.trim().toLowerCase(), String(sompi), priorityFee]);
+      // capped (audit 2026-11-07): the approval window shows it as its own "set by this site" row
+      const priorityFee = sitePriorityFee(options?.priorityFee);
+      if (priorityFee.error) return invalid(priorityFee.error);
+      return openApproval(origin, "sendKaspa", [to.trim().toLowerCase(), String(sompi), priorityFee.sompi]);
     }
     case "signMessage": {
       if (!connection) return unauthorized();
@@ -175,7 +208,11 @@ async function handleSiteRequest(method, params, origin) {
 
 ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
   switch (message?.type) {
-    case "activity": armAutoLock(); return false;
+    // Only KaPay's own pages keep the wallet awake or lock it - a website's process can't hold off
+    // the auto-lock (audit 2026-11-07).
+    case "activity":
+      if (fromExtensionPage(sender)) armAutoLock();
+      return false;
     case "clear-clipboard-soon": {
       // A recovery phrase or private key was copied: clear the clipboard in 30 s (audit EXT-003).
       if (!fromExtensionPage(sender) || !ext.offscreen?.createDocument) { sendResponse({ supported: false }); return false; }
@@ -183,7 +220,9 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ supported: true });
       return false;
     }
-    case "lock": lockNow(); return false;
+    case "lock":
+      if (fromExtensionPage(sender)) lockNow();
+      return false;
     case "site-hello":
       rememberSiteTab(sender).catch(() => {});
       return false;
@@ -201,10 +240,24 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse(entry ? { id: entry.id, origin: entry.origin, kind: entry.kind, params: entry.params } : null);
       return false;
     }
+    case "approval-claim": {
+      // The window asks before it connects, signs or sends: is the request still waiting here, and
+      // is KaPay unlocked and signed in? After a worker restart the site has already been told
+      // "KaPay is unavailable", so nothing may happen for it (audit 2026-11-07).
+      if (!fromExtensionPage(sender)) return false;
+      const entry = approvals.get(message.id);
+      Promise.all([isUnlocked(), isLoggedOut()])
+        .then(([unlocked, loggedOut]) => sendResponse(claimDecision({ entry, unlocked, loggedOut })))
+        .catch(() => sendResponse({ ok: false, reason: "expired" }));
+      return true;
+    }
     case "approval-result": {
       if (!fromExtensionPage(sender)) return false;
       const entry = approvals.get(message.id);
-      if (entry) entry.resolve(message.error ? (entry.sending ? maybeSent() : rejected()) : { result: message.result });
+      if (!entry) return false;
+      // "Not confirmed" (SEND_OUTCOME_UNKNOWN): the window stays up with only Close
+      if (message.outcomeUnknown) entry.keepWindow = true;
+      settle(entry, approvalAnswer(entry, message));
       return false;
     }
     case "approval-sending": {
@@ -215,9 +268,14 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (entry) entry.sending = message.sending !== false;
       return false;
     }
-    case "approval-ping":
-      // The approval window keeps this worker awake while the user decides.
+    case "approval-ping": {
+      // The approval window keeps this worker awake while the user decides, and learns when the
+      // request is gone (a restarted worker has none).
+      if (!fromExtensionPage(sender)) return false;
+      const entry = approvals.get(message.id);
+      sendResponse({ alive: Boolean(entry && !entry.done) });
       return false;
+    }
     default:
       return false;
   }
@@ -225,7 +283,7 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // Closing the approval window is a rejection - unless it was already sending an approved payment.
 ext.windows?.onRemoved?.addListener((windowId) => {
-  for (const entry of approvals.values()) if (entry.windowId === windowId) entry.resolve(entry.sending ? maybeSent() : rejected());
+  for (const entry of approvals.values()) if (entry.windowId === windowId) settle(entry, entry.sending ? maybeSent() : rejected());
 });
 
 ext.alarms.onAlarm.addListener((alarm) => {
@@ -241,7 +299,7 @@ async function clearClipboard() {
     await ext.offscreen.createDocument({
       url: "offscreen.html",
       reasons: ["CLIPBOARD"],
-      justification: "Clears a copied recovery phrase or private key from the clipboard after 30 seconds.",
+      justification: "Clears copied 12 or 24 words or a private key from the clipboard after 30 seconds.",
     });
   } catch { /* already open */ }
   try { await ext.runtime.sendMessage({ type: "offscreen-clear-clipboard" }); } catch { /* the page wasn't ready */ }
@@ -252,18 +310,26 @@ async function clearClipboard() {
 // Content scripts run inside web pages' processes, so they get no access to storage.local (the
 // encrypted vault, connections, cached addresses, settings). Where the browser can't restrict it,
 // the website script still never reads it.
+//
+// Chrome documents setAccessLevel on every storage area, but the browser may still refuse it for
+// storage.local (Chromium first shipped it for storage.session only). A refusal is logged, never
+// swallowed, so the worker's console says whether storage.local is closed to content scripts here
+// (audit 2026-11-07); either way the vault in it is sealed with the wallet password.
 function lockStorageToExtension() {
+  const failed = (error) => console.warn("[KaPay] storage.local could not be limited to KaPay's own pages:", error?.message || error);
+  if (typeof ext.storage.local.setAccessLevel !== "function") { failed(new Error("setAccessLevel is not available in this browser")); return; }
   try {
-    const result = ext.storage.local.setAccessLevel?.({ accessLevel: "TRUSTED_CONTEXTS" });
-    result?.catch?.(() => {});
-  } catch { /* not supported here */ }
+    const result = ext.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+    result?.catch?.(failed);
+  } catch (error) { failed(error); }
 }
 lockStorageToExtension();
 ext.runtime.onInstalled?.addListener(lockStorageToExtension);
 
 // --- Telling sites what changed (audits EXT-006, EXT-007) -----------------------------------
 // A site hears accountsChanged / disconnect when its connection changes, and networkChanged when
-// the wallet switches networks - sent only to tabs of that site's origin.
+// the wallet switches to a network it is connected on - sent only to tabs of that site's origin.
+// Which events go to whom is site-rules.js.
 
 // Which tabs show which site: each page's script says hello (and every request carries its tab);
 // the origin comes from the browser, never the page. Kept in storage.session (extension-only).
@@ -312,34 +378,39 @@ async function tellSite(origin, event, payload) {
 
 const CONNECTION_KEYS = { "kachat.connections": "mainnet", "kachat.connections.testnet": "testnet" };
 
+function tellAll(events) {
+  for (const [origin, event, payload] of events) tellSite(origin, event, payload);
+}
+
+// Events follow the same test as getAccounts (audit 2026-11-07): while KaPay is locked or logged
+// out no event carries an address, and locking, unlocking, Log Out and signing in tell the current
+// network's sites accountsChanged.
 ext.storage.onChanged.addListener(async (changes, area) => {
+  if (area === "session") {
+    const unlock = changes[UNLOCK_KEY];
+    // (a password change rewrites the key: still unlocked, nothing to tell)
+    if (!unlock || Boolean(unlock.oldValue) === Boolean(unlock.newValue)) return;
+    if (await isLoggedOut()) return;
+    tellAll(openStateEvents(await connections(), Boolean(unlock.newValue)));
+    return;
+  }
   if (area !== "local") return;
   const testnet = await onTestnet();
+  const open = await openForSites();
   for (const [key, network] of Object.entries(CONNECTION_KEYS)) {
     // Only the network the wallet is on: the other one's sites aren't answered now.
     if (!changes[key] || (network === "testnet") !== testnet) continue;
-    const before = changes[key].oldValue || {};
-    const after = changes[key].newValue || {};
-    for (const origin of new Set([...Object.keys(before), ...Object.keys(after)])) {
-      const was = before[origin]?.address || null;
-      const now = after[origin]?.address || null;
-      if (was === now) continue;
-      if (now) tellSite(origin, "accountsChanged", [now]);
-      else { tellSite(origin, "accountsChanged", []); tellSite(origin, "disconnect", null); }
-    }
+    tellAll(connectionChangeEvents(changes[key].oldValue || {}, changes[key].newValue || {}, open));
   }
-  const networkChange = changes["kachat.network"];
+  const loggedOutChange = changes[LOGGED_OUT_KEY];
+  if (loggedOutChange && Boolean(loggedOutChange.oldValue) !== Boolean(loggedOutChange.newValue) && (await isUnlocked())) {
+    tellAll(openStateEvents(await connections(), !loggedOutChange.newValue));
+  }
+  const networkChange = changes[NETWORK_MIRROR_KEY];
   if (networkChange && networkChange.oldValue !== networkChange.newValue) {
     const nowTestnet = networkChange.newValue === "testnet";
     const all = await ext.storage.local.get(Object.keys(CONNECTION_KEYS));
-    const current = all[nowTestnet ? "kachat.connections.testnet" : "kachat.connections"] || {};
-    const origins = new Set([...Object.keys(all["kachat.connections"] || {}), ...Object.keys(all["kachat.connections.testnet"] || {})]);
-    for (const origin of origins) {
-      tellSite(origin, "networkChanged", nowTestnet ? "testnet-10" : "mainnet");
-      const address = current[origin]?.address || null;
-      if (address) tellSite(origin, "accountsChanged", [address]);
-      else { tellSite(origin, "accountsChanged", []); tellSite(origin, "disconnect", null); }
-    }
+    tellAll(networkSwitchEvents({ nowTestnet, mainnet: all["kachat.connections"], testnet: all["kachat.connections.testnet"], open }));
   }
 });
 

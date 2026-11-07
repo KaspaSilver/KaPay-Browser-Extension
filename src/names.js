@@ -20,6 +20,7 @@ import { dotkCanonical, kaspaNamesCanonical } from "./names-normalize.js";
 import { esc, ICONS } from "./ui.js";
 import { IS_TESTNET, MAINNET_KNS, TESTNET_KNS } from "./net.js";
 import { kachatRegistry, kachatService, kachatLaunched } from "./kachat-names.js";
+import { resolveHeldChecked } from "./kachat-resolve.js";
 import { normalize as kachatNormalize, isValid as kachatIsValid } from "../shared/engine/kachat-names/codec.js";
 import { KachatNamesRegistry } from "../shared/engine/kachat-names/registry.js";
 
@@ -123,8 +124,9 @@ async function resolveKaspaNames(label) {
  *  a-z, 0-9, hyphen. Always listed first; where the registry isn't live yet (mainnet before its
  *  launch) it is listed as "Coming soon" and resolves nothing (iOS 6ac48a7).
  *  Every typed name may be paid, so an indexer's answer counts only once the chain holds the
- *  record it describes (`resolveHeldOnChain`, KaPay 953b255 confirmOnChain); when it doesn't, or
- *  the indexer answered for another name, the lookup failed. */
+ *  record it describes (KaPay 953b255 confirmOnChain); when it doesn't, or the indexer answered
+ *  for another name, the lookup failed. The address and the check come from one answer
+ *  (kachat-resolve.js): the engine's `resolveHeldOnChain` reads the indexer twice. */
 async function resolveKachat(label) {
   const canonical = kachatNormalize(label);
   if (!kachatIsValid(canonical)) return null;
@@ -132,7 +134,7 @@ async function resolveKachat(label) {
   const registry = kachatRegistry();
   if (!registry) return { tld: "kachat", display, address: null, failed: false, notLive: true };
   try {
-    const address = await registry.resolveHeldOnChain(canonical, kachatService());
+    const address = await resolveHeldChecked(registry, canonical, kachatService());
     return { tld: "kachat", display, address: address || null, failed: false };
   } catch (error) {
     console.info("[KaPay] .kachat lookup failed:", error?.message || error);

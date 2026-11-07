@@ -493,7 +493,9 @@ export function showColdSend(opts) {
       s.frames = chunkQrFrames(unsignedToKsptBytes(unsigned));
       s.frameIndex = 0;
       s.playing = true;
-      s.builtAmount = amount;
+      // what the recipient output carries: a Max Send may be trimmed by up to 2000 sompi of leeway
+      // for the fee, so the QR, Signed and Sent screens show the built amount, not the typed one
+      s.builtAmount = BigInt(unsigned.finalAmountSompi ?? amount);
       s.builtRecipient = { address: toAddress, name: compound ? null : (s.recipient?.domain || null) };
       s.decoded = null;
       go("qr");

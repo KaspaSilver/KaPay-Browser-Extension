@@ -25,6 +25,8 @@ import { nextDefaultAccountName } from "../shared/ui/account-backup-status.js";
 import { forgetWallet as forgetAddressBook } from "./address-book.js";
 import { forgetAccount as forgetBell } from "./bell.js";
 import { forgetKachatSigner } from "./kachat-names.js";
+import { reencodeAddress } from "./net.js";
+import { accountDataKeys, withoutAccount } from "./account-scope.js";
 
 let goHome = () => {};
 let goSettings = () => {};
@@ -35,7 +37,7 @@ export function setHandlers({ home, settings }) {
 }
 
 // iOS keeps you signed out after Log Out until you pick an account again, across launches.
-const LOGGED_OUT_KEY = "kachat.loggedOut";
+export const LOGGED_OUT_KEY = "kachat.loggedOut";
 const LAST_USED_KEY = "kachat.accountLastUsed";
 
 export async function isLoggedOut() { return Boolean(await getLocal(LOGGED_OUT_KEY)); }
@@ -189,12 +191,28 @@ async function runAccountAction(action) {
   }
 }
 
+/** An account's chatting address: the one cached for it on this network, else worked out from its
+ *  words in the vault - an account never opened on this network has none cached, and its delete
+ *  still needs it (the not-backed-up warning, and what's kept under it). Null when neither works. */
+async function chattingAddressOf(accountId) {
+  const cached = (await wallet.cachedAddresses(accountId).catch(() => null))?.main;
+  if (cached) return cached;
+  try {
+    const account = await vault.accountSecretsById(accountId);
+    return await wallet.previewMainAddress(account.mnemonic, account.passphrase, account.family, account.identityIndex || 0);
+  } catch {
+    return null;
+  }
+}
+
 /** The sign-in screen's Delete (iOS 99ab88a DeleteAccountSheet): the warning first, and an account
  *  that still owes its backup says so. Signed out, there are no words open to show. */
-function confirmRemoveAccount(account) {
+async function confirmRemoveAccount(account) {
+  const address = account.address || await chattingAddressOf(account.id);
+  if (app.dataset.screen !== "accounts") return;
   showDeleteAccountSheet({
-    confirmSubtitle: `Deletes ${account.name} (${shortAddr(account.address)}) and its local data from this browser.`,
-    notBackedUp: backupStatus.isPending(account.address),
+    confirmSubtitle: `Deletes ${account.name}${address ? ` (${shortAddr(address)})` : ""} and its local data from this browser.`,
+    notBackedUp: backupStatus.isPending(address),
     onConfirm: () => passwordGate({
       title: "Delete Account",
       message: "Enter your wallet password to delete this account.",
@@ -202,7 +220,7 @@ function confirmRemoveAccount(account) {
       onBack: showWelcome,
       onUnlocked: () => runAccountAction(async () => {
         try {
-          await deleteAccount(account.id, account.address);
+          await deleteAccount(account.id, address);
           toast("Account removed.");
         } catch (error) {
           toast(error.message);
@@ -213,11 +231,16 @@ function confirmRemoveAccount(account) {
   });
 }
 
+const bothNetworks = (address) => [reencodeAddress(address, "kaspa"), reencodeAddress(address, "kaspatest")];
+
 /**
- * Removes an account and everything kept for it in this browser (iOS removeSavedAccount): both
- * networks' address caches, spending state, Cold Storage and portfolios, its website connections,
- * its contacts and the bell's notifications (KaPay iOS 99ab88a), and what it owed a backup. The
- * last account takes the vault with it. Any key held for signing goes first (KaPay iOS 0799cec).
+ * Removes an account and everything kept for it in this browser (iOS removeSavedAccount), on both
+ * networks: address caches, spending state, Cold Storage and portfolios, an owed address discovery,
+ * when it was last used, its UTXO labels, swaps, .kachat caches and news, its website connections,
+ * its contacts and the bell's notifications (KaPay iOS 99ab88a), and what it owed a backup
+ * (account-scope.js lists the keys). The last account takes the vault with it. Any key held for
+ * signing goes first (KaPay iOS 0799cec). Without `mainAddress` the chatting address is worked out
+ * from the vault before the account leaves it.
  */
 export async function deleteAccount(accountId, mainAddress) {
   forgetKachatSigner();
@@ -227,13 +250,22 @@ export async function deleteAccount(accountId, mainAddress) {
     await vault.resetWallet();
     await setLoggedOut(false);
   } else {
+    const chatting = mainAddress || await chattingAddressOf(accountId);
+    // every address it used, from both networks' caches, before they go
+    const caches = await Promise.all([getLocal(`kachat.addresses.${accountId}`), getLocal(`kachat.addresses.${accountId}.testnet`)]).catch(() => []);
+    const addresses = caches.flatMap((cache) => [cache?.main, ...Object.values(cache?.spending || {})]).filter(Boolean);
+    const others = view.accounts.filter((a) => a.id !== accountId).map((a) => a.id);
+    const otherCaches = await Promise.all(others.flatMap((id) => [getLocal(`kachat.addresses.${id}`), getLocal(`kachat.addresses.${id}.testnet`)])).catch(() => []);
+    const keep = otherCaches.flatMap((cache) => [cache?.main, ...Object.values(cache?.spending || {})]).filter(Boolean);
     await vault.removeAccount(accountId);
-    const keys = ["spending", "addresses", "cold", "portfolios", "portfolioFees"].map((k) => `kachat.${k}.${accountId}`);
-    await removeLocal([...keys, ...keys.map((k) => `${k}.testnet`)]);
-    if (mainAddress) {
-      await forgetAddressBook(mainAddress);
-      forgetBell(mainAddress);
-      backupStatus.forget(mainAddress);
+    const { local, page } = accountDataKeys({ accountId, chatting, addresses, variants: bothNetworks, keep });
+    await removeLocal(local);
+    for (const key of page) { try { localStorage.removeItem(key); } catch { /* nothing kept */ } }
+    await setLocal(LAST_USED_KEY, withoutAccount(await getLocal(LAST_USED_KEY), accountId));
+    if (chatting) {
+      await forgetAddressBook(chatting);
+      forgetBell(chatting);
+      backupStatus.forget(chatting);
     }
   }
   await removeConnectionsFor(accountId);
@@ -254,10 +286,20 @@ async function discoverAfterRestore(account, accountId) {
 /** Nobody has seen a created account's words yet, so it owes the backup steps, marked before its
  *  keys are saved (KaPay iOS 0799cec): a popup closed in between can't leave an account that owes
  *  nothing. Whoever imported one has the words, so its six months of Backup Hygiene start once it's
- *  saved (iOS 4f5dfd2). Returns the save's result. */
+ *  saved (iOS 4f5dfd2). Returns the save's result.
+ *
+ *  A created account whose owed backup can't be noted isn't saved at all: no address to note it
+ *  under, or storage that doesn't keep it (full or blocked) - it would otherwise owe nothing, with
+ *  no banner ever asking for the words nobody has seen. */
 async function savingAccount(account, save) {
   const address = await wallet.previewMainAddress(account.mnemonic, account.passphrase, account.family, account.identityIndex || 0);
-  if (address && !account.imported) backupStatus.markPending(address);
+  if (!account.imported) {
+    if (!address) throw new Error("Couldn't set up this account's backup reminder, so it wasn't created. Try again.");
+    backupStatus.markPending(address);
+    if (!backupStatus.isPending(address)) {
+      throw new Error("This browser's storage for KaPay is full, so the account wasn't created: it couldn't remember that its 12 or 24 words still need backing up. Free up some space and try again.");
+    }
+  }
   let view;
   try {
     view = await save();
@@ -611,6 +653,13 @@ const FAMILY_PATHS = {
 };
 
 let importDraft = null;
+
+/** Lock, log out, delete or an account switch (popup.js): the words typed into Import go. */
+export function clearImportDraft() {
+  if (importDraft?.words) importDraft.words.fill("");
+  importDraft = null;
+}
+
 function freshImportDraft() {
   // As with Create Account, nothing is preset: no name and no word count until one is chosen
   // (pasting a phrase picks the count for you).

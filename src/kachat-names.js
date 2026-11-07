@@ -144,7 +144,7 @@ export function kachatRegistry() {
 }
 
 /** The shared service (no key needed) where the registry is launched, else null: what
- *  `registry.resolveHeldOnChain` reads the chain with (KaPay 953b255 confirmOnChain). */
+ *  `confirmOnChain` reads the chain with (kachat-resolve.js, KaPay 953b255). */
 export function kachatService() {
   return kachatLaunched ? base().service : null;
 }

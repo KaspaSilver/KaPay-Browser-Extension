@@ -24,6 +24,7 @@ import {
   sameCoin, formatQuotedAmount, createChangeNowClient, createSwapQuoter, rateLine, portfolioPrefill,
   swapSourceTxId,
 } from "../shared/ui/swap-quote.js";
+import { extraIdName, checkPayoutExtraId, withPayoutExtraId, payoutExtraIdKept } from "./swap-extra-id.js";
 
 const RELAY_ORIGIN = "https://desktop.kachat.app";
 const RELAY_ROOT = `${RELAY_ORIGIN}/nc-proxy/`;
@@ -40,15 +41,16 @@ const TRASH = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" strok
 /** A relay refusal that means "not for this caller / no key", not a ChangeNOW answer. */
 const isRelayRefusal = (error) => error?.unavailable || (error?.status === 403 && /only relayed/i.test(String(error?.message || error?.body || "")));
 
-const client = createChangeNowClient({
-  // The relay's tools/relay-rules.mjs EXTENSION_ID_HEADER.
-  fetchImpl: (url, init) => fetch(url, { ...init, headers: { ...init?.headers, "x-kachat-extension": ext.runtime.id } }),
-  urlFor: (url) => {
-    const parsed = new URL(url);
-    return `${RELAY_ROOT}${encodeURIComponent(parsed.origin)}${parsed.pathname === "/" ? "" : parsed.pathname}${parsed.search}`;
-  },
-});
+// The relay's tools/relay-rules.mjs EXTENSION_ID_HEADER.
+const relayFetch = (url, init) => fetch(url, { ...init, headers: { ...init?.headers, "x-kachat-extension": ext.runtime.id } });
+const relayUrl = (url) => {
+  const parsed = new URL(url);
+  return `${RELAY_ROOT}${encodeURIComponent(parsed.origin)}${parsed.pathname === "/" ? "" : parsed.pathname}${parsed.search}`;
+};
+const client = createChangeNowClient({ fetchImpl: relayFetch, urlFor: relayUrl });
 const quoter = createSwapQuoter(client);
+/** The client for one create whose payout carries an extra ID (swap-extra-id.js). */
+const clientWithPayoutExtraId = (extraId) => createChangeNowClient({ fetchImpl: (url, init) => relayFetch(url, withPayoutExtraId(init, extraId)), urlFor: relayUrl });
 
 function coinIcon(coin) {
   if (coin.ticker === "kas") return '<img class="swap-coin-icon" src="icons/kaspa-logo.png" alt="" />';
@@ -76,6 +78,7 @@ export async function showSwap() {
     otherCoin: USDC_POLYGON,
     amountText: "", receiveAmountText: "", editedSide: "send",
     payoutText: "",
+    payoutExtraText: "",      // the payout's destination tag / memo, for a coin that has one
     payoutOverride: null,     // { index, address } picked instead of the next legacy slot
     nextPayout: null,         // { index, address }
     estimate: { status: "idle" },
@@ -164,21 +167,41 @@ export async function showSwap() {
         paintForm();
         return;
       }
-      const response = await client.create(from, to, amountStr, address);
+      const payoutExtra = checkPayoutExtraId(to, state.payoutExtraText);
+      if (payoutExtra.error) {
+        state.create = { status: "failed", result: null };
+        toast(payoutExtra.error);
+        paintForm();
+        return;
+      }
+      const response = await (payoutExtra.value ? clientWithPayoutExtraId(payoutExtra.value) : client).create(from, to, amountStr, address);
       if (!response?.payinAddress) {
         state.create = { status: "failed", result: null };
         toast("ChangeNOW didn't return a deposit address");
         paintForm();
         return;
       }
+      // a payout to an exchange account without its tag can't be credited: no deposit address unless
+      // ChangeNOW kept it
+      if (!payoutExtraIdKept(payoutExtra.value, response)) {
+        state.create = { status: "failed", result: null };
+        toast(`ChangeNOW didn't take the ${extraIdName(to)}. Don't pay into this swap; try again.`);
+        paintForm();
+        return;
+      }
+      // the deposit's own tag / memo: without it ChangeNOW can't credit the deposit
+      const payinExtraId = response.payinExtraId != null ? String(response.payinExtraId).trim() : "";
+      const payinExtraIdName = extraIdName(from) || "Extra ID";
       state.history.unshift({
         id: String(response.id), fromTicker: from.ticker, fromNetwork: from.network, toTicker: to.ticker, toNetwork: to.network,
         fromAmount: amountStr, toAmount: response.toAmount != null ? String(response.toAmount) : "",
         payinAddress: String(response.payinAddress), payoutAddress: address,
+        payinExtraId, payinExtraIdName, payoutExtraId: payoutExtra.value, payoutExtraIdName: extraIdName(to) || "",
         status: response.status || "new", createdAt: Date.now(), addedToPortfolio: false,
       });
       saveHistory();
-      state.create = { status: "success", result: response };
+      state.create = { status: "success", result: { ...response, payinExtraId, payinExtraIdName } };
+      state.payoutExtraText = "";
       state.amountText = ""; state.receiveAmountText = ""; state.editedSide = "send";
       state.estimate = { status: "idle" };
       state.payoutOverride = null;
@@ -220,11 +243,17 @@ export async function showSwap() {
   const rateText = () => (state.estimate.status === "success"
     ? rateLine({ fromAmount: state.estimate.fromAmount, toAmount: state.estimate.toAmount, fromLabel: state.kasIsSendSide ? "KAS" : state.otherCoin.displayName, toLabel: state.kasIsSendSide ? state.otherCoin.displayName : "KAS" })
     : state.estimate.status === "failed" ? (state.estimate.message || "Unavailable") : "N/A");
+  /** A deposit's tag / memo, where it can't be missed: without it the deposit can't be credited. */
+  const payinExtraHtml = (name, value) => (value ? `
+      <span class="strong small kl-orange">${ICONS.warning} Include this ${esc(name)}</span>
+      <button class="mono small strong swap-mono" data-swap-copy-extra="${esc(value)}" data-swap-extra-name="${esc(name)}">${esc(value)}</button>
+      <span class="muted tiny">ChangeNOW's deposit address is shared. Send without this ${esc(name)} and the deposit can't be credited to your swap.</span>` : "");
   const resultCard = (r) => `
     <div class="sk-card swap-result">
       <div class="strong">Send ${esc(fromCoin().displayName)} to this address</div>
       <button class="swap-qr-button" data-swap-copy="${esc(r.payinAddress)}" aria-label="Copy deposit address"><canvas class="swap-qr" data-swap-qr="${esc(r.payinAddress)}" width="180" height="180"></canvas></button>
       <button class="mono tiny swap-mono" data-swap-copy="${esc(r.payinAddress)}">${esc(r.payinAddress)}</button>
+      ${payinExtraHtml(r.payinExtraIdName || "Extra ID", r.payinExtraId)}
       <span class="muted tiny">Status: ${esc(r.status || "new")}</span>
       <span class="muted tiny">ChangeNOW Exchange ID</span>
       <button class="mono tiny swap-mono" data-swap-copy-id="${esc(r.id)}">${esc(r.id)}</button>
@@ -245,6 +274,10 @@ export async function showSwap() {
       </div>
       ${amountCard({ label: "You Get", coin: toCoin(), value: state.receiveAmountText, field: "get", quoting: state.editedSide === "send" && loading })}
       ${toCoin().ticker !== "kas" ? `<div class="sk-card"><input class="swap-payout" data-swap-payout placeholder="Receive ${esc(toCoin().displayName)} at" value="${esc(state.payoutText)}" autocomplete="off" autocapitalize="off" spellcheck="false" /></div>` : ""}
+      ${extraIdName(toCoin()) ? `<div class="sk-card">
+        <input class="swap-payout" data-swap-payout-extra placeholder="${esc(extraIdName(toCoin()))} (if the address needs one)" value="${esc(state.payoutExtraText)}" autocomplete="off" autocapitalize="off" spellcheck="false" />
+        <span class="muted tiny">An exchange account needs its ${esc(extraIdName(toCoin()))}, or the payout can't reach it.</span>
+      </div>` : ""}
       ${!state.kasIsSendSide ? `
         <div class="sk-card"><div class="sk-from-row">
           <span class="tx-meta"><span class="muted tiny">Receiving KAS At</span><span class="mono small">${esc(shortMiddle(payoutAddress()))}</span></span>
@@ -309,12 +342,16 @@ export async function showSwap() {
     const page = handle.panel.querySelector("[data-swap-page]");
     if (!page || state.tab !== "swap") { paint(); return; }
     const active = document.activeElement;
-    const field = page.contains(active) ? active.dataset?.swapField || (active.matches?.("[data-swap-payout]") ? "payout" : null) : null;
+    const field = page.contains(active)
+      ? active.dataset?.swapField || (active.matches?.("[data-swap-payout]") ? "payout" : active.matches?.("[data-swap-payout-extra]") ? "payout-extra" : null)
+      : null;
     const caret = field ? active.selectionStart : null;
     page.innerHTML = formHtml();
     drawQrs(page);
     if (field) {
-      const again = field === "payout" ? page.querySelector("[data-swap-payout]") : page.querySelector(`[data-swap-field="${field}"]`);
+      const again = field === "payout" ? page.querySelector("[data-swap-payout]")
+        : field === "payout-extra" ? page.querySelector("[data-swap-payout-extra]")
+          : page.querySelector(`[data-swap-field="${field}"]`);
       if (again) { again.focus(); try { again.setSelectionRange(caret, caret); } catch { /* not a text field */ } }
     }
   }
@@ -352,7 +389,8 @@ export async function showSwap() {
           const [ticker, network] = b.dataset.coin.split(":");
           const picked = CURATED_COINS.find((c) => c.ticker === ticker && c.network === network);
           sheet.close();
-          if (picked) { state.otherCoin = picked; clearQuoted(); reschedule(); }
+          // a tag typed for one coin is never sent with another
+          if (picked) { state.otherCoin = picked; state.payoutExtraText = ""; clearQuoted(); reschedule(); }
         };
       }
     };
@@ -396,6 +434,10 @@ export async function showSwap() {
         </div>
         <div class="sk-label">Deposit Address</div>
         <div class="sk-card"><button class="mono tiny swap-mono" data-swap-copy="${esc(swap.payinAddress)}">${esc(swap.payinAddress)}</button></div>
+        ${swap.payinExtraId ? `<div class="sk-label">Deposit ${esc(swap.payinExtraIdName || "Extra ID")}</div>
+        <div class="sk-card swap-result">${payinExtraHtml(swap.payinExtraIdName || "Extra ID", swap.payinExtraId)}</div>` : ""}
+        ${swap.payoutExtraId ? `<div class="sk-label">Payout ${esc(swap.payoutExtraIdName || "Extra ID")}</div>
+        <div class="sk-card"><button class="mono tiny swap-mono" data-swap-copy-extra="${esc(swap.payoutExtraId)}" data-swap-extra-name="${esc(swap.payoutExtraIdName || "Extra ID")}">${esc(swap.payoutExtraId)}</button></div>` : ""}
         <div class="sk-label">Status</div>
         <div class="sk-card"><div class="sk-from-row"><span class="strong ${statusClass(swap.status)}">${esc(capitalize(swap.status))}</span>${swap.status === "finished" ? '<button class="bar-text accent strong" data-swap-portfolio>Add to Portfolio</button>' : ""}</div></div>
         <div class="sk-label">ChangeNOW Exchange ID</div>
@@ -446,6 +488,10 @@ export async function showSwap() {
   function bindCopies(root) {
     for (const b of root.querySelectorAll("[data-swap-copy]")) b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.swapCopy); toast("Address copied to clipboard."); } catch { /* refused */ } };
     for (const b of root.querySelectorAll("[data-swap-copy-id]")) b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.swapCopyId); toast("Exchange ID copied"); } catch { /* refused */ } };
+    for (const b of root.querySelectorAll("[data-swap-copy-extra]")) b.onclick = () => copyExtra(b);
+  }
+  async function copyExtra(button) {
+    try { await navigator.clipboard.writeText(button.dataset.swapCopyExtra); toast(`${button.dataset.swapExtraName || "Extra ID"} copied`); } catch { /* refused */ }
   }
 
   handle = openPanel({ title: "ChangeNOW Swap", leading: "Done", full: true, body: '<div data-swap class="swap-root"></div>', onClose: () => clearTimeout(estimateTimer) });
@@ -460,6 +506,7 @@ export async function showSwap() {
       return;
     }
     if (event.target.closest("[data-swap-payout]")) state.payoutText = event.target.value;
+    if (event.target.closest("[data-swap-payout-extra]")) state.payoutExtraText = event.target.value;
   });
   root.addEventListener("change", (event) => {
     if (event.target.closest("[data-swap-terms]")) { state.termsChecked = event.target.checked; paint(); }
@@ -477,7 +524,7 @@ export async function showSwap() {
     if (t.closest("[data-swap-not-now]")) { handle.close(); return; }
     const tabButton = t.closest("[data-swap-tab]");
     if (tabButton) { state.tab = tabButton.dataset.swapTab; paint(); return; }
-    if (t.closest("[data-swap-flip]")) { state.kasIsSendSide = !state.kasIsSendSide; clearQuoted(); reschedule(); return; }
+    if (t.closest("[data-swap-flip]")) { state.kasIsSendSide = !state.kasIsSendSide; state.payoutExtraText = ""; clearQuoted(); reschedule(); return; }
     if (t.closest("[data-swap-create]")) { execute(); return; }
     if (t.closest("[data-swap-pick]")) { openCoinPicker(); return; }
     if (t.closest("[data-swap-change-address]")) { openAddressPicker(); return; }
@@ -503,7 +550,9 @@ export async function showSwap() {
     const copy = t.closest("[data-swap-copy]");
     if (copy) { try { await navigator.clipboard.writeText(copy.dataset.swapCopy); toast("Address copied to clipboard."); } catch { /* refused */ } return; }
     const copyId = t.closest("[data-swap-copy-id]");
-    if (copyId) { try { await navigator.clipboard.writeText(copyId.dataset.swapCopyId); toast("Exchange ID copied"); } catch { /* refused */ } }
+    if (copyId) { try { await navigator.clipboard.writeText(copyId.dataset.swapCopyId); toast("Exchange ID copied"); } catch { /* refused */ } return; }
+    const copyExtraId = t.closest("[data-swap-copy-extra]");
+    if (copyExtraId) copyExtra(copyExtraId);
   });
   paint();
   wallet.nextSwapPayoutAddress().then((next) => { state.nextPayout = next; paintForm(); }).catch(() => {});

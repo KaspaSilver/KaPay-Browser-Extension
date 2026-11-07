@@ -20,6 +20,7 @@ import {
 import { fetchNetworkStats, peekNetworkStats } from "../shared/engine/network-stats.js";
 import { getEndpoint } from "../shared/engine/endpoints.js";
 import { transactionBelongsInHistory } from "../shared/engine/sync.js";
+import { csvText, csvTextBack } from "./csv-text.js";
 
 export { yearToDateDays, CHART_PAIRS, utcDayKey };
 
@@ -1024,21 +1025,23 @@ function exportBaseName() {
 
 // An export from here adds one last column, Portfolio, with the portfolio's name on every row, so
 // an import puts the rows back into the portfolio of that name (iOS 59593af). A CoinMarketCap file
-// has no such column and imports into the active portfolio, as before.
+// has no such column and imports into the active portfolio, as before. The note and the name are
+// written defused (csvText: one starting with = + - @ would run as a spreadsheet formula), and an
+// import of a file with that column takes the mark off again (csvTextBack).
 const PORTFOLIO_COLUMN = "Portfolio";
 
 /** { filename, csv } for the active portfolio, oldest first; null when it is empty. */
 export function buildCsv() {
   const rows = [...scopedTransactions()].sort((a, b) => a.timestamp - b.timestamp);
   if (!rows.length) return null;
-  const portfolioName = String(activePortfolio()?.name ?? "").replace(/"/g, '""');
+  const portfolioName = csvText(activePortfolio()?.name ?? "");
   let csv = `Date (UTC+0:00),Token,Type,Price (USD),Amount,Total value (USD),Fee,Fee Currency,Notes,${PORTFOLIO_COLUMN}\n`;
   for (const tx of rows) {
     const d = new Date(tx.timestamp);
     const date = `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;
     const amount = amountKasOf(tx);
     const perKas = amount !== 0 ? tx.fiatValue / amount : 0;
-    const notes = String(tx.notes || "").replace(/"/g, '""');
+    const notes = csvText(tx.notes || "");
     csv += `"${date}","KAS","${tx.type}","${swiftDouble(perKas)}","${swiftDouble(amount)}","${swiftDouble(tx.fiatValue)}","0.00","USD","${notes}","${portfolioName}"\n`;
   }
   const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z").replace(/:/g, "-");
@@ -1130,7 +1133,7 @@ export async function importCsv(text) {
   const targetByName = new Map();
   const target = (f) => {
     if (nameColumn < 0 || f.length <= nameColumn) return active;
-    const name = String(f[nameColumn]).trim();
+    const name = csvTextBack(f[nameColumn]).trim();
     if (!name) return active;
     const key = name.toLowerCase();
     if (!targetByName.has(key)) targetByName.set(key, resolveImportPortfolio(name) || active);
@@ -1156,7 +1159,8 @@ export async function importCsv(text) {
       if (type === "buy") total += fee;
       else if (type === "sell") total = Math.max(total - fee, 0);
     }
-    const notes = f.length > 8 && f[8] && nameColumn !== 8 ? f[8] : null;
+    // this app's export (it has the Portfolio column) wrote the note defused
+    const notes = f.length > 8 && f[8] && nameColumn !== 8 ? (nameColumn >= 0 ? csvTextBack(f[8]) : f[8]) : null;
     const amountSompi = kasToSompiString(amount);
     if (amountSompi == null) continue;
     const portfolio = target(f);

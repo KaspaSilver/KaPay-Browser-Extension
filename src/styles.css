@@ -759,7 +759,7 @@ body.tab #app[data-screen="visibility"], body.tab #app[data-screen="coins"], bod
 .alert { width: 270px; background: rgba(44,44,46,.97); border-radius: 14px; overflow: hidden; text-align: center; }
 .alert-body { padding: 18px 16px 14px; display: flex; flex-direction: column; gap: 6px; }
 .alert-title { font-weight: 700; font-size: 16px; }
-.alert-message { font-size: 13px; color: rgba(235,235,245,.85); }
+.alert-message { font-size: 13px; color: rgba(235,235,245,.85); white-space: pre-line; }
 .alert-field { margin-top: 8px; background: #1c1c1e; border: .5px solid rgba(255,255,255,.15); border-radius: 7px; padding: 7px 8px; font-size: 13px; }
 .alert-buttons { display: grid; border-top: .5px solid rgba(255,255,255,.15); }
 .alert-buttons.two { grid-template-columns: 1fr 1fr; }

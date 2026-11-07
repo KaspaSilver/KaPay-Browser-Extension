@@ -8,6 +8,14 @@ import * as vault from "./vault.js";
 
 // The prompt up now, if any: one at a time (iOS authPending, KaPay iOS 0799cec).
 let waiting = null;
+// Answers the prompt up now "no", or null when none is up.
+let cancelWaiting = null;
+
+/** The wallet locked, logged out or switched accounts under the prompt: it answers "cancelled"
+ *  (nothing sent), comes off the screen and gives the screen behind its clicks and keys back. */
+export function cancelSpendPrompt() {
+  cancelWaiting?.();
+}
 
 /**
  * "Confirm Send" with what is being sent and to whom. Resolves true once the password checks out,
@@ -24,7 +32,7 @@ export function confirmSpend(details = {}) {
   return waiting;
 }
 
-function askPassword({ amountText = "", recipient = "", max = false, title = "Confirm Send" } = {}) {
+function askPassword({ amountText = "", recipient = "", max = false, title = "Confirm Send", totalText = null, extraFeeText = null } = {}) {
   return new Promise((resolve) => {
     const backdrop = document.createElement("div");
     backdrop.className = "alert-backdrop spend-auth";
@@ -35,6 +43,7 @@ function askPassword({ amountText = "", recipient = "", max = false, title = "Co
         <div class="alert-body">
           <div class="alert-title">${esc(title)}</div>
           <div class="alert-message">${what ? `<strong>${esc(what)}</strong>` : ""}${to ? `<br><span class="mono tiny">to ${esc(to)}</span>` : ""}</div>
+          ${totalText ? `<div class="alert-message">Total <strong>${esc(totalText)}</strong>${extraFeeText ? `<br><span class="small">includes ${esc(extraFeeText)} extra fee set by the site</span>` : ""}</div>` : ""}
           <div class="alert-message">Enter your wallet password to send.</div>
           <input class="alert-field" type="password" autocomplete="current-password" placeholder="Password" aria-label="Password" />
           <div class="error spend-auth-error"></div>
@@ -51,11 +60,13 @@ function askPassword({ amountText = "", recipient = "", max = false, title = "Co
     const done = (ok) => {
       if (answered) return;
       answered = true;
+      cancelWaiting = null;
       backdrop.remove();
       document.removeEventListener("keydown", onKey);
       if (app) app.inert = wasInert;
       resolve(ok);
     };
+    cancelWaiting = () => done(false);
     const onKey = (event) => { if (event.key === "Escape") done(false); };
     document.addEventListener("keydown", onKey);
     backdrop.addEventListener("click", (event) => { if (event.target.closest("[data-cancel]")) done(false); });

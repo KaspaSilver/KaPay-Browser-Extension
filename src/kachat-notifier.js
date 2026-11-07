@@ -89,15 +89,17 @@ export async function checkKachatNamesNews() {
       try { open = await registry.offersFor(n.name); } catch { open = []; }
       for (const o of open) if (actions.isOwnKey(o.seller)) offersOnMine.push(o);
     }
-    // a different wallet signed in meanwhile: this answer isn't its
-    if (actions.myAddress !== walletAddress) return;
+    // a different wallet signed in meanwhile: this answer isn't its (asked again after every
+    // wait below, and the bell itself drops a row for any account but the one it shows)
+    const stillMine = () => actions.myAddress === walletAddress;
+    if (!stillMine()) return;
 
     const old = readSnapshot(walletAddress);
     const quiet = old == null; // the first check only records where things stand
     const next = { names: {}, offersOnMine: new Set(), myOffers: {} };
     const stamp = Date.now();
     const post = (id, name, title, body) => {
-      if (!quiet) record({ id: `kachat-${id}`, source: "kachat", title, body, timestamp: stamp, targetId: name });
+      if (!quiet && stillMine()) record({ id: `kachat-${id}`, source: "kachat", title, body, timestamp: stamp, targetId: name, account: walletAddress });
     };
 
     // Your names: renewal open, expired (grace), past grace (no longer yours) - once per paid period.
@@ -194,6 +196,9 @@ export async function checkKachatNamesNews() {
       }
     }
 
+    // switched away part way: no snapshot, so the next check of this wallet posts what this one
+    // couldn't (the bell keeps each row once)
+    if (!stillMine()) return;
     writeSnapshot(walletAddress, next);
   } catch (error) {
     console.warn("[KaPay] .kachat news check failed:", error);

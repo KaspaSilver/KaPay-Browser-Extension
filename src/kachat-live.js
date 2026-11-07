@@ -2740,11 +2740,19 @@ export function addressNamesTab({ address, repaint }) {
   return liveDomainsTab({ address, repaint, forAddress: true });
 }
 
+/** The key of `liveDomainsTab.cache`'s entry: Your Domains (every address of the wallet, and its
+ *  offers) and an address's own tab (that address only) both open on the chatting address, so each
+ *  keeps its own list - neither is shown, or saved, as the other. */
+export function domainsCacheKey(address, forAddress = false) {
+  return `${forAddress ? "address" : "wallet"}:${address}`;
+}
+
 /** The tab's body for `address`: `{ html, bind(container, nav) }`, loading on its own. */
 export function liveDomainsTab({ address, repaint, forAddress = false }) {
   const cache = liveDomainsTab.cache || (liveDomainsTab.cache = new Map());
-  const entry = cache.get(address) || { names: [], offers: [], loaded: false, loading: false, revision: -1 };
-  cache.set(address, entry);
+  const cacheKey = domainsCacheKey(address, forAddress);
+  const entry = cache.get(cacheKey) || { names: [], offers: [], loaded: false, loading: false, revision: -1 };
+  cache.set(cacheKey, entry);
   const reg = registry();
   // Not launched here (mainnet): no registry, so nothing to load - the empty state.
   if (!reg) entry.loaded = true;
@@ -2788,7 +2796,7 @@ export function liveDomainsTab({ address, repaint, forAddress = false }) {
           // A lapse is just the clock running out - no registry change announces it - so the list
           // reloads when the next name lapses (iOS aa36d2a dropLapsed).
         }
-        scheduleLapse(`tab:${address}`, entry.names, () => { entry.revision = -1; repaint(); });
+        scheduleLapse(`tab:${cacheKey}`, entry.names, () => { entry.revision = -1; repaint(); });
       }
       entry.revision = reg.revision;
       entry.loaded = true;

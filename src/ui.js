@@ -209,6 +209,22 @@ export function showAlert({ title, message = "", field = null, confirmLabel = "O
   if (input) { input.focus(); input.select(); } else backdrop.querySelector(".alert-button.strong").focus();
 }
 
+/**
+ * Everything open over the screen goes: half sheets, alerts, panels, the scanner and any password
+ * prompt - for a lock, log out, delete or an account switch, so nothing of the account before
+ * stays on top of the next screen (an unlock screen it would cover, or keep from being typed into).
+ * A prompt or the scanner is cancelled through its own Cancel, so whatever waits on it hears "no",
+ * puts the screen behind back as it was and stops the camera; then the rest is removed.
+ */
+export function closeDialogs() {
+  for (const cancel of document.querySelectorAll(".alert-backdrop [data-cancel], .scanner [data-cancel]")) {
+    try { cancel.click(); } catch { /* removed below */ }
+  }
+  for (const layer of document.querySelectorAll(".sheet-backdrop, .alert-backdrop, .panel-backdrop, .kl-progress-backdrop, .scanner")) layer.remove();
+  // a prompt that kept the screen still and wasn't answered can't leave it so
+  if (app) app.inert = false;
+}
+
 /** A password prompt as its own screen (the browser's stand-in for iOS Face ID prompts). */
 export function passwordGate({ title, message = "Enter your wallet password to continue.", onBack, onUnlocked, verify }) {
   render(`

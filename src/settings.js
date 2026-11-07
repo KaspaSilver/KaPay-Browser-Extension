@@ -35,6 +35,7 @@ import { connections, removeConnection } from "./approve.js";
 import { backupPending, openAccountBackup } from "./account-backup.js";
 import { showDeleteAccountSheet } from "./delete-account.js";
 import { IS_TESTNET, TESTNET_REST, switchNetwork } from "./net.js";
+import { shownAccount, shownActiveAccount } from "./account-scope.js";
 
 const BOOK_KEY = IS_TESTNET ? "nodeBookTestnet" : "nodeBook";
 import { NAME_SERVICES } from "./names.js";
@@ -147,11 +148,23 @@ function showBackUpAccount({ onBack }) {
   $("#seed").onclick = () => gateSeedPhrase(again);
 }
 
+// The account-specific pages act on the account this window shows (account-scope.js), not on
+// whichever account another window made active since: that one is refused.
+/** The shown account, still active, from a fresh read of the vault; null (and a toast) when not. */
+async function thisAccount() {
+  try {
+    return shownActiveAccount(await vault.readAccounts());
+  } catch (error) {
+    toast(error.message);
+    return null;
+  }
+}
+
 // --- Account Name (iOS AccountNamePage) -----------------------------------------------------
 
 async function showAccountName({ onBack }) {
-  const view = await vault.readAccounts();
-  const account = view.accounts.find((a) => a.id === view.activeAccountId) || view.accounts[0];
+  const account = await thisAccount();
+  if (!account) return;
   render(`
     ${navHeader({ title: "Account Name" })}
     <section class="screen settings">
@@ -175,7 +188,7 @@ async function showAccountName({ onBack }) {
 
 async function showAbout({ onBack }) {
   const view = await vault.readAccounts().catch(() => null);
-  const account = view?.accounts.find((a) => a.id === view.activeAccountId);
+  const account = view?.accounts.find((a) => a.id === shownAccount().id);
   const created = account?.createdAt
     ? new Date(account.createdAt).toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })
     : "";
@@ -199,9 +212,9 @@ async function showAbout({ onBack }) {
 // --- Delete Account (KaPay iOS 99ab88a) -------------------------------------------------------
 
 async function confirmDeleteAccount({ onBack, onDelete }) {
-  const view = await vault.readAccounts();
-  const account = view.accounts.find((a) => a.id === view.activeAccountId) || view.accounts[0];
-  const main = (await wallet.cachedAddresses(account.id))?.main || null;
+  const account = await thisAccount();
+  if (!account) return;
+  const main = shownAccount().address || (await wallet.cachedAddresses(account.id))?.main || null;
   showDeleteAccountSheet({
     confirmSubtitle: "Removes this account and its data from this browser.",
     notBackedUp: backupPending(),
@@ -213,7 +226,11 @@ async function confirmDeleteAccount({ onBack, onDelete }) {
       message: "Enter your wallet password to confirm deleting this account.",
       verify: (password) => vault.verifyPassword(password),
       onBack,
-      onUnlocked: () => onDelete(account.id, main),
+      // the account shown is the one deleted, and only while it is still the active one
+      onUnlocked: async () => {
+        if ((await thisAccount())?.id !== account.id) { onBack(); return; }
+        onDelete(account.id, main);
+      },
     }),
   });
 }
@@ -307,7 +324,7 @@ function showChangePassword({ onBack }) {
         <input id="current" type="password" autocomplete="current-password" placeholder="Current password" aria-label="Current password" autofocus />
         <input id="next" type="password" autocomplete="new-password" placeholder="New password (at least ${vault.MIN_PASSWORD_LENGTH} characters)" aria-label="New password" />
         <input id="next2" type="password" autocomplete="new-password" placeholder="Re-enter new password" aria-label="Re-enter new password" />
-        <p class="muted small">The new password unlocks this wallet in this browser from now on. Your seed phrases are re-encrypted with it.</p>
+        <p class="muted small">The new password unlocks this wallet in this browser from now on. Your 12 or 24 words are re-encrypted with it.</p>
         <p class="error" id="error"></p>
         <button type="submit" id="save">Change Password</button>
       </form>
@@ -716,8 +733,8 @@ async function showConnectedSites({ onBack }) {
 // --- View 12 or 24 Words: iOS SeedPhraseView -------------------------------------------------
 
 async function showSeedPhrase({ password, onBack }) {
-  const view = await vault.readAccounts();
-  const account = view.accounts.find((a) => a.id === view.activeAccountId) || view.accounts[0];
+  const account = await thisAccount();
+  if (!account) { onBack(); return; }
   let secrets;
   try {
     secrets = await vault.revealSecrets(account.id, password);
@@ -760,7 +777,8 @@ async function showSeedPhrase({ password, onBack }) {
     const copyKey = $("#copy-key");
     if (copyKey) copyKey.onclick = async () => {
       try {
-        copySecret(await wallet.privateKeyHex({ kind: "main" }), "Private key hex copied. Clipboard will clear in 30s.");
+        if ((await thisAccount())?.id !== account.id) return;
+        copySecret(await wallet.privateKeyHex({ kind: "main", accountId: account.id }), "Private key hex copied. Clipboard will clear in 30s.");
       } catch {
         toast("Private key unavailable.");
       }

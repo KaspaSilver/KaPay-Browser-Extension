@@ -20,6 +20,7 @@ import { esc } from "./ui.js";
 import { SYMBOLS, openPanel } from "./kachat-ui.js";
 import { NETWORK, KAS_UNIT, reencodeAddress } from "./net.js";
 import * as wallet from "./wallet.js";
+import { mergeBellEntries } from "./account-scope.js";
 
 const MAX_ENTRIES = 100;
 const MAX_HANDLED = 500;
@@ -48,9 +49,11 @@ function write(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* full: kept in memory */ }
 }
 
+const scopeFor = (main) => (main ? `${NETWORK}:${String(main).toLowerCase()}` : "");
+
 /** Loads the feed of the account whose chatting address is `main` (call on every account change). */
 export function useAccount(main) {
-  const next = main ? `${NETWORK}:${String(main).toLowerCase()}` : "";
+  const next = scopeFor(main);
   if (next === scope) return;
   scope = next;
   const stored = scope ? read(entriesKey(), []) : [];
@@ -66,10 +69,36 @@ export function forgetAccount(main) {
     const address = reencodeAddress(main, hrp);
     if (!address) continue;
     const key = `${network}:${address.toLowerCase()}`;
-    for (const name of ["kachat_bell_entries", "kachat_bell_seen", "kachat_bell_balances", "kachat_bell_handled"]) {
+    for (const name of BELL_KEYS) {
       try { localStorage.removeItem(`${name}:${key}`); } catch { /* nothing kept */ }
     }
     if (key === scope) useAccount(null);
+  }
+}
+
+const BELL_KEYS = ["kachat_bell_entries", "kachat_bell_seen", "kachat_bell_balances", "kachat_bell_handled"];
+
+/** Change Chatting Address: the account's feed moves to its new chatting address, on both networks
+ *  (account-data.js carryAccountData). A feed the new address already had is merged with it. */
+export function carryAccount(fromMain, toMain) {
+  for (const [network, hrp] of [["mainnet", "kaspa"], ["testnet", "kaspatest"]]) {
+    const from = reencodeAddress(fromMain, hrp);
+    const to = reencodeAddress(toMain, hrp);
+    if (!from || !to || from.toLowerCase() === to.toLowerCase()) continue;
+    const fromKey = `${network}:${from.toLowerCase()}`;
+    const toKey = `${network}:${to.toLowerCase()}`;
+    const [entriesName, seenName, balancesName, handledName] = BELL_KEYS;
+    const at = (name, key, fallback) => read(`${name}:${key}`, fallback);
+    write(`${entriesName}:${toKey}`, mergeBellEntries(at(entriesName, toKey, []), at(entriesName, fromKey, []), MAX_ENTRIES));
+    write(`${seenName}:${toKey}`, Math.max(Number(at(seenName, toKey, 0)) || 0, Number(at(seenName, fromKey, 0)) || 0));
+    // the spending addresses' last balances stay; the new chatting address gets its first look
+    write(`${balancesName}:${toKey}`, { ...at(balancesName, fromKey, {}), ...at(balancesName, toKey, {}) });
+    write(`${handledName}:${toKey}`, [...new Set([...at(handledName, fromKey, []), ...at(handledName, toKey, [])])].slice(-MAX_HANDLED));
+    for (const name of BELL_KEYS) {
+      try { localStorage.removeItem(`${name}:${fromKey}`); } catch { /* nothing kept */ }
+    }
+    // the next useAccount loads the carried feed
+    if (scope === fromKey || scope === toKey) useAccount(null);
   }
 }
 
@@ -81,9 +110,12 @@ function changed() { for (const fn of listeners) { try { fn(); } catch { /* a li
 
 export const unreadCount = () => entries.filter((e) => e.timestamp > lastSeenAt).length;
 
-/** Adds a row once (by id). `source`: "wallet" or "kachat"; `targetId`: the name for .kachat rows. */
-export function record({ id, source, title, body = "", timestamp = Date.now(), targetId = null }) {
+/** Adds a row once (by id). `source`: "wallet" or "kachat"; `targetId`: the name for .kachat rows.
+ *  `account`: the chatting address the row is about - dropped when the bell has moved to another
+ *  account meanwhile (a check that started before an account switch). */
+export function record({ id, source, title, body = "", timestamp = Date.now(), targetId = null, account = null }) {
   if (!scope || !id || (source !== "wallet" && source !== "kachat")) return;
+  if (account && scopeFor(account) !== scope) return;
   if (entries.some((e) => e.id === id)) return;
   entries.unshift({ id, source, title, body, timestamp, targetId });
   if (entries.length > MAX_ENTRIES) entries = entries.slice(0, MAX_ENTRIES);
@@ -194,10 +226,13 @@ const shortAddress = (a) => (a.length > 20 ? `${a.slice(0, 14)}...${a.slice(-6)}
  * Checks the wallet's own addresses for Kaspa that arrived since the last look and records a row
  * per paying transaction. `addresses`: `[{ address, label, chatting? }]` - every address of
  * this account (the chatting address, all spending addresses, KasSigner addresses); all of them
- * count as "yours" for the self-send check. `chatting`: plain transfers only. Never throws.
+ * count as "yours" for the self-send check. `chatting`: plain transfers only. `account`: their
+ * chatting address (the feed they belong to). Never throws.
  */
-export async function checkReceipts(addresses, { force = false } = {}) {
+export async function checkReceipts(addresses, { force = false, account = null } = {}) {
   if (!scope || receiptsRunning || !addresses?.length) return;
+  // `account`: the chatting address these addresses belong to - never another account's baseline
+  if (account && scopeFor(account) !== scope) return;
   if (!force && Date.now() - receiptsAt < RECEIPT_INTERVAL_MS) return;
   receiptsRunning = true;
   receiptsAt = Date.now();

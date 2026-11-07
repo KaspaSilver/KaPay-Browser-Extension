@@ -20,6 +20,7 @@
 import * as vault from "./vault.js";
 import { app, esc, render, $, ICONS, passwordGate } from "./ui.js";
 import { reencodeAddress } from "./net.js";
+import { shownActiveAccount, SWITCHED_ELSEWHERE } from "./account-scope.js";
 import {
   createAccountBackupStatus, backupStepsFor, wordPageCount, wordPageRange, backupCheckPositions,
   randomWordPositions, wrongWordPositions, normalizedWord, passphraseMatches, HYGIENE_WORDS_TO_CHECK,
@@ -40,9 +41,11 @@ export const backupStatus = createAccountBackupStatus({
   variants: (address) => [reencodeAddress(address, "kaspa"), reencodeAddress(address, "kaspatest")],
 });
 
-// The signed-in account's chatting address and whether it holds funds (spending addresses
-// included, iOS AccountBackupBanner.hasFunds), as the Wallet tab last read them.
-const context = { address: null, hasFunds: false };
+// The signed-in account (its id and chatting address) and whether it holds funds (spending
+// addresses included, iOS AccountBackupBanner.hasFunds), as the Wallet tab last read them. The
+// steps show this account's words and mark this address, never whichever account is active by
+// then (another window can switch it).
+const context = { accountId: null, address: null, hasFunds: false };
 export function setBackupContext(patch) { Object.assign(context, patch); }
 export const backupPending = () => backupStatus.isPending(context.address);
 export const hygieneDue = () => backupStatus.isHygieneDue(context.address);
@@ -107,6 +110,9 @@ export function bindHygieneCard(onClose) {
 
 /** The open flow, or null. It alone holds the words. */
 let flow = null;
+// Bumped by clearBackupFlow: a password check still running for a flow that was cleared meanwhile
+// opens nothing.
+let flowToken = 0;
 
 function close() {
   const closing = flow;
@@ -114,8 +120,18 @@ function close() {
   closing?.onClose?.();
 }
 
-/** The words behind the password, then `then(seed)`; null when the vault can't give them. */
-function unlockSeed({ title, onBack, then }) {
+/** The wallet locked, logged out, deleted or switched accounts (popup.js): the open flow goes with
+ *  its words and passphrase, without going back anywhere - the caller draws the next screen. */
+export function clearBackupFlow() {
+  flowToken += 1;
+  if (flow?.seed) { flow.seed.words = []; flow.seed.passphrase = ""; }
+  flow = null;
+}
+
+/** The words of `accountId` behind the password, then `then(seed)`; null when the vault can't give
+ *  them. Refused (an error message instead) when another window made a different account active. */
+function unlockSeed({ title, accountId, onBack, then }) {
+  const token = flowToken;
   passwordGate({
     title,
     message: "Enter your wallet password to see your 12 or 24 words.",
@@ -123,16 +139,26 @@ function unlockSeed({ title, onBack, then }) {
     onBack,
     onUnlocked: async (password) => {
       let seed = null;
+      let refused = "";
       try {
-        const view = await vault.readAccounts();
-        const secrets = await vault.revealSecrets(view.activeAccountId, password);
+        shownActiveAccount(await vault.readAccounts(), accountId);
+        const secrets = await vault.revealSecrets(accountId, password);
         const words = String(secrets.mnemonic || "").split(" ").filter(Boolean);
         // the vault keeps every passphrase NFKD (audit EXT-010)
         if (words.length) seed = { words, passphrase: secrets.passphrase || "", passphraseForm: "nfkd" };
-      } catch { seed = null; }
-      then(seed);
+      } catch (error) {
+        seed = null;
+        refused = error?.message || "";
+      }
+      if (token !== flowToken) return;
+      then(seed, refused);
     },
   });
+}
+
+/** Still the account the steps were opened for, and still the active one. */
+async function stillThisAccount(accountId) {
+  try { shownActiveAccount(await vault.readAccounts(), accountId); return true; } catch { return false; }
 }
 
 /** One step: Back (when there is one), the title, Close; the body scrolls, the buttons stay at the
@@ -164,6 +190,8 @@ const pointHtml = (icon, title, detail) => `
   </div>`;
 
 const unavailableHtml = '<p class="backup-detail">This account\'s 12 or 24 words aren\'t available on this device.</p>';
+// a switch in another window refuses the words with its own reason (account-scope.js)
+const refusedHtml = (refused) => (refused === SWITCHED_ELSEWHERE ? `<p class="backup-detail">${esc(refused)}</p>` : unavailableHtml);
 
 // A word or passphrase field: no autofill, no autocorrect, spellcheck off so a browser's cloud
 // spellchecker never sees it, and the password managers told to keep away.
@@ -196,13 +224,14 @@ function bindPassphraseField(onInput) {
 /** The steps, behind the password. `onClose` runs when they close, finished or not. */
 export function openAccountBackup({ onClose }) {
   flow = null;
-  const address = context.address;
-  unlockSeed({ title: "Back Up Account", onBack: onClose, then: (seed) => startBackup(seed, { onClose, address }) });
+  const { accountId, address } = context;
+  unlockSeed({ title: "Back Up Account", accountId, onBack: onClose, then: (seed, refused) => startBackup(seed, { onClose, accountId, address, refused }) });
 }
 
-function startBackup(seed, { onClose, address }) {
+function startBackup(seed, { onClose, accountId, address, refused = "" }) {
   flow = {
     onClose,
+    accountId,
     address,
     seed,
     step: "why",
@@ -214,7 +243,7 @@ function startBackup(seed, { onClose, address }) {
     passphraseAnswer: "",
     passphraseWrong: false,
   };
-  if (!seed) { present("Back Up Account", { body: unavailableHtml }); return; }
+  if (!seed) { present("Back Up Account", { body: refusedHtml(refused) }); return; }
   renderBackupStep();
 }
 
@@ -419,12 +448,16 @@ function renderTips(frame) {
       ${pointHtml(ICON.gear, "You can see it again", "Your 12 or 24 words stay available in Settings > Back Up Account.")}`,
     foot: '<button id="next" class="big">Finish Backup</button>',
   });
-  $("#next").onclick = () => { confirmBackup(); close(); };
+  $("#next").onclick = async () => { await confirmBackup(); close(); };
 }
 
-/** Nothing is owed any more, and the six months start. */
-function confirmBackup() {
-  if (flow?.address) backupStatus.markConfirmed(flow.address);
+/** Nothing is owed any more, and the six months start - for the account whose words these were,
+ *  only while it is still the active one. */
+async function confirmBackup() {
+  const confirming = flow;
+  if (!confirming?.address || !(await stillThisAccount(confirming.accountId))) return;
+  if (flow !== confirming) return;
+  backupStatus.markConfirmed(confirming.address);
 }
 
 // --- Backup Hygiene ---------------------------------------------------------------------------
@@ -433,13 +466,14 @@ function confirmBackup() {
  *  Either one starts the six months over; closing leaves the card up. */
 export function openBackupHygiene({ onClose }) {
   flow = null;
-  const address = context.address;
+  const { accountId, address } = context;
   unlockSeed({
     title: "Backup Hygiene",
+    accountId,
     onBack: onClose,
-    then: (seed) => {
-      flow = { onClose, address, seed, asked: [], answers: [], active: 0, wrong: false, passphraseAnswer: "" };
-      if (!seed) { present("Backup Hygiene", { body: unavailableHtml }); return; }
+    then: (seed, refused) => {
+      flow = { onClose, accountId, address, seed, asked: [], answers: [], active: 0, wrong: false, passphraseAnswer: "" };
+      if (!seed) { present("Backup Hygiene", { body: refusedHtml(refused) }); return; }
       flow.asked = randomWordPositions(seed.words.length, HYGIENE_WORDS_TO_CHECK);
       flow.answers = flow.asked.map(() => "");
       renderHygieneCheck();
@@ -448,8 +482,8 @@ export function openBackupHygiene({ onClose }) {
 }
 
 function redoBackupFromHygiene() {
-  const { seed, onClose, address } = flow;
-  startBackup(seed, { onClose, address });
+  const { seed, onClose, accountId, address } = flow;
+  startBackup(seed, { onClose, accountId, address });
 }
 
 const CANT_COMPLETE = '<button class="ghost backup-cant" id="cant">Can\'t Complete This</button>';
@@ -565,8 +599,10 @@ function renderHygienePassphrase() {
   $("#cant").onclick = redoBackupFromHygiene;
 }
 
-function finishHygiene() {
-  confirmBackup();
+async function finishHygiene() {
+  const finishing = flow;
+  await confirmBackup();
+  if (flow !== finishing) return;
   // past the check nothing here needs the words any more
   flow.seed = null;
   flow.asked = [];

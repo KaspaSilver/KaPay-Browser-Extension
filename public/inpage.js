@@ -6,11 +6,13 @@
 // Kaspa site can support both with little code.
 //
 //   await kachat.requestAccounts()            -> ["kaspa:..."]   (asks the user to connect)
-//   await kachat.getAccounts()                -> [] until connected and unlocked
+//   await kachat.getAccounts()                -> [] until connected, unlocked and signed in
 //   await kachat.getNetwork()                 -> "mainnet" | "testnet-10" (null until connected)
 //   await kachat.getPublicKey()               -> "02..."
 //   await kachat.getBalance()                 -> { confirmed, unconfirmed, total }  (sompi)
 //   await kachat.sendKaspa(to, sompi, { priorityFee })  -> txid   (asks the user)
+//     priorityFee: extra sompi on top of the network fee, at most 100000000 (1 KAS). An error with
+//     code 4002 means the payment may have been sent (error.txid, when known): check before retrying.
 //   await kachat.signMessage(text)            -> signature hex    (asks the user)
 //   await kachat.disconnect()
 //   kachat.on("accountsChanged" | "disconnect" | "networkChanged", handler) / kachat.removeListener(...)
@@ -23,10 +25,12 @@
   let nextId = 1;
 
   class KaChatWalletError extends Error {
-    constructor(message, code) {
+    constructor(message, code, txid) {
       super(message);
       this.name = "KaChatWalletError";
       this.code = code;
+      // 4002 "may have been sent": the transaction to look up, when KaPay has one (audit 2026-11-07)
+      if (typeof txid === "string" && /^[0-9a-f]{64}$/.test(txid)) this.txid = txid;
     }
   }
 
@@ -42,7 +46,7 @@
     const entry = pending.get(data.id);
     if (!entry) return;
     pending.delete(data.id);
-    if (data.error) entry.reject(new KaChatWalletError(data.error.message || "Request failed.", data.error.code));
+    if (data.error) entry.reject(new KaChatWalletError(data.error.message || "Request failed.", data.error.code, data.error.txid));
     else entry.resolve(data.result);
   });
 

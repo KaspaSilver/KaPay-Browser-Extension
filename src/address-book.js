@@ -25,6 +25,7 @@ import { scanQr } from "./camera.js";
 import { looksLikeName, resolveEverywhere, primaryResolution, notFoundMessage, otherDomainsHtml, bindOtherDomains, splitTypedName } from "./names.js";
 import * as dock from "./dock.js";
 import * as wallet from "./wallet.js";
+import { mergeContacts } from "./account-scope.js";
 
 const ENTRIES_PREFIX = "kachat_address_book_wallet_";
 const DELETED_PREFIX = "kachat_address_book_deleted_wallet_";
@@ -76,6 +77,28 @@ export async function forgetWallet(main) {
   const keys = [main, reencodeAddress(main, "kaspa"), reencodeAddress(main, "kaspatest")].filter(Boolean).map(normalize);
   await removeLocal([...new Set(keys)].flatMap((key) => [ENTRIES_PREFIX + key, DELETED_PREFIX + key, PHOTOS_PREFIX + key]));
   if (keys.includes(walletKey)) useWallet(null);
+}
+
+/** Change Chatting Address: the account's contacts move to its new chatting address, on both
+ *  networks (account-data.js carryAccountData). A list the new address already had keeps its own
+ *  entries, the old list's are added to it. */
+export async function carryWallet(fromMain, toMain) {
+  for (const hrp of ["kaspa", "kaspatest"]) {
+    const from = normalize(reencodeAddress(fromMain, hrp));
+    const to = normalize(reencodeAddress(toMain, hrp));
+    if (!from || !to || from === to) continue;
+    const [fromEntries, fromDeleted, fromPhotos, toEntries, toDeleted, toPhotos] = await Promise.all([
+      getLocal(ENTRIES_PREFIX + from), getLocal(DELETED_PREFIX + from), getLocal(PHOTOS_PREFIX + from),
+      getLocal(ENTRIES_PREFIX + to), getLocal(DELETED_PREFIX + to), getLocal(PHOTOS_PREFIX + to),
+    ]);
+    if (fromEntries == null && fromDeleted == null && fromPhotos == null) continue;
+    await setLocal(ENTRIES_PREFIX + to, mergeContacts(toEntries, fromEntries));
+    await setLocal(DELETED_PREFIX + to, { ...(fromDeleted || {}), ...(toDeleted || {}) });
+    await setLocal(PHOTOS_PREFIX + to, { ...(fromPhotos || {}), ...(toPhotos || {}) });
+    await removeLocal([ENTRIES_PREFIX + from, DELETED_PREFIX + from, PHOTOS_PREFIX + from]);
+    // the next useWallet loads the carried list
+    if (walletKey === from || walletKey === to) useWallet(null);
+  }
 }
 
 export function onAddressBookChange(fn) { listeners.add(fn); return () => listeners.delete(fn); }

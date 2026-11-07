@@ -112,6 +112,9 @@ const status = { connection: "busy", balanceText: null, nodeUrl: "" };
 
 export function setStatus(patch) { Object.assign(status, patch); }
 
+/** Lock, log out, delete or an account switch: no account's balance stays in the toolbar. */
+export function resetStatus() { Object.assign(status, { connection: "busy", balanceText: null, nodeUrl: "" }); }
+
 /** Between the toolbar and the title, the backup banner while the backup is owed (KaPay iOS 953b255
  *  pinnedTabHeader): every tab shows it. */
 export function tabTopHtml(title, { rightHtml = "" } = {}) {

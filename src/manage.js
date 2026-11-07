@@ -29,8 +29,12 @@ import { addressNamesTab, showLiveNameDetail } from "./kachat-live.js";
 import { addressDomainsTab } from "./address-domains.js";
 import { kachatRegistry } from "./kachat-names.js";
 import { followAccount } from "./approve.js";
+import { carryAccountData } from "./account-data.js";
+import { shownActiveAccount } from "./account-scope.js";
 import { sompiFromUserText } from "./amounts.js";
 import { showAddToPortfolio } from "./portfolio.js";
+import { MAX_AMOUNT_CHANGED } from "../shared/engine/transactions.js";
+import { consolidateOutcome, sameCoinSet, CONSOLIDATE_CHANGED_MESSAGE } from "./send-guards.js";
 
 // The quantum-safe shield (iOS bba1b1e): green while the address's key has never been on chain
 // (receiving any number of times is fine); slashed once it has spent - orange when funds sit on it
@@ -277,9 +281,10 @@ function addressTabContent(state, compoundFooter) {
 
 // iOS ChattingAddressPrivateKeyView / SpendingAddressPrivateKeyView: the warning, tap to reveal
 // for seven seconds, Copy Private Key Hex (clipboard cleared after 30 s).
-async function showPrivateKey({ title, source, onBack }) {
+async function showPrivateKey({ title, source, address, onBack }) {
   let value = "Unavailable";
-  try { value = await wallet.privateKeyHex(source); } catch { /* shown as Unavailable */ }
+  // this page's address: another account's key (switched in another window) is never shown here
+  try { value = await wallet.privateKeyHex(source, { fromAddress: address }); } catch { /* shown as Unavailable */ }
   let revealed = false;
   let timer = null;
   const paint = () => {
@@ -308,20 +313,20 @@ async function showPrivateKey({ title, source, onBack }) {
   paint();
 }
 
-function gatePrivateKey({ title, source, onBack }) {
+function gatePrivateKey({ title, source, address, onBack }) {
   passwordGate({
     title,
     message: "Enter your wallet password to view this address's private key.",
     verify: (password) => vault.verifyPassword(password),
     onBack,
-    onUnlocked: () => showPrivateKey({ title, source, onBack }),
+    onUnlocked: () => showPrivateKey({ title, source, address, onBack }),
   });
 }
 
 // iOS ChattingAddressPublicKeyView.
-async function showPublicKey({ source, onBack }) {
+async function showPublicKey({ source, address, onBack }) {
   let value = null;
-  try { value = await wallet.publicKeyHex(source); } catch { /* fallback text */ }
+  try { value = await wallet.publicKeyHex(source, { fromAddress: address }); } catch { /* fallback text */ }
   render(`
     ${navHeader({ title: "Public Key", backLabel: "Close" })}
     <section class="screen key-screen">
@@ -367,8 +372,8 @@ export function showManageAddress(opts) {
     title: "Address Actions",
     cancel: false,
     rows: [
-      { label: "View Private Key", subtitle: "The key that spends this address. Never share it.", icon: SF.keyFill, onClick: () => gatePrivateKey({ title: "Chatting Address", source, onBack: back }) },
-      { label: "View Public Key", subtitle: "The public half of this address, for anyone who asks for it.", icon: SF.number, onClick: () => showPublicKey({ source, onBack: back }) },
+      { label: "View Private Key", subtitle: "The key that spends this address. Never share it.", icon: SF.keyFill, onClick: () => gatePrivateKey({ title: "Chatting Address", source, address: opts.address, onBack: back }) },
+      { label: "View Public Key", subtitle: "The public half of this address, for anyone who asks for it.", icon: SF.number, onClick: () => showPublicKey({ source, address: opts.address, onBack: back }) },
       { label: "View in Explorer", subtitle: "Opens this address on your chosen block explorer.", icon: SF.globe, onClick: () => window.open(wallet.explorerAddressUrl(opts.address), "_blank", "noopener") },
       // The extension's home for the picker iOS shows in its Welcome Guide after an import.
       ...(opts.onChangeIdentity ? [{ label: "Change Chatting Address", subtitle: "Pick another address of this seed that already holds your identity.", icon: SF.person, onClick: () => showChattingAddressPicker({ onBack: back, onChanged: opts.onChangeIdentity }) }] : []),
@@ -775,7 +780,7 @@ function showSpendingAddress({ row, onBack }) {
     const scroller = app.querySelector(".manage-scroll");
     if (scroller) scroller.scrollTop = scroll;
     $("#back").onclick = onBack;
-    $("#export-key").onclick = () => gatePrivateKey({ title, source, onBack: back });
+    $("#export-key").onclick = () => gatePrivateKey({ title, source, address: row.address, onBack: back });
     for (const tab of app.querySelectorAll("[data-tab]")) tab.onclick = () => { state.tab = tab.dataset.tab; paint(); };
     $("#receive").onclick = () => showQr({ title: `Address #${row.index}`, address: row.address, backLabel: "Close", onBack: back });
     $("#send").onclick = () => openSend(false);
@@ -957,8 +962,23 @@ async function showConsolidate({ list, onBack }) {
   const rows = list?.rows || [];
   const primary = rows.find((r) => r.primary);
   const sources = rows.filter((r) => !r.primary && r.balanceSompi > 0n);
-  const state = { tier: "normal", customKas: null, editing: false, sending: false, base: null };
+  // `pins`: each source's coins as the screen shows them (the engine's Max view, by index) - what a
+  // Confirm sends, or nothing from that address (KaChat-Desktop's Max pin)
+  const state = { tier: "normal", customKas: null, editing: false, sending: false, base: null, pins: new Map(), pinning: sources.length > 0 };
   try { state.base = (await wallet.maxFee(1)).policyKas; } catch { state.base = 0.002; }
+  const shownSompi = (r) => state.pins.get(r.index)?.totalSompi ?? r.balanceSompi;
+  const loadPins = async () => {
+    await Promise.all(sources.map(async (r) => {
+      try {
+        const plan = await wallet.estimateMax({ address: r.address, destination: primary?.address || null });
+        state.pins.set(r.index, { outpoints: plan.outpoints, totalSompi: plan.totalSompi });
+      } catch (error) {
+        state.pins.set(r.index, { error });
+      }
+    }));
+    state.pinning = false;
+    if (app.dataset.screen === "consolidate" && !state.sending) paint();
+  };
   const feeKas = () => state.customKas ?? state.base * (TIERS.find((t) => t[0] === state.tier)?.[2] || 1);
 
   const paint = () => {
@@ -967,7 +987,7 @@ async function showConsolidate({ list, onBack }) {
       <header class="navbar form-bar">
         <button class="bar-text" id="cancel" ${state.sending ? "disabled" : ""}>Cancel</button>
         <div class="nav-title">Consolidate to Primary</div>
-        ${state.sending ? '<span class="bar-text"><span class="spinner small-spin"></span></span>' : `<button class="bar-text strong" id="confirm" ${sources.length ? "" : "disabled"}>Confirm</button>`}
+        ${state.sending ? '<span class="bar-text"><span class="spinner small-spin"></span></span>' : `<button class="bar-text strong" id="confirm" ${sources.length && !state.pinning ? "" : "disabled"}>${state.pinning ? '<span class="spinner small-spin"></span>' : "Confirm"}</button>`}
       </header>
       <section class="form">
         <div class="form-section">
@@ -976,7 +996,7 @@ async function showConsolidate({ list, onBack }) {
             ${sources.length ? sources.map((r) => `
               <div class="form-row between">
                 <span class="tx-meta"><span class="muted tiny">${esc(r.label)}</span><span class="mono small">${esc(shortAddress(r.address))}</span></span>
-                <span class="strong">${esc(wallet.sompiToKasText(r.balanceSompi))} KAS</span>
+                <span class="strong">${esc(wallet.sompiToKasText(shownSompi(r)))} KAS</span>
               </div>`).join("") : '<div class="form-row muted">No other addresses have a balance to consolidate.</div>'}
           </div>
         </div>
@@ -1024,42 +1044,82 @@ async function showConsolidate({ list, onBack }) {
     if (confirm) confirm.onclick = run;
   };
 
-  // One Max send per source, in turn; an error does not stop the rest.
+  // One Max send per source, in turn; an error does not stop the rest. Each sends exactly the coins
+  // the screen shows for it: coins that moved meanwhile send nothing from that address, and the
+  // new amount is shown to confirm again.
   const run = async () => {
     state.sending = true;
     paint();
     const multiplier = TIERS.find((t) => t[0] === state.tier)?.[2] || 1;
-    const txids = [];
-    let lastError = null;
+    const results = [];
+    const changedTo = (source, outpoints, totalSompi) => {
+      if (Array.isArray(outpoints) && totalSompi != null) state.pins.set(source.index, { outpoints, totalSompi });
+      const error = new Error(CONSOLIDATE_CHANGED_MESSAGE);
+      error.code = MAX_AMOUNT_CHANGED;
+      return error;
+    };
     for (const source of sources) {
+      const pin = state.pins.get(source.index);
       try {
-        const coins = await wallet.utxos(source.address);
-        if (!coins.length) continue;
-        const base = (await wallet.maxFee(coins.length, { sourceIndex: source.index })).policyKas;
+        if (!pin || pin.error) throw pin?.error || new Error("Couldn't load the coins at this address");
+        const base = (await wallet.maxFee(pin.outpoints.length, { sourceIndex: source.index })).policyKas;
         const total = state.customKas != null ? Math.max(state.customKas, base) : base * multiplier;
-        const result = await wallet.send({ source: { kind: "spending", index: source.index }, destination: primary.address, max: true, totalFeeKas: total.toFixed(8), maxAmountSompi: source.balanceSompi });
-        txids.push(...(result?.txids || []));
+        // the amount at this fee, worked out by the engine; checked against the shown coins before
+        // the password is asked
+        const plan = await wallet.estimateMax({ address: source.address, destination: primary.address, totalFeeKas: total.toFixed(8) });
+        if (!sameCoinSet(plan.outpoints, pin.outpoints)) throw changedTo(source, plan.outpoints, plan.totalSompi);
+        const result = await wallet.send({
+          source: { kind: "spending", index: source.index }, destination: primary.address, max: true, totalFeeKas: total.toFixed(8),
+          maxAmountSompi: plan.amountSompi, maxOutpoints: pin.outpoints,
+          fromAddress: source.address, fromAccountId: list?.accountId || null,
+        });
+        results.push({ label: source.label, txids: result?.txids || [] });
       } catch (error) {
         // a cancelled password prompt stops the run: nothing more is sent
         if (error?.code === wallet.SEND_CANCELLED) break;
-        lastError = error;
+        if (error?.code === MAX_AMOUNT_CHANGED && error.feeSompi != null) {
+          results.push({ label: source.label, error: changedTo(source, error.outpoints, error.amountSompi + error.feeSompi) });
+        } else {
+          results.push({ label: source.label, error });
+        }
       }
     }
     state.sending = false;
-    if (txids.length) return showConsolidateSuccess({ txids, onDone: onBack });
+    const outcome = consolidateOutcome(results);
+    // anything that went out (or may have): the result lists every address, sent or not
+    if (outcome.txids.length || outcome.unconfirmed.length) return showConsolidateResult({ outcome, onDone: onBack });
     paint();
-    if (lastError) showAlert({ title: "Something Went Wrong", message: String(lastError?.message || lastError), confirmLabel: "OK" });
+    const notSent = [...outcome.changed, ...outcome.failed];
+    if (notSent.length) {
+      showAlert({
+        title: "Something Went Wrong",
+        // each address named; the alert runs them on as one paragraph
+        message: notSent.length === 1 && sources.length === 1 ? notSent[0].message : notSent.map((r) => `${r.label}: ${r.message}`).join(" "),
+        confirmLabel: "OK",
+      });
+    }
   };
 
   paint();
+  loadPins();
 }
 
-function showConsolidateSuccess({ txids, onDone }) {
+// What Consolidate did, address by address: the transactions sent, then any address whose send
+// wasn't confirmed (it may still land: check before sending again) or didn't go out.
+function showConsolidateResult({ outcome, onDone }) {
+  const rows = (list) => list.map((r) => `
+    <div class="list-row stack-tight"><span class="strong small">${esc(r.label)}</span><span class="muted tiny">${esc(r.message)}</span>
+      ${r.txid ? `<a class="mono tiny break link-button underline" href="${esc(wallet.explorerTxUrl(r.txid))}" target="_blank" rel="noopener noreferrer">${esc(r.txid)}</a>` : ""}
+    </div>`).join("");
+  const notSent = [...outcome.changed, ...outcome.failed];
   render(`
     <section class="screen sent">
-      <div class="sent-check" style="color:#30d158">${ICONS.checkBig}</div>
-      <h2>Sent</h2>
-      ${txids.map((txid) => `<a class="mono tiny break link-button underline" href="${esc(wallet.explorerTxUrl(txid))}" target="_blank" rel="noopener noreferrer">${esc(txid)}</a>`).join("")}
+      ${outcome.txids.length
+        ? `<div class="sent-check" style="color:#30d158">${ICONS.checkBig}</div><h2>Sent</h2>`
+        : `<div class="sent-check kl-orange">${ICONS.warning}</div><h2>Not Confirmed</h2>`}
+      ${outcome.txids.map((txid) => `<a class="mono tiny break link-button underline" href="${esc(wallet.explorerTxUrl(txid))}" target="_blank" rel="noopener noreferrer">${esc(txid)}</a>`).join("")}
+      ${outcome.unconfirmed.length ? `<div class="form-header">Not Confirmed</div><div class="glass list">${rows(outcome.unconfirmed)}</div>` : ""}
+      ${notSent.length ? `<div class="form-header">Not Sent</div><div class="glass list">${rows(notSent)}</div>` : ""}
       <div class="spacer"></div>
       <button id="ok" class="big">OK</button>
     </section>`, "sent");
@@ -1156,11 +1216,16 @@ function showIdentityDetail({ row, current, onBack, onChanged }) {
     button.disabled = true;
     button.innerHTML = '<span class="spinner"></span>';
     try {
-      const view = await vault.readAccounts();
-      await vault.setIdentityIndex(view.activeAccountId, row.index);
-      await wallet.deriveAddresses();
+      // the account this window shows, refused if another window switched since (audit 2026-11-07)
+      const accountId = shownActiveAccount(await vault.readAccounts()).id;
+      const before = (await wallet.cachedAddresses(accountId))?.main
+        || (await wallet.identityFor(accountId).catch(() => null))?.address || null;
+      await vault.setIdentityIndex(accountId, row.index);
+      const derived = await wallet.deriveAddresses();
+      // what it owes a backup, its contacts and its bell feed move with it (audit 2026-11-07)
+      await carryAccountData(before, derived.main);
       // Connected websites follow the account to its new chatting address (audit EXT-001).
-      await followAccount(view.activeAccountId);
+      await followAccount(accountId);
       toast(`Chatting address set to #${row.index}.`);
       onChanged();
     } catch (error) {

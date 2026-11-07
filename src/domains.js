@@ -21,6 +21,7 @@ import { showKachatMarket } from "./market.js";
 import { showLiveNameDetail } from "./kachat-live.js";
 // the .kachat list, started from the names saved last time (iOS f4f5c0f)
 import { ownedDomainsTab, ownedDomainsEntry } from "./kachat-owned-cache.js";
+import { recipientLookup } from "./send-pieces.js";
 
 const BASE_FEE_SOMPI = 2_000_000n; // 0.02 KAS - iOS WithdrawFeeTier base for domain transfers
 const FEE_TIERS = [
@@ -233,7 +234,7 @@ function showDomainDetail({ address, domain, primaryDomain, onBack }) {
       if (app.dataset.screen === "domain-detail") paint();
     };
     $("#send").onclick = () => {
-      if (canSend) showSendDomain({ domain, onBack: paint, onSent: onBack });
+      if (canSend) showSendDomain({ domain, ownerAddress: address, onBack: paint, onSent: onBack });
     };
   };
   paint();
@@ -308,8 +309,9 @@ async function finishTransfer(record, after) {
   }
 }
 
-/** Send Domain. `source` is the owner: the chatting address, or { kind: "spending", index }. */
-export function showSendDomain({ domain, onBack, onSent, source = { kind: "main" } }) {
+/** Send Domain. `source` is the owner: the chatting address, or { kind: "spending", index };
+ *  `ownerAddress` its address as shown - another account's key is refused at Send. */
+export function showSendDomain({ domain, onBack, onSent, source = { kind: "main" }, ownerAddress = null }) {
   const state = {
     recipientInput: "", recipient: null, recipientError: "", resolving: false, resolutions: [], othersOpen: false,
     tier: "normal", customFeeSompi: null, editingFee: false,
@@ -318,36 +320,23 @@ export function showSendDomain({ domain, onBack, onSent, source = { kind: "main"
   const feeSompi = () => state.customFeeSompi ?? BASE_FEE_SOMPI * (FEE_TIERS.find((t) => t.id === state.tier)?.multiplier || 1n);
   const canSend = () => Boolean(state.recipient) && !state.resolving && !state.sending;
 
-  let resolveSeq = 0;
-  let recipientTimer = null;
-  const resolveRecipient = async () => {
-    const seq = ++resolveSeq;
-    const input = state.recipientInput.trim().split("?")[0];
-    state.recipient = null;
-    state.recipientError = "";
-    state.resolutions = [];
-    state.othersOpen = false;
-    if (!input) { paint(); return; }
-    state.resolving = true;
-    paint();
-    try {
-      const resolved = await wallet.resolveRecipient(input);
-      if (seq !== resolveSeq) return;
-      state.recipient = resolved;
-      state.resolutions = resolved.resolutions || [];
-    } catch (error) {
-      if (seq !== resolveSeq) return;
-      state.recipientError = error.message;
-      state.resolutions = error.resolutions || [];
-      state.othersOpen = state.resolutions.some((r) => r.address);
-    } finally {
-      if (seq === resolveSeq) { state.resolving = false; paint(); }
-    }
-  };
+  // The send screens' lookup (send-pieces.js): a keystroke clears the recipient and marks it as being
+  // looked up at once, so Send is off until the new text resolves - never the last answer's address.
+  const lookup = recipientLookup({
+    read: () => state.recipientInput.split("?")[0],
+    resolve: (text) => wallet.resolveRecipient(text),
+    onChange: (found) => {
+      state.recipient = found.recipient;
+      state.recipientError = found.error;
+      state.resolutions = found.resolutions;
+      state.resolving = found.resolving;
+      // nothing for the ending typed, but another service has the name: show it straight away
+      state.othersOpen = Boolean(found.error) && found.resolutions.some((r) => r.address);
+      paintRecipient();
+    },
+  });
 
-  const paint = () => {
-    if (state.sending) return paintProgress();
-    const focusedId = document.activeElement?.id;
+  const recipientStatusHtml = () => {
     const status = (() => {
       if (!state.recipientInput.trim()) return "";
       if (state.resolving) return `<div class="status muted"><span class="spinner small-spin"></span> Looking up domain...</div>`;
@@ -356,6 +345,34 @@ export function showSendDomain({ domain, onBack, onSent, source = { kind: "main"
       if (state.recipient) return `<div class="status good">${ICONS.checkFill}<span>Valid address</span></div>`;
       return "";
     })();
+    return status || state.resolutions.length ? `<div class="form-row stack-tight">${status}${names.otherDomainsHtml({ resolutions: state.resolutions, selectedTld: state.recipient?.tld || names.splitTypedName(state.recipientInput).tld, open: state.othersOpen })}</div>` : "";
+  };
+  const bindRecipientExtras = () => {
+    names.bindOtherDomains(app, {
+      onToggle: () => { state.othersOpen = !state.othersOpen; paintRecipient(); },
+      onPick: (tld) => {
+        const pick = state.resolutions.find((r) => r.tld === tld && r.address);
+        if (!pick) return;
+        state.recipient = { address: pick.address, domain: pick.display, tld: pick.tld, resolutions: state.resolutions };
+        state.recipientError = "";
+        state.othersOpen = false;
+        paintRecipient();
+      },
+    });
+  };
+  /** Only the recipient's status and the Send button, so the field keeps its caret while typing. */
+  const paintRecipient = () => {
+    if (state.sending || app.dataset.screen !== "send-domain") return;
+    const host = $("#recipient-status");
+    if (host) host.innerHTML = recipientStatusHtml();
+    bindRecipientExtras();
+    const send = $("#send");
+    if (send) send.disabled = !canSend();
+  };
+
+  const paint = () => {
+    if (state.sending) return paintProgress();
+    const focusedId = document.activeElement?.id;
     const fee = feeSompi();
     render(`
       <header class="navbar form-bar">
@@ -372,7 +389,7 @@ export function showSendDomain({ domain, onBack, onSent, source = { kind: "main"
           <div class="form-header">Recipient Address</div>
           <div class="form-card">
             <textarea id="recipient" class="mono recipient" rows="2" placeholder="kaspa:qr... or domain" spellcheck="false" autocapitalize="off">${esc(state.recipientInput)}</textarea>
-            ${status || state.resolutions.length ? `<div class="form-row stack-tight">${status}${names.otherDomainsHtml({ resolutions: state.resolutions, selectedTld: state.recipient?.tld || names.splitTypedName(state.recipientInput).tld, open: state.othersOpen })}</div>` : ""}
+            <div id="recipient-status">${recipientStatusHtml()}</div>
             <div class="form-row"><button class="link-button" id="paste">${ICONS.clipboard}<span>Paste</span></button></div>
           </div>
           <div class="form-footer">Enter a Kaspa address (kaspa:...) or a domain.</div>
@@ -401,23 +418,17 @@ export function showSendDomain({ domain, onBack, onSent, source = { kind: "main"
     const recipient = $("#recipient");
     recipient.oninput = () => {
       state.recipientInput = recipient.value;
-      clearTimeout(recipientTimer);
-      recipientTimer = setTimeout(resolveRecipient, 350);
+      lookup.schedule();
     };
-    names.bindOtherDomains(app, {
-      onToggle: () => { state.othersOpen = !state.othersOpen; paint(); },
-      onPick: (tld) => {
-        const pick = state.resolutions.find((r) => r.tld === tld && r.address);
-        if (!pick) return;
-        state.recipient = { address: pick.address, domain: pick.display, tld: pick.tld, resolutions: state.resolutions };
-        state.recipientError = "";
-        state.othersOpen = false;
-        paint();
-      },
-    });
+    bindRecipientExtras();
     $("#paste").onclick = async () => {
-      try { state.recipientInput = (await navigator.clipboard.readText()).trim(); resolveRecipient(); }
-      catch { toast("Clipboard unavailable - paste with ⌘V instead."); }
+      let text;
+      try { text = (await navigator.clipboard.readText()).trim(); }
+      catch { toast("Clipboard unavailable - paste with ⌘V instead."); return; }
+      state.recipientInput = text;
+      const field = $("#recipient");
+      if (field) field.value = text;
+      lookup.now();
     };
     for (const button of app.querySelectorAll("[data-tier]")) {
       button.onclick = () => { state.tier = button.dataset.tier; state.customFeeSompi = null; state.editingFee = false; paint(); };
@@ -468,6 +479,7 @@ export function showSendDomain({ domain, onBack, onSent, source = { kind: "main"
         toAddress: state.recipient.address,
         priorityFeeSompi: feeSompi(),
         source,
+        fromAddress: ownerAddress,
         onStatus: ({ status }) => { if (STAGES[status]) { state.stage = status; paintProgress(); } },
       });
       const who = state.recipient.domain || wallet.shortAddress(result.recipientAddress);

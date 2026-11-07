@@ -7,14 +7,14 @@ import { ext, isExtension, tellBackground } from "./browser.js";
 import * as vault from "./vault.js";
 import * as wallet from "./wallet.js";
 import {
-  app, isTab, esc, render, $, toast, copyText, settings, noteActivity, ICONS, showQr, showQrPending, showSheet,
+  app, isTab, esc, render, $, toast, copyText, settings, noteActivity, ICONS, showQr, showQrPending, showSheet, closeDialogs,
 } from "./ui.js";
 import { showSend } from "./send.js";
 import { showRequestPayment } from "./request-payment.js";
 import { loadOwnAddresses } from "./own-addresses.js";
 import { showManageAddress, showManageAddresses, openSpendingAddress } from "./manage.js";
 import { cachedOwnedNames, ownedNames, otherNamesCount } from "./names.js";
-import { showWelcome, showUnlock, enterApp, setHandlers, setLoggedOut, deleteAccount } from "./onboarding.js";
+import { showWelcome, showUnlock, enterApp, setHandlers, setLoggedOut, deleteAccount, clearImportDraft, isLoggedOut, LOGGED_OUT_KEY } from "./onboarding.js";
 import { showDomains } from "./domains.js";
 import { showKachatMarket } from "./market.js";
 import { watchRegistrations, scheduleLapse, showLiveNameDetail } from "./kachat-live.js";
@@ -30,9 +30,10 @@ import { kachatLive, kachatNames, forgetKachatSigner } from "./kachat-names.js";
 import { KachatNamesRegistry } from "../shared/engine/kachat-names/registry.js";
 import { faucetCardHtml, startFaucetClaim, noteFaucetBalance, faucetPending } from "./faucet.js";
 import { showSettings } from "./settings.js";
-import { setBackupContext, backupBannerHtml, bindBackupBanner, hygieneCardHtml, bindHygieneCard } from "./account-backup.js";
-import { showApproval } from "./approve.js";
-import { confirmSpend } from "./spend-auth.js";
+import { setBackupContext, backupBannerHtml, bindBackupBanner, hygieneCardHtml, bindHygieneCard, clearBackupFlow } from "./account-backup.js";
+import { showApproval, followOwedConnections } from "./approve.js";
+import { confirmSpend, cancelSpendPrompt } from "./spend-auth.js";
+import { setShownAccount, shownAccount, followsSwitch } from "./account-scope.js";
 
 // The password before every KAS you send (KaChat-Desktop Build 228): the prompt every send asks.
 wallet.setSpendAuthorizer(confirmSpend);
@@ -89,7 +90,11 @@ setHandlers({
 });
 
 // The wallet can lock under an open popup (auto-lock alarm, or the lock button in another
-// window): the unlock key disappears from storage.session, and the popup follows.
+// window): the unlock key disappears from storage.session, and the popup follows. So does every
+// wallet window (never an approval window, which answers for the account it was opened for) when
+// another one switches accounts - signs in to another, adds one, deletes the one shown - or logs
+// out: the popup and the full tab never show different accounts, and nothing done in one acts on
+// an account the other has left (vault.js publishes the active account's id for this).
 ext?.storage?.onChanged?.addListener((changes, area) => {
   // The network was switched in another KaPay window: this one follows (net.js).
   if (area === "local" && changes[NETWORK_MIRROR_KEY] && changes[NETWORK_MIRROR_KEY].newValue !== NETWORK) {
@@ -98,12 +103,58 @@ ext?.storage?.onChanged?.addListener((changes, area) => {
   }
   if (isApproval) return;
   if (area === "session" && changes["kachat.unlockKey"] && !changes["kachat.unlockKey"].newValue) {
-    forgetKachatSigner();
-    wallet.disconnect();
-    dock.enableDock(false);
-    showUnlock();
+    leaveAccount().then(async () => {
+      wallet.disconnect();
+      // Reset Wallet in another window takes the vault too: the welcome screen, not the unlock one
+      if (await vault.hasVault()) showUnlock(); else showWelcome();
+    });
+    return;
   }
+  if (area !== "local") return;
+  const active = changes[vault.ACTIVE_ACCOUNT_KEY];
+  if (active && followsSwitch(shownAccount().id, active.newValue)) {
+    followAccountSwitch();
+    return;
+  }
+  if (changes[LOGGED_OUT_KEY]?.newValue && shownAccount().id) leaveAccount().then(() => showWelcome());
 });
+
+// Bumped whenever this window leaves the account it showed: a screen still loading for that
+// account draws nothing.
+let accountEpoch = 0;
+
+/**
+ * Everything this window had open for the account it showed goes - lock, log out, delete, or a
+ * switch made in another window: the Wallet tab's state and the toolbar's balance, the backup steps
+ * with the words they hold, the words typed into Import, a Confirm Send prompt (answered
+ * "cancelled", nothing sent), sheets and alerts over the screen, and the dock's places (it opens on
+ * Wallet again). The caller draws the next screen.
+ */
+async function leaveAccount() {
+  accountEpoch += 1;
+  homeState = null;
+  setShownAccount(null);
+  setBackupContext({ accountId: null, address: null, hasFunds: false });
+  clearBackupFlow();
+  clearImportDraft();
+  cancelSpendPrompt();
+  closeDialogs();
+  dock.enableDock(false);
+  dock.resetStatus();
+  bell.useAccount(null);
+  addressBook.useWallet(null);
+  forgetKachatSigner();
+  // what a cancelled prompt's own code does next runs now, so none of it draws over the next screen
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** Another window made a different account active: this one shows that account's Wallet tab (or
+ *  the sign-in screen, when signed out). */
+async function followAccountSwitch() {
+  await leaveAccount();
+  if (!(await vault.isUnlocked())) return showUnlock();
+  return enterApp();
+}
 
 // --- home: KaPay iOS's Wallet tab -----------------------------------------------------------
 //
@@ -128,14 +179,21 @@ function connectionDot(state) {
 }
 
 async function showHome() {
+  const epoch = accountEpoch;
   dock.enableDock(true);
   dock.resetTab("profile");
   const accounts = await vault.readAccounts().catch(() => null);
+  if (epoch !== accountEpoch) return;
   if (!accounts) return showUnlock();
   const account = accounts.accounts.find((a) => a.id === accounts.activeAccountId) || accounts.accounts[0];
   const currency = (await settings()).currency || "usd";
   const cached = await wallet.cachedAddresses(account.id);
   const spending = await wallet.spendingState(account.id);
+  const loggedOut = await isLoggedOut();
+  // locked, logged out or switched while this was read: the next screen is already drawn
+  if (epoch !== accountEpoch) return;
+  // logged out in another window while this one was following its switch (a delete there)
+  if (loggedOut) { dock.enableDock(false); return showWelcome(); }
   // The bell keeps a feed per account (its chatting address) and network.
   bell.useAccount(cached?.main || null);
   // One list of contacts per wallet (iOS 00767a4).
@@ -157,6 +215,7 @@ async function showHome() {
   noteBackupContext(homeState);
   paintHome();
   refreshHome();
+  followOwedConnections().catch(() => {});
 }
 
 // --- Expired .kachat names (iOS 6ac48a7): a dismissible banner while any is in its grace period ---
@@ -343,9 +402,7 @@ function confirmLogOut() {
 /** Delete Account, once the password confirmed it (KaPay iOS 99ab88a deleteCurrentAccount): the
  *  account and everything kept for it go, and the sign-in screen comes up. */
 async function deleteCurrentAccount(accountId, main) {
-  dock.enableDock(false);
-  homeState = null;
-  forgetKachatSigner();
+  await leaveAccount();
   try {
     await deleteAccount(accountId, main);
     toast("Account deleted.");
@@ -360,17 +417,15 @@ async function deleteCurrentAccount(accountId, main) {
 // iOS Log Out: back to the accounts screen, where you pick an account (or add one). The vault
 // stays unlocked; the lock button is what asks for the password again.
 async function logOut() {
-  dock.enableDock(false);
+  // left before the flag is written: this window doesn't follow its own log out (the listener above)
+  await leaveAccount();
   await setLoggedOut(true);
-  homeState = null;
-  forgetKachatSigner();
   await wallet.disconnect();
   showWelcome();
 }
 
 async function lockWallet() {
-  dock.enableDock(false);
-  forgetKachatSigner();
+  await leaveAccount();
   await vault.lock();
   tellBackground({ type: "lock" });
   await wallet.disconnect();
@@ -450,33 +505,45 @@ function openBell() {
   });
 }
 
-/** Every address of the account, labelled the way the bell describes it (iOS describe(address)). */
+/** Every address of the account, labelled the way the bell describes it (iOS describe(address)).
+ *  Only into this account's feed: the window may have moved to another account meanwhile. */
 async function bellReceipts(s) {
   const list = [{ address: s.addresses.main, label: "Chatting address", chatting: true }];
   for (const address of Object.values(s.addresses.spending || {})) list.push({ address, label: "Spending address" });
   try {
     for (const c of await coldWatchAddresses()) list.push({ address: c.address, label: `Cold storage (${c.account})` });
   } catch { /* no KasSigner accounts */ }
-  bell.checkReceipts(list);
+  if (homeState !== s) return;
+  bell.checkReceipts(list, { account: s.addresses.main });
 }
 
-let refreshing = false;
+// The home state a refresh is running for: one at a time for an account. A refresh still running
+// for an account the window has left (lock, log out, a switch) stops at its next step - nothing of
+// it reaches the toolbar, the bell or the backup status - and doesn't hold up the next account's.
+let refreshingFor = null;
 async function refreshHome() {
-  if (refreshing || !homeState) return;
-  refreshing = true;
   const s = homeState;
+  if (!s || refreshingFor === s) return;
+  refreshingFor = s;
+  const stale = () => homeState !== s;
   try {
     // Addresses first: derived from the phrase (a moment of CPU on first unlock), then cached.
     // both chains' last slot (a quantum-safe one at QUANTUM_INDEX_BASE + qMaxIndex, iOS bba1b1e)
     const lastQuantum = s.spending.qMaxIndex >= 0 ? wallet.QUANTUM_INDEX_BASE + s.spending.qMaxIndex : null;
     if (!s.addresses || s.addresses.accountId !== s.account.id || !s.addresses.spending?.[s.spending.maxIndex]
       || (lastQuantum != null && !s.addresses.spending?.[lastQuantum])) {
-      s.addresses = await wallet.deriveAddresses();
+      const derived = await wallet.deriveAddresses();
+      // derived for the active account, which another window may have changed meanwhile
+      if (stale() || derived.accountId !== s.account.id) return;
+      s.addresses = derived;
       bell.useAccount(s.addresses.main);
       addressBook.useWallet(s.addresses.main);
       s.kns = wallet.cachedKns(s.addresses.main);
       s.otherNames = cachedOwnedNames(s.addresses.main);
       if (kachatLive && !s.kachatCount) s.kachatCount = cachedOwnedCount(s.addresses.main) ?? 0;
+      // the backup banner, Complete Your Backup and the delete warning at once, offline too - not
+      // only once the balances load
+      noteBackupContext(s);
       paintHomeIfShowing(s);
     }
     wallet.kns(s.addresses.main).then((info) => { s.kns = info; paintHomeIfShowing(s); }).catch(() => {});
@@ -487,6 +554,7 @@ async function refreshHome() {
     }
     try {
       await wallet.connection();
+      if (stale()) return;
       s.connection = "ok";
       dock.setStatus({ connection: "ok", nodeUrl: wallet.connectedNodeUrl() });
       paintHomeIfShowing(s);
@@ -496,6 +564,7 @@ async function refreshHome() {
         const main = s.addresses.main;
         kachatNames()
           .then(async (rt) => {
+            if (stale()) return;
             // The .kachat names for the Your Domains count: the set its .kachat tab lists - active
             // names and expired ones in grace, never lapsed ones (iOS aa36d2a heldNames).
             const key = KachatNamesRegistry.keyOf(main.toLowerCase());
@@ -521,7 +590,9 @@ async function refreshHome() {
       }
       if (!IS_TESTNET) wallet.price(s.currency).then((entry) => { if (entry && entry.price !== s.price?.price) { s.price = entry; paintHomeIfShowing(s); } }).catch(() => {});
       // the account total counts hidden addresses too, so nothing disappears from it (iOS 245a5d2)
-      s.balances = await wallet.balances(s.addresses, []);
+      const balances = await wallet.balances(s.addresses, []);
+      if (stale()) return;
+      s.balances = balances;
       // The bell: Kaspa that arrived in any of this account's addresses since the last look.
       bellReceipts(s);
       // a restored phrase's address discovery, if it never completed (audit EXT-031)
@@ -535,23 +606,28 @@ async function refreshHome() {
       dock.setStatus({ balanceText: wallet.formatKas(s.balances.total, 8) });
       noteBackupContext(s);
     } catch (error) {
+      if (stale()) return;
       s.connection = "bad";
       dock.setStatus({ connection: "bad" });
       console.warn("[KaPay] network:", error);
     }
   } catch (error) {
+    if (stale()) return;
     s.error = error.message;
     toast(error.message);
   } finally {
-    refreshing = false;
+    if (refreshingFor === s) refreshingFor = null;
     paintHomeIfShowing(s);
   }
 }
 
 /** The backup banner follows the signed-in account; it turns red once the account holds funds,
- *  spending addresses included (iOS AccountBackupBanner.hasFunds). */
+ *  spending addresses included (iOS AccountBackupBanner.hasFunds). The same account is the one this
+ *  window shows: Settings' account pages act on it (account-scope.js). */
 function noteBackupContext(s) {
-  setBackupContext({ address: s.addresses?.main || null, hasFunds: Boolean(s.balances && s.balances.total > 0n) });
+  const address = s.addresses?.main || null;
+  setShownAccount({ id: s.account.id, address });
+  setBackupContext({ accountId: s.account.id, address, hasFunds: Boolean(s.balances && s.balances.total > 0n) });
 }
 
 function paintHomeIfShowing(state) {

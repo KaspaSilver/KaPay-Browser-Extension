@@ -24,7 +24,8 @@ import { scanQr } from "./camera.js";
 import { loadOwnAddresses } from "./own-addresses.js";
 import { KAS_UNIT } from "./net.js";
 import { parsePaymentRequestLink, paymentRequestAmountText } from "../shared/engine/payment-request.js";
-import { SEND_OUTCOME_UNKNOWN, SEND_OUTCOME_UNKNOWN_MESSAGE } from "../shared/engine/transactions.js";
+import { SEND_OUTCOME_UNKNOWN, SEND_OUTCOME_UNKNOWN_MESSAGE, MAX_AMOUNT_CHANGED, MAX_AMOUNT_CHANGED_MESSAGE } from "../shared/engine/transactions.js";
+import { maxPinCurrent, selectionKey } from "./send-guards.js";
 import { entryFor, entryName } from "./address-book.js";
 import {
   FEE_TIERS, recipientCardHtml, recipientStatusHtml, recipientLookup, bindAddressBookButton, amountState, feeControlsHtml,
@@ -66,6 +67,7 @@ export function showSend(opts) {
     amountText: "",
     maxMode: false,
     fillingMax: false,
+    maxPin: null,           // what Max was worked out from (coins, amount, fee): what the slide sends
     coins: null,            // all spendable coins at the source
     coinsUnread: false,     // they couldn't be read: said so, never Available 0 (KaPay iOS 0799cec)
     selected: null,         // Set of coin keys, or null for Automatic
@@ -102,6 +104,8 @@ export function showSend(opts) {
   };
   const kasNumberToSompi = (kas) => wallet.kasToSompi(kas.toFixed(8));
   const totalFeeSompi = () => { const fee = totalFeeKas(); return fee == null ? null : kasNumberToSompi(fee); };
+  /** The fee the review shows: a Max's own (the engine raises a fee under the network floor). */
+  const shownFeeSompi = () => (state.maxMode && state.maxPin && !opts.compound ? state.maxPin.feeSompi : totalFeeSompi());
   /** The Normal fee for these coins: the network minimum the fee editor holds to. */
   const normalFeeSompi = () => (state.base ? kasNumberToSompi(state.base.policyKas) : null);
   const amountSompi = () => wallet.kasToSompi(state.amountText);
@@ -254,20 +258,30 @@ export function showSend(opts) {
 
   // Max: the fee for spending EVERY coin Max uses, at the live rate, then amount = spendable -
   // fee exactly, so the send is one output and nothing is left for a dust change output. Worked
-  // out again whenever the fee, its speed or the coins change (iOS setMaxAmount).
+  // out again whenever the fee, its speed or the coins change (iOS setMaxAmount). A send's Max is
+  // the engine's own plan (the coins at the address now), kept as the pin the slide sends: coins
+  // that change before the swipe refuse the send instead of paying a different amount
+  // (KaChat-Desktop sendKaspaPinnedMax). Compound keeps every coin and has no pin.
+  let maxSeq = 0;
   const fillMax = async () => {
     const available = spendableSompi();
     if (available == null) return;
     // a typed amount's estimate still waiting or on its way no longer applies
     clearTimeout(estimateTimer);
     estimateSeq += 1;
+    // only the newest Max answers: a fee tapped twice must not leave the first one's pin
+    const mine = ++maxSeq;
+    state.maxPin = null;
     state.estimating = true;
     state.fillingMax = true;
     paint();
     try {
-      state.base = await wallet.maxFee(inputCount(), { sourceIndex: opts.source?.kind === "spending" ? opts.source.index : null });
+      const base = await wallet.maxFee(inputCount(), { sourceIndex: opts.source?.kind === "spending" ? opts.source.index : null });
+      if (mine !== maxSeq) return;
+      state.base = base;
       state.feeError = "";
     } catch (error) {
+      if (mine !== maxSeq) return;
       // the amount stays as it was and the swipe stays off (iOS setMaxAmount, KaPay iOS 0799cec)
       state.base = null;
       state.feeError = friendlySendError(error);
@@ -275,16 +289,37 @@ export function showSend(opts) {
       state.fillingMax = false;
       return;
     }
+    const fee = kasNumberToSompi(totalFeeKas());
+    let amount = available - fee;
+    if (!opts.compound && available > fee) {
+      const selection = selectedOutpoints();
+      try {
+        const plan = await wallet.estimateMax({
+          address: opts.fromAddress, destination: state.recipient?.address || null,
+          selectedOutpoints: selection, totalFeeKas: wallet.sompiToKasText(fee),
+        });
+        if (mine !== maxSeq) return;
+        state.maxPin = { ...plan, sourceAddress: opts.fromAddress, totalFeeSompi: fee, selectionKey: selectionKey(selection) };
+        amount = plan.amountSompi;
+      } catch (error) {
+        if (mine !== maxSeq) return;
+        state.estimating = false;
+        state.fillingMax = false;
+        state.error = friendlySendError(error);
+        setAmountKas("");
+        state.maxMode = false;
+        return;
+      }
+    }
     state.estimating = false;
     state.fillingMax = false;
-    const fee = kasNumberToSompi(totalFeeKas());
-    if (available <= fee) {
+    if (amount <= 0n) {
       state.error = "Balance too low after network fees.";
       setAmountKas("");
       state.maxMode = false;
       return;
     }
-    setAmountKas(wallet.sompiToKasText(available - fee));
+    setAmountKas(wallet.sompiToKasText(amount));
     state.maxMode = true;
     state.error = "";
   };
@@ -526,6 +561,8 @@ export function showSend(opts) {
   };
   /** Fee estimate, Max and coin control follow the new address (coin control resets). */
   const resetForSource = () => {
+    // a Max still being worked out for the previous From counts for nothing
+    maxSeq += 1;
     // the last address's fee estimate, waiting or on its way, is not this one's
     clearTimeout(estimateTimer);
     estimateSeq += 1;
@@ -533,6 +570,7 @@ export function showSend(opts) {
     state.selected = null;
     state.customFeeKas = null;
     state.maxMode = false;
+    state.maxPin = null;
     state.base = null;
     state.feeError = "";
     state.error = "";
@@ -641,7 +679,7 @@ export function showSend(opts) {
 
   // --- Step 4, the review: the swipe-up screen ----------------------------------------------
   const feeText = () => {
-    const fee = totalFeeSompi();
+    const fee = shownFeeSompi();
     return fee == null ? null : `${trimmedKas(fee)} ${KAS_UNIT}`;
   };
   const reviewFiat = () => {
@@ -650,7 +688,7 @@ export function showSend(opts) {
   };
   const reviewHtml = () => {
     const sompi = amountSompi();
-    const fee = totalFeeSompi();
+    const fee = shownFeeSompi();
     let total = '<span class="muted">—</span>';
     if (sompi != null && sompi > 0n && fee != null && !state.estimating) total = `<strong>${esc(`${trimmedKas(sompi + fee)} ${KAS_UNIT}`)}</strong>`;
     else if (state.estimating) total = '<span class="spinner small-spin"></span>';
@@ -759,24 +797,36 @@ export function showSend(opts) {
     state.error = "";
     swipe?.setBusy(true);
     const fee = totalFeeKas();
+    // the From address on the review: a key of any other address (another window switched
+    // accounts meanwhile) is refused before anything is built
+    const fromAddress = opts.fromAddress;
     try {
       let result;
       if (opts.compound) {
-        result = await wallet.compound(opts.source, fee.toFixed(8));
+        result = await wallet.compound(opts.source, fee.toFixed(8), { fromAddress });
       } else if (state.maxMode) {
+        const pin = state.maxPin;
+        if (!maxPinCurrent(pin, { sourceAddress: fromAddress, totalFeeSompi: totalFeeSompi(), selection: selectedOutpoints() }) || pin.amountSompi !== amountSompi()) {
+          // worked out for another fee, coin pick or address: never sent as it stands
+          const changed = new Error(MAX_AMOUNT_CHANGED_MESSAGE);
+          changed.code = MAX_AMOUNT_CHANGED;
+          throw changed;
+        }
         result = await wallet.send({
           source: opts.source, destination: state.recipient.address, max: true,
-          totalFeeKas: fee.toFixed(8), selectedOutpoints: selectedOutpoints(), maxAmountSompi: amountSompi(),
+          totalFeeKas: fee.toFixed(8), selectedOutpoints: selectedOutpoints(),
+          maxAmountSompi: pin.amountSompi, maxOutpoints: pin.outpoints, fromAddress,
         });
       } else {
         const tip = Math.max(0, fee - (state.base?.sdkBaseKas || 0));
         result = await wallet.send({
           source: opts.source, destination: state.recipient.address,
-          amountKas: state.amountText, tipKas: tip.toFixed(8), selectedOutpoints: selectedOutpoints(),
+          amountKas: state.amountText, tipKas: tip.toFixed(8), selectedOutpoints: selectedOutpoints(), fromAddress,
         });
       }
       const txid = (result?.txids || [])[result?.txids?.length - 1] || "";
-      opts.onSent?.();
+      // the payment is out: whatever the caller does next can't turn it into "Failed"
+      try { opts.onSent?.(); } catch (error) { console.warn("[KaPay] after a send:", error); }
       swipe?.setSent({
         txid,
         amountSompi: result?.amountSompi ?? result?.result?.summary?.amountSompi ?? amountSompi(),
@@ -788,12 +838,35 @@ export function showSend(opts) {
       state.sending = false;
       // the password prompt was cancelled: nothing was sent, the review comes back as it was
       if (error?.code === wallet.SEND_CANCELLED) { swipe?.returnToForm(); return; }
+      if (error?.code === MAX_AMOUNT_CHANGED) { maxChanged(error, swipe); return; }
       console.warn("[KaPay] send failed:", error);
       state.error = friendlySendError(error);
       swipe?.setBusy(false);
       // Try Again shows the review with the error under the fee.
       if (handle?.swipe === swipe) paintReview({ force: true });
     }
+  };
+
+  /** Nothing was sent: Max no longer matched the coins or the fee. The review comes back with the
+   *  new amount (the engine's, when it says) and the person slides again. */
+  const maxChanged = (error, swipe) => {
+    const selection = selectedOutpoints();
+    if (Array.isArray(error.outpoints) && error.amountSompi != null && error.amountSompi > 0n) {
+      state.maxPin = {
+        outpoints: error.outpoints, amountSompi: error.amountSompi, feeSompi: error.feeSompi,
+        sourceAddress: opts.fromAddress, totalFeeSompi: totalFeeSompi(), selectionKey: selectionKey(selection),
+      };
+      setAmountKas(wallet.sompiToKasText(error.amountSompi));
+      state.error = MAX_AMOUNT_CHANGED_MESSAGE;
+      // the coins behind Available and Coin Control too (the pin above stays the engine's)
+      const address = opts.fromAddress;
+      wallet.utxos(address).then((coins) => { if (address === opts.fromAddress) { state.coins = coins; paint(); } }).catch(() => {});
+    } else {
+      // checked here before anything was asked: Max is worked out again for what's on screen now
+      fillMax().then(() => { if (state.maxMode) state.error = MAX_AMOUNT_CHANGED_MESSAGE; paint(); });
+    }
+    swipe?.returnToForm();
+    if (handle?.swipe === swipe) paintReview({ force: true });
   };
 
   // --- start -----------------------------------------------------------------------------

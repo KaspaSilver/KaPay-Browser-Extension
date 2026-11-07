@@ -30,6 +30,8 @@ import {
 
 const short = (a) => `${a.slice(0, 14)}...${a.slice(-6)}`;
 const ORDER = ["destination", "amount", "review"];
+const ACCOUNT_SWITCHED = "You switched accounts. Start the request again.";
+const FRESH_MOVED = "That fresh address was just used. Check the new Paid to address and copy again.";
 
 /** @param {{ onClose?: Function }} [opts] onClose: Cancel / after copying, back where it was opened
  *  (the tab under the "+" by default). */
@@ -41,6 +43,7 @@ export function showRequestPayment(opts = {}) {
     fresh: null,          // reserved once, then reused
     chosen: null,         // { address, label }
     chatting: null,
+    accountId: null,      // the account the screen opened on: the request is that account's
     amountText: "",
     memo: "",
     copied: false,
@@ -192,7 +195,7 @@ export function showRequestPayment(opts = {}) {
         ${reviewAmountHtml({ eyebrow: "You're requesting", amountText: `${trimmedKas(sompi ?? 0n)} ${KAS_UNIT}`, fiatText: sompi != null && price() ? wallet.formatFiat(sompi, state.price) : "" })}
         <div class="ss-review-stack">
           <div class="ss-label">Paid to</div>
-          ${addressResolutionHtml({ address: address() || "" })}
+          <div id="req-paid-to">${addressResolutionHtml({ address: address() || "" })}</div>
         </div>
         <div class="req-memo-card">
           <textarea id="req-memo" class="req-memo" rows="2" placeholder="What it's for (optional)">${esc(state.memo)}</textarea>
@@ -224,6 +227,9 @@ export function showRequestPayment(opts = {}) {
   };
   const refreshReview = () => {
     if (!here() || flow.current !== "review") return;
+    // "Paid to" is the address the link pays: the reserved one once Copy has reserved it
+    const paidTo = handle.el.querySelector("#req-paid-to");
+    if (paidTo) paidTo.innerHTML = unitText(addressResolutionHtml({ address: address() || "" }));
     handle.refresh();
     const share = handle.el.querySelector("#req-share");
     if (share) share.disabled = !canMake() || state.working;
@@ -232,14 +238,28 @@ export function showRequestPayment(opts = {}) {
   };
 
   /** The request to hand out, signed by your chatting address. A fresh address is reserved here,
-   *  the first time it's needed. */
+   *  the first time it's needed. The chatting address and its key come from one read of the vault,
+   *  now: the address cached when the screen opened next to whichever key is active at copy time
+   *  made a signature receivers reject (or a link signed for "null"). */
   const makeRequest = async () => {
     const sompi = amountSompi();
     if (sompi == null) return null;
+    let signer = null;
+    try { signer = await wallet.chattingSigner(); } catch { signer = null; }
+    // another window switched accounts: this screen's addresses are the other account's
+    if (signer && state.accountId && signer.accountId !== state.accountId) { state.error = ACCOUNT_SWITCHED; return null; }
+    if (signer) state.chatting = signer.address;
     let to;
     if (state.destination === "fresh") {
       if (!state.fresh) {
-        try { state.fresh = await wallet.reserveFreshSpendingAddress(); } catch { state.error = "Couldn't make a new address. Please try again."; return null; }
+        const shown = state.nextFresh?.address || null;
+        let reserved;
+        try { reserved = await wallet.reserveFreshSpendingAddress(); } catch { state.error = "Couldn't make a new address. Please try again."; return null; }
+        if (state.accountId && reserved.accountId && reserved.accountId !== state.accountId) { state.error = ACCOUNT_SWITCHED; return null; }
+        state.fresh = reserved;
+        // never hand out an address that wasn't on screen: "Paid to" shows the reserved one, and
+        // the next Copy uses it
+        if (shown && shown !== reserved.address) { state.error = FRESH_MOVED; return null; }
       }
       to = state.fresh.address;
     } else {
@@ -247,12 +267,9 @@ export function showRequestPayment(opts = {}) {
       to = state.chosen.address;
     }
     const unsigned = makePaymentRequest({ address: to, amountSompi: sompi, memo: state.memo, toChattingAddress: to === state.chatting });
-    try {
-      const key = await wallet.privateKeyHex({ kind: "main" });
-      return signPaymentRequest(unsigned, state.chatting, key) || unsigned;
-    } catch {
-      return unsigned;
-    }
+    // the chatting address unknown: the link goes unsigned rather than signed for nobody
+    if (!signer) return unsigned;
+    return signPaymentRequest(unsigned, signer.address, signer.privateKeyHex) || unsigned;
   };
 
   const copy = async () => {
@@ -280,7 +297,8 @@ export function showRequestPayment(opts = {}) {
   flow.go("destination");
   (async () => {
     try {
-      state.chatting = (await wallet.cachedAddresses((await vault.readAccounts()).activeAccountId))?.main || null;
+      state.accountId = (await vault.readAccounts()).activeAccountId || null;
+      state.chatting = (await wallet.cachedAddresses(state.accountId))?.main || null;
       state.nextFresh = await wallet.nextFreshSpendingAddress();
     } catch { /* shown as loading */ }
     paintDestination();
