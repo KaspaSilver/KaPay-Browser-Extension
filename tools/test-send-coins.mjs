@@ -11,7 +11,7 @@ import {
   SPENT_COIN_HOLD_MS, HELD_COINS_MESSAGE, liveHolds, mergeHolds, holdSpentCoins, heldKeys, heldCountAt, nextHoldExpiry,
   withoutHeldCoins, heldCoinsError, oneTransactionChunk, maxCoinKeys, pendingInputKeys, recordBuiltInputs, rejectionAwareRpc,
   watchedSend, isNodeRejection, transactionInputKeys, checkFeeAgainstReview, sendFeeChangedError, trimmedKasText,
-  REVIEW_FEE_MARGIN_SOMPI, SEND_FEE_CHANGED, CHAINED_CHANGE, forgetNotConfirmedSpends, pricingChangeAtFreshSlot,
+  REVIEW_FEE_MARGIN_SOMPI, SEND_FEE_CHANGED, CHAINED_CHANGE, pricingChangeAtFreshSlot,
 } from "../src/send-coins.js";
 import {
   SEND_OUTCOME_UNKNOWN, MAX_SEND_INPUT_LIMIT, MAX_AMOUNT_CHANGED, setReservedOutpoints, estimateMaxSend, sendMaxKaspa, sendKaspa,
@@ -285,14 +285,12 @@ await check("held coins stay out of the next Max; when every coin is held, the h
 await check("a 'Not confirmed' send holds none of its coins, and neither does a rejected one (KaPay iOS 2da5f4b)", async () => {
   const lost = pretendNode([coin(8, 1e8), coin(9, 2e8)], () => { throw timedOut(); });
   let spent = null;
-  let released = 0;
   const unknown = await watchedSend({
-    kaspa, withRpc: reconnectingWithRpc(lost), onSpent: (keys) => { spent = keys; }, onNotConfirmed: () => { released += 1; },
+    kaspa, withRpc: reconnectingWithRpc(lost), onSpent: (keys) => { spent = keys; },
     start: (engine) => sendKaspa({ ...engine, rpc: lost, privateKey: KEY, sourceAddress: SOURCE, destinationAddress: SOURCE, amountKas: "0.5", exactAmount: true }),
   }).catch((e) => e);
   assert.equal(unknown.code, SEND_OUTCOME_UNKNOWN);
   assert.deepEqual(spent, []);
-  assert.equal(released, 1);
 
   let tries = 0;
   const refusing = pretendNode([coin(10, 1e8), coin(11, 2e8)], () => { tries += 1; throw tries === 1 ? timedOut() : rejected(); });
@@ -304,28 +302,18 @@ await check("a 'Not confirmed' send holds none of its coins, and neither does a 
   assert.match(verdict.message, /fee is below the minimum/);
   assert.equal(spent, null);
 });
-await check("after 'Not confirmed' a resend finds the same coins: the engine's note is taken back, other holds stay (KaPay iOS 2da5f4b)", async () => {
+await check("after 'Not confirmed' a resend finds the same coins, and other holds stay (KaPay iOS 2da5f4b, the engine since Build 274)", async () => {
   const lost = pretendNode([coin(40, 1e8), coin(41, 2e8)], () => { throw timedOut(); });
-  const holds = holdSpentCoins({}, [`${txid(42)}:0`], SOURCE);
   noteSpentOutpoints([`${txid(42)}:0`]);
   const unknown = await watchedSend({
-    kaspa, withRpc: reconnectingWithRpc(lost), onNotConfirmed: () => forgetNotConfirmedSpends(holds),
+    kaspa, withRpc: reconnectingWithRpc(lost),
     start: (engine) => sendKaspa({ ...engine, rpc: lost, privateKey: KEY, sourceAddress: SOURCE, destinationAddress: SOURCE, amountKas: "0.5", exactAmount: true }),
   }).catch((e) => e);
   assert.equal(unknown.code, SEND_OUTCOME_UNKNOWN);
-  // the engine noted the lost send's coins; they're back, and the other send's hold is not
   const estimate = await estimateMaxSend({ kaspa, rpc: lost, sourceAddress: SOURCE });
   assert.deepEqual([...estimate.outpoints].sort(), [`${txid(40)}:0`, `${txid(41)}:0`]);
   const listed = [coin(42, 5e7), coin(43, 5e7)];
   assert.deepEqual(excludeJustSpentUtxos(listed), [listed[1]]);
-});
-await check("the holds given back to the engine keep the expiry they had", () => {
-  const holds = holdSpentCoins({}, ["a:0"], SOURCE, T0);
-  noteSpentOutpoints(["b:0"], T0);
-  forgetNotConfirmedSpends(holds, T0 + 60_000);
-  const at = (key) => ({ outpoint: { transactionId: key, index: 0 } });
-  assert.deepEqual(excludeJustSpentUtxos([at("a"), at("b")], T0 + 119_000), [at("b")]);
-  assert.deepEqual(excludeJustSpentUtxos([at("a"), at("b")], T0 + 121_000), [at("a"), at("b")]);
 });
 await check("a chained send that ends 'Not confirmed' holds only what its earlier transactions spent", async () => {
   const earlier = "e".repeat(64);

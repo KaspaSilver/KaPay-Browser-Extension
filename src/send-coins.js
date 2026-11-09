@@ -9,7 +9,7 @@
 // tools/test-send-coins.mjs runs it in node.
 
 import { isRpcConnectionError } from "../shared/engine/rpc.js";
-import { MAX_SEND_INPUT_LIMIT, SEND_OUTCOME_UNKNOWN, JUST_SPENT_HOLD_MS, outpointKeysFrom, noteSpentOutpoints, clearJustSpentOutpoints } from "../shared/engine/transactions.js";
+import { MAX_SEND_INPUT_LIMIT, SEND_OUTCOME_UNKNOWN, outpointKeysFrom } from "../shared/engine/transactions.js";
 import { utxoAmountSompi } from "../shared/engine/amounts.js";
 import { quantumAddressForRedeem } from "../shared/engine/quantum.js";
 
@@ -67,17 +67,6 @@ export function nextHoldExpiry(holds, now = Date.now()) {
   return times.length ? Math.min(...times) : null;
 }
 
-/**
- * After a "Not confirmed": the engine's own just-spent list, without that send's coins. The engine
- * (shared/engine/transactions.js, which isn't edited here) notes them on an unknown outcome and can
- * only clear its list whole, so it is cleared and given back what `holds` still has, each with the
- * expiry it had. What it noted for a submit that went out is in `holds` too (every submit here
- * reports one).
- */
-export function forgetNotConfirmedSpends(holds, now = Date.now()) {
-  clearJustSpentOutpoints();
-  for (const [key, hold] of Object.entries(liveHolds(holds, now))) noteSpentOutpoints([key], hold.until - JUST_SPENT_HOLD_MS);
-}
 
 const keyOf = (coin) => (typeof coin?.key === "string" ? coin.key : `${coin?.outpoint?.transactionId}:${coin?.outpoint?.index}`);
 
@@ -357,12 +346,11 @@ export function rejectionAwareRpc(withRpc, isRejection = isNodeRejection) {
  * after one of its broadcasts went out (a .kas transfer's reveal after its commit); a rejection or
  * any other failure spends nothing. "Not confirmed" holds none of its coins (KaPay iOS 2da5f4b: a
  * resend picks the same ones, so at most one can land): only the earlier transactions of a chained
- * send, which did go out, and `onNotConfirmed()` then takes the rest off the engine's own list. What's
- * thrown is the verdict, with the engine's scheduled-post words for held coins rewritten. The holding
+ * send, which did go out. What's thrown is the verdict, with the engine's scheduled-post words for held coins rewritten. The holding
  * is bookkeeping: if it fails, the send still reads as it went. `expectedFeeSompi`: the fee the Review
  * showed (recordBuiltInputs).
  */
-export async function watchedSend({ kaspa, withRpc, start, onSpent = async () => {}, onNotConfirmed = async () => {}, holding = () => false, isRejection = isNodeRejection, expectedFeeSompi = null, unit = "KAS", singleTransaction = false }) {
+export async function watchedSend({ kaspa, withRpc, start, onSpent = async () => {}, holding = () => false, isRejection = isNodeRejection, expectedFeeSompi = null, unit = "KAS", singleTransaction = false }) {
   const built = recordBuiltInputs(kaspa, { expectedFeeSompi, unit, singleTransaction });
   const guard = rejectionAwareRpc(withRpc, isRejection);
   const spent = async (keys) => { try { await onSpent(keys); } catch { /* the send's outcome stands */ } };
@@ -373,7 +361,6 @@ export async function watchedSend({ kaspa, withRpc, start, onSpent = async () =>
     const verdict = heldCoinsError(guard.verdict(error), { holding: holding() });
     if (verdict?.code === SEND_OUTCOME_UNKNOWN) {
       await spent(built.keysOf(verdict.submittedTxids));
-      try { await onNotConfirmed(); } catch { /* the send's outcome stands */ }
     } else if (guard.wentOut()) {
       await spent(built.keys());
     }

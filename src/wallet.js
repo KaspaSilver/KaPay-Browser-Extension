@@ -41,7 +41,7 @@ import { sompiFromUserText } from "./amounts.js";
 import { sourceChangedError, SOURCE_CHANGED, revealsToRetry, commitIsLive } from "./send-guards.js";
 import {
   HELD_COINS_MESSAGE, liveHolds, mergeHolds, holdSpentCoins, heldKeys, heldCountAt, nextHoldExpiry, withoutHeldCoins,
-  heldCoinsError, maxCoinKeys, watchedSend, CHAINED_CHANGE, recordBuiltInputs, transactionInputKeys, forgetNotConfirmedSpends, pricingChangeAtFreshSlot,
+  heldCoinsError, maxCoinKeys, watchedSend, CHAINED_CHANGE, recordBuiltInputs, transactionInputKeys, pricingChangeAtFreshSlot,
 } from "./send-coins.js";
 import { logInfo, logWarn } from "./log.js";
 
@@ -615,12 +615,6 @@ export async function holdSubmittedCoins(keys, address) {
   try { await holdCoins(keys, address); } catch { /* bookkeeping: the submit stands as it went */ }
 }
 
-/** A submit ended "Not confirmed": its coins stay spendable (KaPay iOS 2da5f4b), so they come off
- *  the engine's own list, which notes them on an unknown outcome (send-coins.js). */
-export function releaseNotConfirmedCoins() {
-  forgetNotConfirmedSpends(liveHolds(spentCoins));
-}
-
 /** Node entries less every coin held back: this page's and other windows' holds, and the ones the
  *  engine itself noted after a submit in this page (a .kas commit, a .kachat combine). */
 function withoutSpentEntries(entries, holds) {
@@ -814,7 +808,7 @@ export async function estimateMax({ address, destination = null, selectedOutpoin
 async function spendFrom(address, start, { expectedFeeSompi = null, singleTransaction = false } = {}) {
   await currentHolds();
   return watchedSend({
-    kaspa: await kaspa(), withRpc, start, onSpent: (keys) => holdCoins(keys, address), onNotConfirmed: releaseNotConfirmedCoins, holding: () => heldCoinCount(address) > 0,
+    kaspa: await kaspa(), withRpc, start, onSpent: (keys) => holdCoins(keys, address), holding: () => heldCoinCount(address) > 0,
     expectedFeeSompi, unit: KAS_UNIT, singleTransaction,
   });
 }
@@ -2016,21 +2010,16 @@ export function namesNodeMethods() {
       // its coins held once it's out (KaPay iOS 1652437 submitRpcTransaction), not after "Not
       // confirmed" (KaPay iOS 2da5f4b)
       const spends = transactionInputKeys(transaction);
-      try {
-        const txid = await submitConfirmingAcceptance({
-          withRpc,
-          submit: (node, { allowOrphan = false } = {}) => node.submitTransaction({ transaction, allowOrphan }),
-          txid: localId,
-          spends,
-          label: "Transaction submit",
-          log: logInfo,
-        });
-        await holdSubmittedCoins(spends, this?.address || "");
-        return txid;
-      } catch (error) {
-        if (error?.code === SEND_OUTCOME_UNKNOWN) releaseNotConfirmedCoins();
-        throw error;
-      }
+      const txid = await submitConfirmingAcceptance({
+        withRpc,
+        submit: (node, { allowOrphan = false } = {}) => node.submitTransaction({ transaction, allowOrphan }),
+        txid: localId,
+        spends,
+        label: "Transaction submit",
+        log: logInfo,
+      });
+      await holdSubmittedCoins(spends, this?.address || "");
+      return txid;
     },
     /** The fee (BigInt sompi) of a 0.2 KAS self-transfer from the bound address carrying
      *  `payloadBytes` of payload (optionally only from `selectedOutpoints`); null when unknown.

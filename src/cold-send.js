@@ -40,7 +40,6 @@ import { KAS_UNIT } from "./net.js";
 import { sompiFromUserText } from "./amounts.js";
 import { coldRecipientMassError } from "./send-guards.js";
 import { logWarn } from "./log.js";
-import { SEND_OUTCOME_UNKNOWN } from "../shared/engine/transactions.js";
 import {
   recipientCardHtml, recipientStatusHtml, recipientLookup, bindAddressBookButton, amountState, feeControlsHtml, trimmedKas,
 } from "./send-pieces.js";
@@ -692,7 +691,6 @@ export function showColdSend(opts) {
       swipe?.setBusy(false);
       swipe?.setEnabled(false);
     } catch (error) {
-      if (error?.code === SEND_OUTCOME_UNKNOWN) wallet.releaseNotConfirmedCoins();
       if (closed) return;
       logWarn("[KaPay] cold broadcast failed:", error);
       s.broadcasting = false;
