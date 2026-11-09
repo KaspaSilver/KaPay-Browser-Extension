@@ -1,17 +1,15 @@
 // Managing your addresses - a 1:1 port of the iOS screens:
 //
-//   ChattingAddressManageView   Balance, Address Actions (View
-//                               Private Key, View Public Key, View in Explorer), History | UTXOs |
-//                               .kachat on the underline tab bar, Receive / Send
+//   ChattingAddressManageView   Balance, History | UTXOs | .kachat on the underline tab bar,
+//                               Receive / Send; the options button opens Address Actions
 //   ManageAddressesView         Total Balance, Address Actions (Generate, Discover, Address
-//                               Visibility, Send All Kaspa To Primary), one card per spending
-//                               address with its own actions sheet (Rename, Copy, Show QR Code,
-//                               Set as Primary, Hide)
+//                               Visibility), one card per spending address with its own actions
+//                               sheet (Rename, Copy, Show QR Code, Set as Primary, Hide)
 //   SpendingAddressTransactionHistoryView   one spending address: History | UTXOs | .kachat (iOS
 //                               5.2 dropped its KNS Domains tab: .kas names live in Your Domains),
-//                               private key export and explorer in the bar, Receive / Send
-//   SpendingAddressVisibilityView, ConsolidateToPrimaryConfirmView, the private / public key
-//   sheets, Rename UTXO, the Transaction sheet.
+//                               Receive / Send; the options button opens Address Actions
+//   SpendingAddressVisibilityView, the private / public key sheets, Rename UTXO, the Transaction
+//   sheet.
 //
 // Left out because the extension has no counterpart: "Notify on receive" (no notifications) and
 // the Chat Privacy tab (chats only).
@@ -33,8 +31,6 @@ import { carryAccountData } from "./account-data.js";
 import { shownActiveAccount } from "./account-scope.js";
 import { sompiFromUserText } from "./amounts.js";
 import { showAddToPortfolio } from "./portfolio.js";
-import { MAX_AMOUNT_CHANGED } from "../shared/engine/transactions.js";
-import { consolidateOutcome, sameCoinSet, CONSOLIDATE_CHANGED_MESSAGE } from "./send-guards.js";
 
 // The quantum-safe shield (iOS bba1b1e): green while the address's key has never been on chain
 // (receiving any number of times is fine); slashed once it has spent - orange when funds sit on it
@@ -69,13 +65,12 @@ const SF = {
   plusCircle: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 7.5v9M7.5 12h9"/></svg>',
   magnifier: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5L21 21"/></svg>',
   checklist: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6.5l1.8 1.8L8.5 5M3.5 13.5l1.8 1.8 3.2-3.3M11.5 7h9M11.5 14h9M11.5 20h9"/></svg>',
-  upToLine: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3h14M12 21V8M6.5 13.5L12 8l5.5 5.5"/></svg>',
   doc: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="13" height="13" rx="2.5"/><path d="M16 8V5.5A2.5 2.5 0 0 0 13.5 3h-8A2.5 2.5 0 0 0 3 5.5v8A2.5 2.5 0 0 0 5.5 16H8"/></svg>',
   star: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l2.8 5.7 6.2.9-4.5 4.4 1 6.2L12 17.3 6.5 20.2l1-6.2L3 9.6l6.2-.9L12 3z"/></svg>',
   starFill: '<svg width="11" height="11" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.8 5.7 6.2.9-4.5 4.4 1 6.2L12 17.3 6.5 20.2l1-6.2L3 9.6l6.2-.9L12 3z" fill="currentColor"/></svg>',
   eyeSlash: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.4 10.4 0 0 1 12 5c6.5 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.2M6.6 6.6C3.8 8.4 2 12 2 12s3.5 7 10 7c1.9 0 3.5-.6 4.9-1.4"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>',
+  ellipsis: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="2.1" fill="currentColor"/><circle cx="12" cy="12" r="2.1" fill="currentColor"/><circle cx="19" cy="12" r="2.1" fill="currentColor"/></svg>',
   ellipsisV: '<svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="19" r="2" fill="currentColor"/></svg>',
-  exportKey: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="7" y="7" width="13" height="14" rx="2.5"/><path d="M4 16V5.5A2.5 2.5 0 0 1 6.5 3H15M13.5 15.5V10.5M11 13l2.5-2.5L16 13"/></svg>',
   creditcard: '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2.5"/><path d="M2.5 9.5h19M6 15h4"/></svg>',
   warning: '<svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l10 18H2z" fill="currentColor"/><path d="M12 10v5" stroke="#000" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="18" r="1.1" fill="#000"/></svg>',
   seal: '<svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l2.4 1.8 3-.2.9 2.9 2.5 1.7-.9 2.8.9 2.8-2.5 1.7-.9 2.9-3-.2L12 22l-2.4-1.8-3 .2-.9-2.9-2.5-1.7.9-2.8-.9-2.8 2.5-1.7.9-2.9 3 .2z" fill="currentColor"/><path d="M8.5 12.2l2.4 2.4 4.6-4.8" fill="none" stroke="var(--bg)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
@@ -323,16 +318,18 @@ function gatePrivateKey({ title, source, address, onBack }) {
   });
 }
 
-// iOS ChattingAddressPublicKeyView.
-async function showPublicKey({ source, address, onBack }) {
-  let value = null;
-  try { value = await wallet.publicKeyHex(source, { fromAddress: address }); } catch { /* fallback text */ }
+// iOS AddressPublicKeyView. `value`: the key when it's known already (a Cold Storage address's,
+// read from the address); else derived for this source.
+export async function showPublicKey({ source = null, address, value = null, note = "This is the public half of this address. It cannot spend anything.", onBack }) {
+  if (value == null && source) {
+    try { value = await wallet.publicKeyHex(source, { fromAddress: address }); } catch { /* fallback text */ }
+  }
   render(`
     ${navHeader({ title: "Public Key", backLabel: "Close" })}
     <section class="screen key-screen">
       <div class="callout safe">
         <div class="callout-title">${SF.seal}<span>Safe to share</span></div>
-        <p>This is the public half of your chatting address. It identifies you and cannot spend anything.</p>
+        <p>${esc(note)}</p>
       </div>
       ${value ? `<div class="glass key-box mono selectable">${esc(value)}</div>
         <button class="with-icon soft" id="copy-key">${SF.doc}<span>Copy Public Key</span></button>`
@@ -341,6 +338,33 @@ async function showPublicKey({ source, address, onBack }) {
   $("#back").onclick = onBack;
   const copy = $("#copy-key");
   if (copy) copy.onclick = () => copyText(value, "Public key");
+}
+
+// The options button at the top right of every address page, and the one sheet it opens (iOS
+// AddressOptionsButton, AddressActionsSheet, KaPay iOS 2da5f4b): the chatting address, each spending
+// address, each Cold Storage address.
+export function addressOptionsButtonHtml() {
+  return `<div class="nav-right bar-circles"><button class="bar-circle" id="address-options" aria-label="Address Actions" title="Address Actions">${SF.ellipsis}</button></div>`;
+}
+
+/**
+ * @param {object} opts
+ * @param {string} opts.address
+ * @param {Function} [opts.onViewPrivateKey] left out where the app doesn't hold the key (Cold Storage)
+ * @param {Function} [opts.onViewPublicKey]  left out on a quantum-safe address: its key stays hidden until it spends
+ * @param {object[]} [opts.extraRows]
+ */
+export function showAddressActions({ address, onViewPrivateKey = null, onViewPublicKey = null, extraRows = [] }) {
+  showSheet({
+    title: "Address Actions",
+    cancel: false,
+    rows: [
+      ...(onViewPrivateKey ? [{ label: "View Private Key", subtitle: "The key that spends this address. Never share it.", icon: SF.keyFill, onClick: onViewPrivateKey }] : []),
+      ...(onViewPublicKey ? [{ label: "View Public Key", subtitle: "The public half of this address, for anyone who asks for it.", icon: SF.number, onClick: onViewPublicKey }] : []),
+      { label: "View in Explorer", subtitle: "Opens this address on your chosen block explorer.", icon: SF.globe, onClick: () => window.open(wallet.explorerAddressUrl(address), "_blank", "noopener") },
+      ...extraRows,
+    ],
+  });
 }
 
 // --- Chatting address: iOS ChattingAddressManageView ----------------------------------------
@@ -368,16 +392,12 @@ export function showManageAddress(opts) {
     onClose: () => { paint(); loadHistory(); loadCoins(); },
   });
 
-  const addressActions = () => showSheet({
-    title: "Address Actions",
-    cancel: false,
-    rows: [
-      { label: "View Private Key", subtitle: "The key that spends this address. Never share it.", icon: SF.keyFill, onClick: () => gatePrivateKey({ title: "Chatting Address", source, address: opts.address, onBack: back }) },
-      { label: "View Public Key", subtitle: "The public half of this address, for anyone who asks for it.", icon: SF.number, onClick: () => showPublicKey({ source, address: opts.address, onBack: back }) },
-      { label: "View in Explorer", subtitle: "Opens this address on your chosen block explorer.", icon: SF.globe, onClick: () => window.open(wallet.explorerAddressUrl(opts.address), "_blank", "noopener") },
-      // The extension's home for the picker iOS shows in its Welcome Guide after an import.
-      ...(opts.onChangeIdentity ? [{ label: "Change Chatting Address", subtitle: "Pick another address of this seed that already holds your identity.", icon: SF.person, onClick: () => showChattingAddressPicker({ onBack: back, onChanged: opts.onChangeIdentity }) }] : []),
-    ],
+  const addressActions = () => showAddressActions({
+    address: opts.address,
+    onViewPrivateKey: () => gatePrivateKey({ title: "Chatting Address", source, address: opts.address, onBack: back }),
+    onViewPublicKey: () => showPublicKey({ source, address: opts.address, note: "This is the public half of your chatting address. It identifies you and cannot spend anything.", onBack: back }),
+    // The extension's home for the picker iOS shows in its Welcome Guide after an import.
+    extraRows: opts.onChangeIdentity ? [{ label: "Change Chatting Address", subtitle: "Pick another address of this seed that already holds your identity.", icon: SF.person, onClick: () => showChattingAddressPicker({ onBack: back, onChanged: opts.onChangeIdentity }) }] : [],
   });
 
   function paint() {
@@ -386,10 +406,13 @@ export function showManageAddress(opts) {
     const unreadable = total == null && Boolean(state.coinsError) && !state.coinsLoading;
     const scroll = app.querySelector(".manage-scroll")?.scrollTop || 0;
     render(`
-      ${navHeader({ title: "Chatting Address" })}
+      <header class="navbar">
+        <button class="nav-back" id="back" aria-label="Back">${ICONS.back}<span>Back</span></button>
+        <div class="nav-title">Chatting Address</div>
+        ${addressOptionsButtonHtml()}
+      </header>
       <div class="manage-scroll">
         ${unreadable ? unreadableBalanceHtml() : `<div class="ios-balance"><span class="muted tiny">Balance</span><span class="ios-balance-value">${total != null ? `${esc(formatKas8(total))} KAS` : '<span class="spinner small-spin"></span>'}</span></div>`}
-        <button class="ios-capsule" id="address-actions">Address Actions</button>
         ${addressTabsHtml(state.tab)}
         ${addressTabContent(state, "Combines all UTXOs at this address into a single one, to reduce the number of inputs a future send needs.")}
       </div>
@@ -403,7 +426,7 @@ export function showManageAddress(opts) {
     if (scroller) scroller.scrollTop = scroll;
     $("#back").onclick = opts.onBack;
     for (const tab of app.querySelectorAll("[data-tab]")) tab.onclick = () => { state.tab = tab.dataset.tab; paint(); };
-    $("#address-actions").onclick = addressActions;
+    $("#address-options").onclick = addressActions;
     $("#receive").onclick = () => showQr({
       address: opts.address, balanceSompi: total, backLabel: "Close", onBack: back,
       note: "This address should be for chatting and domains only. 1 Kaspa is enough for about 500 interactions in the app. Domains cost from 35 to 4,000 Kaspa, depending on the name.",
@@ -462,8 +485,10 @@ export function showManageAddresses({ onBack, onChangeIdentity = null }) {
             const balances = await wallet.balancesFor([main]);
             state.chatting = { address: main, balance: balances[main] ?? 0n };
           } catch {
-            // unread, not 0 (KaPay iOS 0799cec): the card says so; a balance read before stays
-            if (state.chatting?.address !== main || state.chatting.balance == null) state.chatting = { address: main, balance: null };
+            // unread, not 0 (KaPay iOS 0799cec): the last figure known (KaPay iOS 2da5f4b), else
+            // the card says so; a balance read before stays
+            const known = (await wallet.cachedBalances(state.list.accountId))?.main ?? null;
+            if (state.chatting?.address !== main || state.chatting.balance == null) state.chatting = { address: main, balance: known };
           }
         }
       } catch { /* no chatting card */ }
@@ -761,10 +786,7 @@ function showSpendingAddress({ row, onBack }) {
       <header class="navbar">
         <button class="nav-back" id="back" aria-label="Back">${ICONS.back}<span>Back</span></button>
         <div class="nav-title ellipsis">${esc(title)}</div>
-        <div class="nav-right bar-circles">
-          <button class="bar-circle" id="export-key" aria-label="Export private key" title="Private key">${SF.exportKey}</button>
-          <a class="bar-circle" href="${esc(wallet.explorerAddressUrl(row.address))}" target="_blank" rel="noopener noreferrer" aria-label="View in Explorer" title="View in Explorer">${SF.globe}</a>
-        </div>
+        ${addressOptionsButtonHtml()}
       </header>
       <div class="manage-scroll">
         <div class="ios-balance"><span class="muted tiny">Balance</span><span class="ios-balance-value">${esc(formatKas8(row.balanceSompi))} KAS</span></div>
@@ -780,7 +802,12 @@ function showSpendingAddress({ row, onBack }) {
     const scroller = app.querySelector(".manage-scroll");
     if (scroller) scroller.scrollTop = scroll;
     $("#back").onclick = onBack;
-    $("#export-key").onclick = () => gatePrivateKey({ title, source, address: row.address, onBack: back });
+    $("#address-options").onclick = () => showAddressActions({
+      address: row.address,
+      onViewPrivateKey: () => gatePrivateKey({ title, source, address: row.address, onBack: back }),
+      // a quantum-safe address keeps its key hidden until it spends: that's the point of it
+      onViewPublicKey: wallet.isQuantumIndex(row.index) ? null : () => showPublicKey({ source, address: row.address, onBack: back }),
+    });
     for (const tab of app.querySelectorAll("[data-tab]")) tab.onclick = () => { state.tab = tab.dataset.tab; paint(); };
     $("#receive").onclick = () => showQr({ title: `Address #${row.index}`, address: row.address, backLabel: "Close", onBack: back });
     $("#send").onclick = () => openSend(false);
@@ -952,178 +979,6 @@ function showVisibility({ onBack }) {
 
   paint();
   loadList().then(() => { state.loading = false; if (here()) paint(); });
-}
-
-// --- Send All Kaspa To Primary: iOS ConsolidateToPrimaryConfirmView ----------------------------
-
-const TIERS = [["normal", "Normal", 1], ["fast", "Fast", 2], ["priority", "Priority", 5]];
-
-async function showConsolidate({ list, onBack }) {
-  const rows = list?.rows || [];
-  const primary = rows.find((r) => r.primary);
-  const sources = rows.filter((r) => !r.primary && r.balanceSompi > 0n);
-  // `pins`: each source's coins as the screen shows them (the engine's Max view, by index) - what a
-  // Confirm sends, or nothing from that address (KaChat-Desktop's Max pin)
-  const state = { tier: "normal", customKas: null, editing: false, sending: false, base: null, pins: new Map(), pinning: sources.length > 0 };
-  try { state.base = (await wallet.maxFee(1)).policyKas; } catch { state.base = 0.002; }
-  const shownSompi = (r) => state.pins.get(r.index)?.totalSompi ?? r.balanceSompi;
-  const loadPins = async () => {
-    await Promise.all(sources.map(async (r) => {
-      try {
-        const plan = await wallet.estimateMax({ address: r.address, destination: primary?.address || null });
-        state.pins.set(r.index, { outpoints: plan.outpoints, totalSompi: plan.totalSompi });
-      } catch (error) {
-        state.pins.set(r.index, { error });
-      }
-    }));
-    state.pinning = false;
-    if (app.dataset.screen === "consolidate" && !state.sending) paint();
-  };
-  const feeKas = () => state.customKas ?? state.base * (TIERS.find((t) => t[0] === state.tier)?.[2] || 1);
-
-  const paint = () => {
-    const fee = feeKas();
-    render(`
-      <header class="navbar form-bar">
-        <button class="bar-text" id="cancel" ${state.sending ? "disabled" : ""}>Cancel</button>
-        <div class="nav-title">Consolidate to Primary</div>
-        ${state.sending ? '<span class="bar-text"><span class="spinner small-spin"></span></span>' : `<button class="bar-text strong" id="confirm" ${sources.length && !state.pinning ? "" : "disabled"}>${state.pinning ? '<span class="spinner small-spin"></span>' : "Confirm"}</button>`}
-      </header>
-      <section class="form">
-        <div class="form-section">
-          <div class="form-header">From</div>
-          <div class="form-card">
-            ${sources.length ? sources.map((r) => `
-              <div class="form-row between">
-                <span class="tx-meta"><span class="muted tiny">${esc(r.label)}</span><span class="mono small">${esc(shortAddress(r.address))}</span></span>
-                <span class="strong">${esc(wallet.sompiToKasText(shownSompi(r)))} KAS</span>
-              </div>`).join("") : '<div class="form-row muted">No other addresses have a balance to consolidate.</div>'}
-          </div>
-        </div>
-        <div class="form-section">
-          <div class="form-header">To (Primary Address)</div>
-          <div class="form-card"><div class="form-row"><span class="mono small ellipsis">${esc(primary?.address || "")}</span></div></div>
-        </div>
-        ${sources.length ? `
-        <div class="form-section">
-          <div class="form-header">Fee</div>
-          <div class="form-card">
-            <div class="form-row"><div class="segmented wide" role="radiogroup" aria-label="Fee">
-              ${TIERS.map(([id, label]) => `<button type="button" role="radio" data-tier="${id}" aria-checked="${state.customKas == null && state.tier === id}">${label}</button>`).join("")}
-            </div></div>
-            <div class="form-row between">
-              <span>Network Fee</span>
-              ${state.editing
-                ? `<span class="fee-edit"><input id="custom-fee" inputmode="decimal" placeholder="0.00" value="${esc(String(+fee.toFixed(8)))}" /><button class="icon plain" id="fee-ok" aria-label="Use this fee">${ICONS.checkCircle}</button></span>`
-                : `<button class="link-button underline" id="fee">~${esc(String(+fee.toFixed(8)))} KAS ${ICONS.pencilSmall}</button>`}
-            </div>
-          </div>
-          <div class="form-footer">${sources.length >= 2
-            ? `${sources.length} separate transactions will be sent, one per address. Fast or Priority pays a higher fee to help them confirm sooner. Tap the fee amount to set a custom fee, applied to each.`
-            : "If the network is busy, Fast or Priority pays a higher fee to help this confirm sooner. Tap the fee amount to set a custom fee."}</div>
-        </div>` : ""}
-      </section>`, "consolidate");
-    $("#cancel").onclick = onBack;
-    for (const button of app.querySelectorAll("[data-tier]")) button.onclick = () => { state.tier = button.dataset.tier; state.customKas = null; paint(); };
-    const feeButton = $("#fee");
-    if (feeButton) feeButton.onclick = () => { state.editing = true; paint(); $("#custom-fee")?.select(); };
-    const feeOk = $("#fee-ok");
-    if (feeOk) {
-      const commit = () => {
-        const typed = sompiFromUserText($("#custom-fee").value);
-        const value = typed == null ? NaN : Number(typed) / 1e8;
-        state.editing = false;
-        // Below the normal fee is clamped up to it.
-        if (Number.isFinite(value) && value > 0) state.customKas = Math.max(value, state.base);
-        paint();
-      };
-      feeOk.onclick = commit;
-      $("#custom-fee").onkeydown = (event) => { if (event.key === "Enter") commit(); };
-    }
-    const confirm = $("#confirm");
-    if (confirm) confirm.onclick = run;
-  };
-
-  // One Max send per source, in turn; an error does not stop the rest. Each sends exactly the coins
-  // the screen shows for it: coins that moved meanwhile send nothing from that address, and the
-  // new amount is shown to confirm again.
-  const run = async () => {
-    state.sending = true;
-    paint();
-    const multiplier = TIERS.find((t) => t[0] === state.tier)?.[2] || 1;
-    const results = [];
-    const changedTo = (source, outpoints, totalSompi) => {
-      if (Array.isArray(outpoints) && totalSompi != null) state.pins.set(source.index, { outpoints, totalSompi });
-      const error = new Error(CONSOLIDATE_CHANGED_MESSAGE);
-      error.code = MAX_AMOUNT_CHANGED;
-      return error;
-    };
-    for (const source of sources) {
-      const pin = state.pins.get(source.index);
-      try {
-        if (!pin || pin.error) throw pin?.error || new Error("Couldn't load the coins at this address");
-        const base = (await wallet.maxFee(pin.outpoints.length, { sourceIndex: source.index })).policyKas;
-        const total = state.customKas != null ? Math.max(state.customKas, base) : base * multiplier;
-        // the amount at this fee, worked out by the engine; checked against the shown coins before
-        // the password is asked
-        const plan = await wallet.estimateMax({ address: source.address, destination: primary.address, totalFeeKas: total.toFixed(8) });
-        if (!sameCoinSet(plan.outpoints, pin.outpoints)) throw changedTo(source, plan.outpoints, plan.totalSompi);
-        const result = await wallet.send({
-          source: { kind: "spending", index: source.index }, destination: primary.address, max: true, totalFeeKas: total.toFixed(8),
-          maxAmountSompi: plan.amountSompi, maxOutpoints: pin.outpoints,
-          fromAddress: source.address, fromAccountId: list?.accountId || null,
-        });
-        results.push({ label: source.label, txids: result?.txids || [] });
-      } catch (error) {
-        // a cancelled password prompt stops the run: nothing more is sent
-        if (error?.code === wallet.SEND_CANCELLED) break;
-        if (error?.code === MAX_AMOUNT_CHANGED && error.feeSompi != null) {
-          results.push({ label: source.label, error: changedTo(source, error.outpoints, error.amountSompi + error.feeSompi) });
-        } else {
-          results.push({ label: source.label, error });
-        }
-      }
-    }
-    state.sending = false;
-    const outcome = consolidateOutcome(results);
-    // anything that went out (or may have): the result lists every address, sent or not
-    if (outcome.txids.length || outcome.unconfirmed.length) return showConsolidateResult({ outcome, onDone: onBack });
-    paint();
-    const notSent = [...outcome.changed, ...outcome.failed];
-    if (notSent.length) {
-      showAlert({
-        title: "Something Went Wrong",
-        // each address named; the alert runs them on as one paragraph
-        message: notSent.length === 1 && sources.length === 1 ? notSent[0].message : notSent.map((r) => `${r.label}: ${r.message}`).join(" "),
-        confirmLabel: "OK",
-      });
-    }
-  };
-
-  paint();
-  loadPins();
-}
-
-// What Consolidate did, address by address: the transactions sent, then any address whose send
-// wasn't confirmed (it may still land: check before sending again) or didn't go out.
-function showConsolidateResult({ outcome, onDone }) {
-  const rows = (list) => list.map((r) => `
-    <div class="list-row stack-tight"><span class="strong small">${esc(r.label)}</span><span class="muted tiny">${esc(r.message)}</span>
-      ${r.txid ? `<a class="mono tiny break link-button underline" href="${esc(wallet.explorerTxUrl(r.txid))}" target="_blank" rel="noopener noreferrer">${esc(r.txid)}</a>` : ""}
-    </div>`).join("");
-  const notSent = [...outcome.changed, ...outcome.failed];
-  render(`
-    <section class="screen sent">
-      ${outcome.txids.length
-        ? `<div class="sent-check" style="color:#30d158">${ICONS.checkBig}</div><h2>Sent</h2>`
-        : `<div class="sent-check kl-orange">${ICONS.warning}</div><h2>Not Confirmed</h2>`}
-      ${outcome.txids.map((txid) => `<a class="mono tiny break link-button underline" href="${esc(wallet.explorerTxUrl(txid))}" target="_blank" rel="noopener noreferrer">${esc(txid)}</a>`).join("")}
-      ${outcome.unconfirmed.length ? `<div class="form-header">Not Confirmed</div><div class="glass list">${rows(outcome.unconfirmed)}</div>` : ""}
-      ${notSent.length ? `<div class="form-header">Not Sent</div><div class="glass list">${rows(notSent)}</div>` : ""}
-      <div class="spacer"></div>
-      <button id="ok" class="big">OK</button>
-    </section>`, "sent");
-  $("#ok").onclick = onDone;
 }
 
 // --- Change Chatting Address: iOS ChattingAddressPickerView ------------------------------------

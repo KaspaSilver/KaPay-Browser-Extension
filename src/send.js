@@ -154,6 +154,7 @@ export function showSend(opts) {
   // still being worked out, or a fee that couldn't be, would send something other than the review
   // shows. Fast and Priority are the Normal fee times their multiplier here, with no estimate of
   // their own to wait for.
+  const tooManyPicked = () => (state.maxMode || opts.compound) && (state.selected?.size || 0) > MAX_SEND_INPUT_LIMIT;
   const canSend = () => {
     if (state.sending || !state.recipient || state.resolving || state.fillingMax) return false;
     if (state.estimating || !state.base || state.feeError) return false;
@@ -161,6 +162,8 @@ export function showSend(opts) {
     const fee = totalFeeKas();
     const available = spendableSompi();
     if (amount == null || amount <= 0n || fee == null || available == null) return false;
+    // Coin Control's pick past what one transaction can spend: said under the fee, before the password
+    if (tooManyPicked()) return false;
     if (state.maxMode || opts.compound) return true;
     return amount + kasNumberToSompi(fee) <= available;
   };
@@ -284,6 +287,7 @@ export function showSend(opts) {
       if (available != null && amount >= available) amount = available > 100_000n ? available - 100_000n : 1n;
       const result = await wallet.estimateFee({
         address: opts.fromAddress,
+        source: opts.source,
         destination: state.recipient?.address || null,
         amountKas: wallet.sompiToKasText(amount),
         selectedOutpoints: selectedOutpoints(),
@@ -292,6 +296,8 @@ export function showSend(opts) {
       if (!(result?.policyKas > 0)) throw new Error("No spendable UTXOs");
       state.base = result;
       state.feeError = "";
+      // the recipient this fee was priced for: another one at the Review prices it again
+      state.estimatedFor = state.recipient?.address || null;
     } catch (error) {
       if (mine !== estimateSeq) return;
       // no made-up fee: the review says why and the swipe stays off (iOS feeError, KaPay iOS 0799cec)
@@ -310,6 +316,8 @@ export function showSend(opts) {
   // (KaChat-Desktop sendKaspaPinnedMax). Compound keeps every coin and has no pin.
   let maxSeq = 0;
   const fillMax = async () => {
+    // a request's amount is fixed: Max can't replace it (KaPay iOS 2da5f4b)
+    if (state.request) return;
     // what Max can spend: past 80 coins, the largest 80
     const coins = maxCoins();
     if (coins == null) return;
@@ -428,7 +436,12 @@ export function showSend(opts) {
     // the exact amount is what's sent: the field goes back to KAS for it
     amountField.fiat = false;
     setAmountKas(paymentRequestAmountText(request));
+    // an earlier Max, finished or still being worked out, must not recalculate over it (KaPay iOS 2da5f4b)
+    maxSeq += 1;
+    state.fillingMax = false;
     state.maxMode = false;
+    state.maxPin = null;
+    state.maxCapped = false;
     state.error = "";
     lookup.now();
     scheduleEstimate();
@@ -760,7 +773,7 @@ export function showSend(opts) {
         custom: state.customFeeKas != null,
         estimating: state.estimating,
         feeText: feeText(),
-        showsCoinControl: !opts.compound,
+        showsCoinControl: true,
         coinSummary: coinSummary(state.selected),
         editPill: true,
       })}
@@ -775,12 +788,16 @@ export function showSend(opts) {
       return `<p class="error-text small center-text">${esc(message)}</p>
         ${state.error && !state.coinsUnread ? "" : '<p class="center-text"><button class="link-button small" id="fee-retry">Try Again</button></p>'}`;
     }
+    if (tooManyPicked()) return `<p class="error-text small center-text">${esc(`One transaction can spend ${MAX_SEND_INPUT_LIMIT} coins. Pick fewer in Coin Control.`)}</p>`;
     if ((state.maxMode || opts.compound) && state.maxCapped && !state.estimating) {
       return `<p class="ss-footnote">${esc(opts.compound ? COMPOUND_CAPPED_NOTE : MAX_CAPPED_NOTE)}</p>`;
     }
     return "";
   };
   const drawReview = (direction) => {
+    // the recipient changed after the amount was typed: its own output script is priced again,
+    // rather than the swipe being refused once for a fee the Review could have shown
+    if (!state.maxMode && !opts.compound && state.base && state.estimatedFor !== (state.recipient?.address || null)) scheduleEstimate();
     const back = backFrom("review");
     const swipe = showSwipeUp({
       screen: "send-review",
@@ -840,8 +857,9 @@ export function showSend(opts) {
         onDone: (selection) => {
           state.selected = selection;
           flow.go("review");
-          // coins picked anew: a Max amount is worked out again, else the fee
-          (state.maxMode ? fillMax() : estimate()).then(paint);
+          // coins picked anew: a Max amount (or a Compound's, KaPay iOS 2da5f4b) is worked out again,
+          // else the fee
+          (state.maxMode || opts.compound ? fillMax() : estimate()).then(paint);
           paint();
         },
       });
@@ -882,9 +900,11 @@ export function showSend(opts) {
     try {
       let result;
       if (opts.compound) {
-        // past 80 coins, the largest 80 the amount was worked out from, in one transaction
-        const chunk = state.coins ? oneTransactionChunk(state.coins) : null;
-        result = await wallet.compound(opts.source, fee.toFixed(8), { fromAddress, outpoints: chunk ? chunk.map((c) => c.key) : null });
+        // the coins picked in Coin Control (KaPay iOS 2da5f4b); else past 80 coins, the largest 80
+        // the amount was worked out from, in one transaction
+        const picked = selectedOutpoints();
+        const chunk = !picked && state.coins ? oneTransactionChunk(state.coins) : null;
+        result = await wallet.compound(opts.source, fee.toFixed(8), { fromAddress, outpoints: picked || (chunk ? chunk.map((c) => c.key) : null), picked: Boolean(picked) });
       } else if (state.maxMode) {
         const pin = state.maxPin;
         if (!maxPinCurrent(pin, { sourceAddress: fromAddress, totalFeeSompi: totalFeeSompi(), selection: selectedOutpoints() }) || pin.amountSompi !== amountSompi()) {
@@ -949,7 +969,16 @@ export function showSend(opts) {
   const compoundChanged = (swipe) => {
     state.error = MAX_AMOUNT_CHANGED_MESSAGE;
     const address = opts.fromAddress;
-    readCoins(address).then((current) => { if (current) paint(); }).catch(() => {});
+    readCoins(address).then((current) => {
+      if (!current) return;
+      // a picked coin that's gone leaves the pick, or every swipe would stop here again
+      if (state.selected && state.coins) {
+        const left = new Set(state.coins.map((coin) => coin.key));
+        state.selected = new Set([...state.selected].filter((key) => left.has(key)));
+        if (!state.selected.size) state.selected = null;
+      }
+      return fillMax().then(() => { state.error = MAX_AMOUNT_CHANGED_MESSAGE; paint(); });
+    }).catch(() => {});
     swipe?.returnToForm();
     if (handle?.swipe === swipe) paintReview({ force: true });
   };

@@ -75,7 +75,6 @@ textarea.cold-field { min-height: 0; resize: none; font-size: 13px; line-height:
 .cold-kpub-note { font-size: 13px; color: rgba(0, 0, 0, .45); margin: 0; padding: 0 12px; }
 
 /* --- one address ------------------------------------------------------------------------- */
-.cold-globe { width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center; }
 .cold-address-balance { padding-top: 8px; flex: none; }
 .cold-tabs { margin-top: 4px; }
 .cold-address-scroll { padding-top: 14px; }

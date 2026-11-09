@@ -367,9 +367,10 @@ export function mountOwnAddressList(list, { selectedAddress = null, onPick, excl
     const view = await vault.readAccounts();
     const main = (await wallet.cachedAddresses(view.activeAccountId))?.main || null;
     const spendingList = await wallet.spendingList();
-    // A failed read says nothing about the balance: left unknown, not shown as 0 (KaPay 953b255).
+    // A failed read says nothing about the balance: the last figure known (KaPay iOS 2da5f4b), else
+    // left unknown, not shown as 0 (KaPay 953b255).
     const mainRead = main ? await wallet.balancesFor([main]).catch(() => null) : null;
-    const mainBalance = mainRead?.[main] != null ? BigInt(mainRead[main]) : null;
+    const mainBalance = mainRead?.[main] != null ? BigInt(mainRead[main]) : (main ? (await wallet.cachedBalances(view.activeAccountId))?.main ?? null : null);
     if (!alive()) return;
     const chatting = main ? [{ key: "chatting", title: "Chatting Address", address: main, balanceSompi: mainBalance, source: { kind: "chatting", address: main } }] : [];
     const spending = spendingList.rows

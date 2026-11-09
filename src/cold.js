@@ -18,7 +18,7 @@
 // per wallet. Left out: the per-account receive notifications toggle (the extension has none).
 
 import { netKey } from "./net.js";
-import { ownsAnyName } from "./names.js";
+import { ownsAnyName, xOnlyKeyFromAddress } from "./names.js";
 import "./cold.css";
 import QRCode from "qrcode";
 import * as wallet from "./wallet.js";
@@ -35,7 +35,7 @@ import { addressDomainsTab } from "./address-domains.js";
 import { kachatRegistry } from "./kachat-names.js";
 import { showAddToPortfolio } from "./portfolio.js";
 import { showColdSend } from "./cold-send.js";
-import { unreadableBalanceHtml } from "./manage.js";
+import { unreadableBalanceHtml, addressOptionsButtonHtml, showAddressActions, showPublicKey } from "./manage.js";
 import { SF, txDate, feeText, portfolioKas, middle, shortAddress, fieldSheet } from "./cold-common.js";
 
 const INVALID_KPUB = "That doesn't look like a valid Kaspa extended public key (kpub).";
@@ -136,12 +136,36 @@ async function addressList(account) {
   const addresses = await wallet.kpubAddresses(account.kpub, 0, account.maxAddressIndex + 1);
   let balances = null;
   try { balances = await wallet.balancesFor(addresses); } catch { balances = null; }
+  // a failed read isn't an empty address: the last figures known, kept across windows (KaPay iOS 2da5f4b)
+  if (!balances) await restoreKnownBalances();
   const hidden = new Set(account.hidden);
-  return addresses.map((address, index) => {
+  const list = addresses.map((address, index) => {
     const balanceSompi = balances ? (balances[address] ?? 0n) : (balanceCache.get(address) ?? null);
     if (balances) balanceCache.set(address, balanceSompi);
     return { index, address, balanceSompi, label: labelOf(account, index), hidden: hidden.has(index) };
   });
+  if (balances) keepKnownBalances(addresses);
+  return list;
+}
+
+async function knownBalancesKey() {
+  const view = await vault.readAccounts();
+  return netKey(`kachat.coldBalances.${view.activeAccountId || view.accounts?.[0]?.id || "default"}`);
+}
+async function restoreKnownBalances() {
+  try {
+    for (const [address, sompi] of Object.entries((await getLocal(await knownBalancesKey())) || {})) {
+      if (!balanceCache.has(address)) balanceCache.set(address, BigInt(sompi));
+    }
+  } catch { /* nothing saved: unknown stays unknown */ }
+}
+async function keepKnownBalances(addresses) {
+  try {
+    const key = await knownBalancesKey();
+    const known = (await getLocal(key)) || {};
+    for (const address of addresses) known[address] = String(balanceCache.get(address) ?? 0n);
+    await setLocal(key, known);
+  } catch { /* the next read saves it */ }
 }
 
 async function ownsDomain(address) {
@@ -1058,7 +1082,7 @@ function showAddress({ accountId, entry, onBack }) {
       <header class="navbar">
         <button class="nav-back" id="back" aria-label="Back">${ICONS.back}<span>Back</span></button>
         <div class="nav-title cold-nav-title">${esc(title)}</div>
-        <div class="nav-right"><a class="icon plain accent cold-globe" href="${esc(wallet.explorerAddressUrl(address))}" target="_blank" rel="noopener noreferrer" aria-label="View in Explorer" title="View in Explorer">${SF.globe}</a></div>
+        ${addressOptionsButtonHtml()}
       </header>
       ${unreadable ? unreadableBalanceHtml("cold-address-balance") : `<div class="ios-balance cold-address-balance"><span class="muted tiny">Balance</span><span class="ios-balance-value">${total != null ? `${esc(formatKas8(total))} KAS` : '<span class="spinner small-spin"></span>'}</span></div>`}
       <div class="underline-tabs cold-tabs" role="tablist">
@@ -1078,6 +1102,11 @@ function showAddress({ accountId, entry, onBack }) {
     if (scroller) scroller.scrollTop = scroll;
     $("#back").onclick = onBack;
     for (const tab of app.querySelectorAll("[data-tab]")) tab.onclick = () => { if (state.tab !== tab.dataset.tab) { state.tab = tab.dataset.tab; app.querySelector(".manage-scroll").scrollTop = 0; paint(); } };
+    // no View Private Key: a cold address's key stays on the signer (KaPay iOS 2da5f4b)
+    $("#address-options").onclick = () => showAddressActions({
+      address,
+      onViewPublicKey: () => showPublicKey({ address, value: xOnlyKeyFromAddress(address), onBack: back }),
+    });
     $("#receive").onclick = () => showQr({ title, address, backLabel: "Close", onBack: back });
     $("#send").onclick = () => openSend(false);
     for (const row of app.querySelectorAll("[data-tx]")) row.onclick = () => transactionSheet(state.history.txs[Number(row.dataset.tx)]);

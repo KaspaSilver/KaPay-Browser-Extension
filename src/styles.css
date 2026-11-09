@@ -680,9 +680,9 @@ body.tab #app[data-screen^="kachat-"], body.tab #app[data-screen^="kachat:"] { h
 
 /* --- Manage screens: 1:1 with iOS ChattingAddressManageView / ManageAddressesView ----------- */
 #app[data-screen="manage-chat"], #app[data-screen="manage-spending"], #app[data-screen="manage-list"],
-#app[data-screen="visibility"], #app[data-screen="coins"], #app[data-screen="consolidate"] { height: calc(600px - var(--dock-h, 0px)); min-height: 0; }
+#app[data-screen="visibility"], #app[data-screen="coins"] { height: calc(600px - var(--dock-h, 0px)); min-height: 0; }
 body.tab #app[data-screen="manage-chat"], body.tab #app[data-screen="manage-spending"], body.tab #app[data-screen="manage-list"],
-body.tab #app[data-screen="visibility"], body.tab #app[data-screen="coins"], body.tab #app[data-screen="consolidate"] { height: calc(100vh - 48px - var(--dock-h, 0px)); }
+body.tab #app[data-screen="visibility"], body.tab #app[data-screen="coins"] { height: calc(100vh - 48px - var(--dock-h, 0px)); }
 .manage-scroll { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding: 6px 16px 18px; }
 .manage-scroll > * { flex-shrink: 0; }
 .manage-scroll.flush { padding: 0; gap: 0; }
@@ -805,7 +805,7 @@ html:has(#app[data-screen="qr"]), body:has(#app[data-screen="qr"]) { background:
 /* Fixed-height screens: #app grows to fill the shell (flex: 1), which would let tall content
    override the height and push the dock away - these keep their height and scroll inside. */
 #app[data-screen^="kachat-"], #app[data-screen^="kachat:"], #app[data-screen="manage-chat"], #app[data-screen="manage-spending"], #app[data-screen="manage-list"],
-#app[data-screen="visibility"], #app[data-screen="coins"], #app[data-screen="consolidate"] { flex: none; }
+#app[data-screen="visibility"], #app[data-screen="coins"] { flex: none; }
 /* The generic disabled-button grey must not repaint these. */
 .link-button:disabled { background: transparent !important; color: var(--muted) !important; }
 .ios-capsule:disabled { opacity: .5 !important; }

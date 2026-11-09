@@ -1,7 +1,7 @@
-// What a send checks before anything is built (Cold Storage: before its QR is shown), and how a run
-// of sends reads back. No DOM and no wallet here, so tools/test-send-guards.mjs runs it in node.
+// What a send checks before anything is built (Cold Storage: before its QR is shown), and which
+// unfinished .kas transfers are tried again. No DOM and no wallet here, so
+// tools/test-send-guards.mjs runs it in node.
 
-import { MAX_AMOUNT_CHANGED, SEND_OUTCOME_UNKNOWN, SEND_OUTCOME_UNKNOWN_MESSAGE } from "../shared/engine/transactions.js";
 import { fitsStorageMass, SMALL_SEND_MASS_MESSAGE } from "../shared/ui/kspt.js";
 
 export const SOURCE_CHANGED = "SOURCE_CHANGED";
@@ -42,38 +42,37 @@ export function maxPinCurrent(pin, { sourceAddress, totalFeeSompi, selection }) 
     && pin.selectionKey === selectionKey(selection);
 }
 
-/** Two lists of "txid:index" coin keys hold exactly the same coins. */
-export function sameCoinSet(a, b) {
-  const left = new Set((a || []).map(String));
-  const right = (b || []).map(String);
-  return left.size === right.length && right.every((key) => left.has(key));
+// A .kas transfer whose reveal never went out (iOS KNSRevealRecovery, KaPay iOS 2da5f4b): tried
+// again whenever the wallet is open, for an hour after its commit was filed. Doing what was asked
+// long after it was seen to fail would be a surprise; Your Domains' Finish Transfer stays after that.
+export const REVEAL_RETRY_MAX_AGE_MS = 3_600_000;
+// A record touched this recently may be another KaPay window's transfer, still running.
+export const REVEAL_RETRY_SETTLE_MS = 120_000;
+
+/** The pending .kas transfers (shared/engine/kns-write.js records) to retry now: this account's, within
+ *  the hour, not running here (`inFlow`: asset ids) and not just touched by another window. */
+export function revealsToRetry(records, { accountId, inFlow = new Set(), now = Date.now() } = {}) {
+  return (records || []).filter((record) => {
+    const created = Number(record?.createdAt);
+    const touched = Number(record?.updatedAt ?? created);
+    if (!record?.assetId || inFlow.has(record.assetId)) return false;
+    if (record.source?.accountId && record.source.accountId !== accountId) return false;
+    if (!Number.isFinite(created) || now - created > REVEAL_RETRY_MAX_AGE_MS) return false;
+    return !Number.isFinite(touched) || now - touched >= REVEAL_RETRY_SETTLE_MS;
+  });
 }
 
-/** Consolidate's words for MAX_AMOUNT_CHANGED: it has a Confirm button, not a slide. */
-export const CONSOLIDATE_CHANGED_MESSAGE = "The available amount changed. Check the new amount and confirm again.";
-
-/**
- * Consolidate to Primary's run, source by source: `results` is [{ label, txids } | { label, error }].
- * Every source is accounted for - a "Not confirmed" one may still land, so it is never counted as
- * failed or offered again as if nothing went out. -> { txids, sent, unconfirmed, changed, failed }
- */
-export function consolidateOutcome(results) {
-  const out = { txids: [], sent: [], unconfirmed: [], changed: [], failed: [] };
-  for (const result of results || []) {
-    const label = String(result?.label || "");
-    const error = result?.error;
-    if (!error) {
-      out.txids.push(...(result?.txids || []));
-      out.sent.push(label);
-    } else if (error.code === SEND_OUTCOME_UNKNOWN) {
-      out.unconfirmed.push({ label, message: SEND_OUTCOME_UNKNOWN_MESSAGE, txid: error.txid || null });
-    } else if (error.code === MAX_AMOUNT_CHANGED) {
-      out.changed.push({ label, message: CONSOLIDATE_CHANGED_MESSAGE });
-    } else {
-      out.failed.push({ label, message: String(error.message || error || "Send failed.") });
-    }
-  }
-  return out;
+/** Whether the record's commit is sitting unspent in these node entries (its commit address's). An
+ *  empty answer means not landed yet, or already spent by its reveal: either way nothing to send.
+ *  A commit whose answer was lost has no txid on record: the amount says which it is. */
+export function commitIsLive(record, entries) {
+  const txid = String(record?.commitTxId || "").toLowerCase();
+  let amount = null;
+  try { amount = record?.commitAmountSompi != null ? BigInt(record.commitAmountSompi) : null; } catch { amount = null; }
+  return (entries || []).some((entry) => {
+    if (txid) return String(entry?.outpoint?.transactionId || "").toLowerCase() === txid;
+    return amount != null && BigInt(entry?.amount ?? 0) === amount;
+  });
 }
 
 /**

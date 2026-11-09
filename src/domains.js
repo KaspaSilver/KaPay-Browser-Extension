@@ -223,13 +223,14 @@ function showDomainDetail({ address, domain, primaryDomain, onBack }) {
       state.error = "";
       paint();
       try {
-        await wallet.setPrimaryDomain(domain.inscriptionId);
+        await wallet.setPrimaryDomain(domain.inscriptionId, domain.fullName);
         state.primaryDomain = domain.fullName;
         toast(`Primary domain set to ${domain.fullName}.`);
         // The KNS API takes a moment to report the new primary (iOS refreshKNSUntilPrimarySettles).
         settlePrimary(address, domain.fullName);
       } catch (error) {
-        state.error = String(error?.message || error).slice(0, 160);
+        // the password prompt was cancelled: nothing changed, and nothing to say
+        if (error?.code !== wallet.SEND_CANCELLED) state.error = String(error?.message || error).slice(0, 160);
       }
       state.setting = false;
       if (app.dataset.screen === "domain-detail") paint();

@@ -35,6 +35,7 @@ import { KachatNamesRegistry } from "../shared/engine/kachat-names/registry.js";
 import { Status, Profile, SocialKind, SocialPlatform, SocialSource } from "../shared/engine/kachat-names/registry-state.js";
 import { normalize, unhex32, p2pkScript, bytesEqual, yearMs, tier } from "../shared/engine/kachat-names/codec.js";
 import { isRegistryUpgrading, registryUpgradingMessage } from "../shared/engine/kachat-names/service.js";
+import { answersAreCurrent } from "./kachat-resolve.js";
 import { scanQr } from "./camera.js";
 import * as dock from "./dock.js";
 import "./kachat-steps.css";
@@ -575,7 +576,8 @@ export const hub = {
     try {
       this.listings = await reg.listings();
       this.lapsed = await reg.lapsed();
-      this.grace = await reg.inGrace().catch(() => []);
+      // a failed read keeps what's on screen (KaPay iOS 2da5f4b)
+      this.grace = await reg.inGrace().catch(() => this.grace);
       // Your own names and the offers you made live in Profile > Your Domains (iOS 0765ce0).
       this.activity = await reg.activity();
       this.loadError = null;
@@ -1795,7 +1797,11 @@ function openClaimSheet(target) {
     if (state.quote !== q) { fail(priceChanged); return; }
     let commitTxId;
     try {
-      commitTxId = await (await runtime()).actions.startRegistration({ name: target.name, years: BigInt(q.years), maxPrice: q.price, feeTier: tier });
+      const rt = await runtime();
+      // a copy minutes old can say "free" of a name taken since, and the commit costs money (KaPay iOS 2da5f4b)
+      await rt.registry.refresh();
+      if (!answersAreCurrent(rt.registry)) throw new Error("The registry can't be checked right now. Try again in a moment.");
+      commitTxId = await rt.actions.startRegistration({ name: target.name, years: BigInt(q.years), maxPrice: q.price, feeTier: tier });
     } catch (error) {
       fail(errorText(error));
       return;
@@ -2498,9 +2504,11 @@ export async function showLiveNameDetail({ info: initial, onBack, screen = "kach
     if (!ownedByWallet() && owner) {
       try { state.ownerLabel = (await reg.identity(owner))?.label ?? null; } catch { /* no label */ }
     }
-    state.history = await reg.history(state.info.name).catch(() => []);
+    // a failed read keeps what's on screen: it isn't "no history" or "no offers" (KaPay iOS 2da5f4b)
+    state.history = await reg.history(state.info.name).catch(() => state.history);
     // only offers made since the owner got the name (MAINNET.md C6, iOS 0312a3f, EXT-020)
-    state.offers = currentOffers(await reg.offersFor(state.info.name).catch(() => []), state.info.owner, state.history);
+    const openOffers = await reg.offersFor(state.info.name).catch(() => null);
+    if (openOffers) state.offers = currentOffers(openOffers, state.info.owner, state.history);
     if (state.offers.length) {
       const actions = (await runtime()).actions;
       await actions.refreshVirtualDaa().catch(() => {});
@@ -2508,7 +2516,8 @@ export async function showLiveNameDetail({ info: initial, onBack, screen = "kach
       // your offers made to an earlier owner are pulled back (iOS ba07975).
       await prepareOfferSigners(state.offers);
       await actions.returnExpiredOffers(canActAsOwner() ? state.offers : state.offers.filter((o) => isMine(o.buyer))).catch(() => {});
-      await actions.withdrawDeclinedOffers(state.offers).catch(() => {});
+      // withdrawing gives up a live offer, so it waits for an answer that is current (KaPay iOS 2da5f4b)
+      if (answersAreCurrent(reg)) await actions.withdrawDeclinedOffers(state.offers).catch(() => {});
     }
     if (here()) paint();
   };
@@ -2781,7 +2790,12 @@ export function liveDomainsTab({ address, repaint, forAddress = false }) {
           }
           entry.names = own ? own.names : await reg.heldNames(key);
           entry.upgrading = false;
-        } catch (error) { entry.upgrading = isRegistryUpgrading(error); }
+          entry.failed = false;
+        } catch (error) {
+          entry.upgrading = isRegistryUpgrading(error);
+          // a failed read keeps what's on screen: it isn't "holds no names" (KaPay iOS 2da5f4b)
+          entry.failed = !entry.upgrading && entry.names.length === 0;
+        }
         if (!forAddress) {
           // The offers this wallet made, under its names (iOS 0765ce0, from the former My Names tab);
           // expired ones, and ones made to an earlier owner, come back on their own (ba07975).
@@ -2792,7 +2806,7 @@ export function liveDomainsTab({ address, repaint, forAddress = false }) {
               await actions.refreshVirtualDaa().catch(() => null);
               await prepareOfferSigners(entry.offers);
               await actions.returnExpiredOffers(entry.offers).catch(() => null);
-              await actions.withdrawDeclinedOffers(entry.offers).catch(() => null);
+              if (answersAreCurrent(reg)) await actions.withdrawDeclinedOffers(entry.offers).catch(() => null);
             }
           } catch { /* a failed read keeps the offers shown (KaPay f4f5c0f) */ }
           // A lapse is just the clock running out - no registry change announces it - so the list
@@ -2832,7 +2846,9 @@ export function liveDomainsTab({ address, repaint, forAddress = false }) {
     : !entry.loaded && !entry.names.length
     ? '<div class="center-text"><span class="spinner"></span></div>'
     : !entry.names.length
-      ? (forAddress
+      ? (entry.failed
+        ? '<p class="muted small center-text">Couldn\'t load this address\'s names. Try again in a moment.</p>'
+        : forAddress
         ? `<div class="kachat-address-empty">
             ${kachatWordmark(40)}
             <div class="strong">No .kachat names on this address</div>

@@ -171,6 +171,8 @@ export function notFoundMessage(typed, results = []) {
   const wanted = splitTypedName(typed).tld || "kachat";
   const kachatNotLive = !service("kachat").live || (results || []).some((r) => r.tld === "kachat" && r.notLive);
   if (wanted === "kachat" && kachatNotLive) return ".kachat names aren't live on this network yet";
+  // the service couldn't be asked: that says nothing about whether the name exists (KaPay iOS 2da5f4b)
+  if ((results || []).some((r) => r.tld === wanted && r.failed)) return `Couldn't look up ${service(wanted).suffix} right now. Try again in a moment.`;
   return `No ${service(wanted).suffix} domain found`;
 }
 

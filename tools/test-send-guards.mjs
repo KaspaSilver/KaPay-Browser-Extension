@@ -1,14 +1,13 @@
-// What a send checks before it's built and how Consolidate's run reads back (src/send-guards.js):
-// the reviewed source against the key the vault gives now, the Max pin against what the review
-// shows, every Consolidate source accounted for, and Cold Storage's no-change recipient output
-// against the storage-mass budget. Run: node tools/test-send-guards.mjs
+// What a send checks before it's built (src/send-guards.js): the reviewed source against the key the
+// vault gives now, the Max pin against what the review shows, Cold Storage's no-change recipient
+// output against the storage-mass budget, and which unfinished .kas transfers are tried again (KaPay
+// iOS 2da5f4b). Run: node tools/test-send-guards.mjs
 import assert from "node:assert/strict";
 import {
-  SOURCE_CHANGED, SOURCE_CHANGED_MESSAGE, sourceChangedError, selectionKey, maxPinCurrent, sameCoinSet,
-  consolidateOutcome, CONSOLIDATE_CHANGED_MESSAGE, coldRecipientMassError,
+  SOURCE_CHANGED, SOURCE_CHANGED_MESSAGE, sourceChangedError, selectionKey, maxPinCurrent, coldRecipientMassError,
+  revealsToRetry, commitIsLive, REVEAL_RETRY_MAX_AGE_MS, REVEAL_RETRY_SETTLE_MS,
 } from "../src/send-guards.js";
 import { planSendOutputs, SMALL_SEND_MASS_MESSAGE } from "../shared/ui/kspt.js";
-import { MAX_AMOUNT_CHANGED, SEND_OUTCOME_UNKNOWN, SEND_OUTCOME_UNKNOWN_MESSAGE, sendOutcomeUnknownError } from "../shared/engine/transactions.js";
 
 let passed = 0;
 function check(name, fn) { fn(); passed += 1; console.log(`ok - ${name}`); }
@@ -46,36 +45,35 @@ check("a Max pin holds only for the address, fee and coin pick it was worked out
   assert.equal(maxPinCurrent(null, { sourceAddress: A, totalFeeSompi: 1_000n, selection: null }), false);
   assert.equal(maxPinCurrent({ ...pin, outpoints: null }, { sourceAddress: A, totalFeeSompi: 1_000n, selection: null }), false);
 });
-check("the same coins in any order are the same set; one more or less is not", () => {
-  assert.equal(sameCoinSet(["a:0", "b:1"], ["b:1", "a:0"]), true);
-  assert.equal(sameCoinSet(["a:0"], ["a:0", "b:1"]), false);
-  assert.equal(sameCoinSet(["a:0", "b:1"], ["a:0", "c:2"]), false);
-  assert.equal(sameCoinSet([], []), true);
+// A .kas transfer whose reveal never went out, retried for an hour (KaPay iOS 2da5f4b KNSRevealRecovery)
+const NOW = 2_000_000_000_000;
+const filed = (over = {}) => ({ assetId: "asset", source: { accountId: "A" }, createdAt: NOW - 600_000, updatedAt: NOW - 600_000, commitTxId: "CC", commitAmountSompi: "200000000", ...over });
+const retried = (records, inFlow = new Set()) => revealsToRetry(records, { accountId: "A", inFlow, now: NOW }).map((r) => r.assetId);
+check("a commit left without a reveal is retried for this account, within the hour", () => {
+  assert.equal(REVEAL_RETRY_MAX_AGE_MS, 3_600_000);
+  assert.deepEqual(retried([filed()]), ["asset"]);
+  assert.deepEqual(retried([filed({ source: null })]), ["asset"]);
+  assert.deepEqual(retried([filed({ source: { accountId: "B" } })]), []);
 });
-
-check("Consolidate: every source lands in exactly one list", () => {
-  const changed = Object.assign(new Error("x"), { code: MAX_AMOUNT_CHANGED });
-  const outcome = consolidateOutcome([
-    { label: "Address #1", txids: ["t1"] },
-    { label: "Address #2", error: sendOutcomeUnknownError("t2") },
-    { label: "Address #3", error: changed },
-    { label: "Address #4", error: new Error("Balance too low after network fees.") },
-    { label: "Address #5", txids: ["t5a", "t5b"] },
-  ]);
-  assert.deepEqual(outcome.txids, ["t1", "t5a", "t5b"]);
-  assert.deepEqual(outcome.sent, ["Address #1", "Address #5"]);
-  assert.deepEqual(outcome.unconfirmed, [{ label: "Address #2", message: SEND_OUTCOME_UNKNOWN_MESSAGE, txid: "t2" }]);
-  assert.deepEqual(outcome.changed, [{ label: "Address #3", message: CONSOLIDATE_CHANGED_MESSAGE }]);
-  assert.deepEqual(outcome.failed, [{ label: "Address #4", message: "Balance too low after network fees." }]);
+check("past the hour it's left to Finish Transfer", () => {
+  assert.deepEqual(retried([filed({ createdAt: NOW - REVEAL_RETRY_MAX_AGE_MS })]), ["asset"]);
+  assert.deepEqual(retried([filed({ createdAt: NOW - REVEAL_RETRY_MAX_AGE_MS - 1 })]), []);
+  assert.deepEqual(retried([filed({ createdAt: undefined, updatedAt: undefined })]), []);
 });
-check("Consolidate: a Not confirmed source is never dropped once another succeeds", () => {
-  const outcome = consolidateOutcome([
-    { label: "Address #1", txids: ["t1"] },
-    { label: "Address #2", error: Object.assign(new Error("?"), { code: SEND_OUTCOME_UNKNOWN }) },
-  ]);
-  assert.equal(outcome.txids.length, 1);
-  assert.equal(outcome.unconfirmed.length, 1);
-  assert.equal(outcome.unconfirmed[0].txid, null);
+check("a transfer running here, or just touched by another window, does its own reveal", () => {
+  assert.deepEqual(retried([filed()], new Set(["asset"])), []);
+  assert.deepEqual(retried([filed({ updatedAt: NOW - REVEAL_RETRY_SETTLE_MS + 1 })]), []);
+  assert.deepEqual(retried([filed({ updatedAt: NOW - REVEAL_RETRY_SETTLE_MS })]), ["asset"]);
+});
+check("a commit is live only while the node lists its output", () => {
+  const entry = (transactionId, amount) => ({ outpoint: { transactionId, index: 0 }, amount });
+  assert.equal(commitIsLive(filed(), [entry("cc", 200_000_000n)]), true);
+  assert.equal(commitIsLive(filed(), [entry("dd", 200_000_000n)]), false);
+  assert.equal(commitIsLive(filed(), []), false);
+  assert.equal(commitIsLive(filed(), undefined), false);
+  // its answer was lost, so no txid was recorded: the amount says which it is
+  assert.equal(commitIsLive(filed({ commitTxId: null }), [entry("dd", 200_000_000n)]), true);
+  assert.equal(commitIsLive(filed({ commitTxId: null }), [entry("dd", 5n)]), false);
 });
 
 // Cold Storage's no-change path (KaPay iOS 0799cec KaChatTransactionBuilder: the recipient's output

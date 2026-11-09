@@ -4,18 +4,22 @@
 // coins, and a node's rejection is reported as one even when another node timed out first
 // (KaPay iOS 0799cec). A send rebuilt at the swipe that would pay more than the Review showed
 // sends nothing, and only a node's verdict on the transaction counts as a rejection (KaPay iOS
-// 1652437). No DOM and no wallet here, so tools/test-send-coins.mjs runs it in node.
+// 1652437). Coins aren't held after "Not confirmed", so a resend can't pay twice, and the Review
+// prices change at the script it really goes to (KaPay iOS 2da5f4b). No DOM and no wallet here, so
+// tools/test-send-coins.mjs runs it in node.
 
 import { isRpcConnectionError } from "../shared/engine/rpc.js";
-import { MAX_SEND_INPUT_LIMIT, SEND_OUTCOME_UNKNOWN, outpointKeysFrom } from "../shared/engine/transactions.js";
+import { MAX_SEND_INPUT_LIMIT, SEND_OUTCOME_UNKNOWN, JUST_SPENT_HOLD_MS, outpointKeysFrom, noteSpentOutpoints, clearJustSpentOutpoints } from "../shared/engine/transactions.js";
 import { utxoAmountSompi } from "../shared/engine/amounts.js";
+import { quantumAddressForRedeem } from "../shared/engine/quantum.js";
 
 // --- Coins a send just spent (iOS WalletService.recordSpend / unreservedUtxos) ------------------
 //
 // The node goes on listing a spent coin until its spend is in a block, so the next send, Max or fee
 // would pick it again and be refused. Its key ("txid:index") is held for SPENT_COIN_HOLD_MS (iOS
-// spentOutpointHold = 120), also after "Not confirmed", which may still land. Holds are
-// { key: { until, address } } records; nothing here mutates one.
+// spentOutpointHold = 120). Not after "Not confirmed" (KaPay iOS 2da5f4b): a resend then picks the
+// same coins, so at most one of the two can land. Holds are { key: { until, address } } records;
+// nothing here mutates one.
 export const SPENT_COIN_HOLD_MS = 120_000;
 // iOS has no words of its own for this (its send just finds "No spendable UTXOs").
 export const HELD_COINS_MESSAGE = "Your last send is still settling. Try again in a moment.";
@@ -61,6 +65,18 @@ export function heldCountAt(holds, address, now = Date.now()) {
 export function nextHoldExpiry(holds, now = Date.now()) {
   const times = Object.values(liveHolds(holds, now)).map((hold) => hold.until);
   return times.length ? Math.min(...times) : null;
+}
+
+/**
+ * After a "Not confirmed": the engine's own just-spent list, without that send's coins. The engine
+ * (shared/engine/transactions.js, which isn't edited here) notes them on an unknown outcome and can
+ * only clear its list whole, so it is cleared and given back what `holds` still has, each with the
+ * expiry it had. What it noted for a submit that went out is in `holds` too (every submit here
+ * reports one).
+ */
+export function forgetNotConfirmedSpends(holds, now = Date.now()) {
+  clearJustSpentOutpoints();
+  for (const [key, hold] of Object.entries(liveHolds(holds, now))) noteSpentOutpoints([key], hold.until - JUST_SPENT_HOLD_MS);
 }
 
 const keyOf = (coin) => (typeof coin?.key === "string" ? coin.key : `${coin?.outpoint?.transactionId}:${coin?.outpoint?.index}`);
@@ -159,14 +175,12 @@ export function pendingInputKeys(transactions) {
 // nothing is sent; the Review then shows that fee, and the next swipe pays it. (Max and Compound are
 // pinned already.)
 //
-// iOS works the Review's fee out with the real recipient and change address. The engine's estimate
-// prices the recipient's own output since KaChat-Desktop Build 272 (wallet.estimateFee passes it),
-// but its change still goes to the source, so a primary's change to a fresh quantum-safe P2SH slot
-// (35-byte script against Schnorr's 34) costs the real send 1,100 sompi more. The margin covers that
-// with room for rounding; a real difference - another coin the tip needs, say - is far bigger (an
-// input is about 0.0011 KAS). This is why the engine's own check (sendKaspa's expectedFeeSompi, a
-// 1,000-sompi margin) isn't used here: it would refuse every such primary send.
-export const REVIEW_FEE_MARGIN_SOMPI = 5_000n;
+// The Review's fee is worked out with the real recipient and change script, as iOS does: the
+// engine's estimate prices the recipient's own output since KaChat-Desktop Build 272, and its change
+// goes to the source, so a primary's or quantum source's estimate is built by a module whose change
+// goes to a stand-in of the fresh slot's shape (pricingChangeAtFreshSlot below). The margin is
+// iOS's 1,000 sompi (KaPay iOS 2da5f4b).
+export const REVIEW_FEE_MARGIN_SOMPI = 1_000n;
 export const SEND_FEE_CHANGED = "sendFeeChanged";
 
 /** Sompi as KAS with no trailing zeros ("0.0002", "1"), as iOS's "%.8f" trimmed. */
@@ -195,11 +209,36 @@ export function checkFeeAgainstReview(summary, expectedFeeSompi, unit = "KAS") {
   if (fee > BigInt(expectedFeeSompi) + REVIEW_FEE_MARGIN_SOMPI) throw sendFeeChangedError(fee, unit);
 }
 
-/** `kaspa` with createTransaction / createTransactions noting the inputs they build. -> { kaspa, keys }
- *  `expectedFeeSompi`: the fee the Review showed; a generator build that would pay more throws
+/**
+ * `kaspa` as a fee estimate should see it when the send's change goes to a fresh quantum-safe slot
+ * (iOS reviewChangeScript, KaPay iOS 2da5f4b): that's a 35-byte P2SH script where a legacy address's
+ * is 34, and pricing it with the source's comes out 1,100 sompi low. The slot isn't chosen until the
+ * send, and only the script's length counts, so any address of the same shape stands in.
+ */
+export function pricingChangeAtFreshSlot(kaspa) {
+  const changeAddress = quantumAddressForRedeem(new Uint8Array(34));
+  return Object.create(kaspa, {
+    createTransactions: { value: (settings) => kaspa.createTransactions({ ...settings, changeAddress }) },
+  });
+}
+
+/** A send big enough to need several transactions relays through its change address, and the key
+ *  can't sign for a quantum-safe (P2SH) one: the second transaction failed after the first had gone
+ *  out. Thrown before anything is signed, so the send can be built again keeping its change. */
+export const CHAINED_CHANGE = "chainedChange";
+function chainedChangeError() {
+  const error = new Error("This send needs several transactions, so its change can't go to a fresh address.");
+  error.code = CHAINED_CHANGE;
+  return error;
+}
+
+/** `kaspa` with createTransaction / createTransactions noting the inputs they build. -> { kaspa, keys, keysOf }
+ *  `keysOf(txids)`: the inputs of those of the generator's transactions (a chained send's earlier
+ *  ones). `expectedFeeSompi`: the fee the Review showed; a generator build that would pay more throws
  *  SEND_FEE_CHANGED before anything is signed (checkFeeAgainstReview). */
-export function recordBuiltInputs(kaspa, { expectedFeeSompi = null, unit = "KAS" } = {}) {
+export function recordBuiltInputs(kaspa, { expectedFeeSompi = null, unit = "KAS", singleTransaction = false } = {}) {
   let keys = [];
+  let pendings = [];
   const recording = Object.create(kaspa, {
     createTransaction: {
       value: (entries, ...rest) => {
@@ -212,12 +251,19 @@ export function recordBuiltInputs(kaspa, { expectedFeeSompi = null, unit = "KAS"
       value: async (settings) => {
         const result = await kaspa.createTransactions(settings);
         keys = pendingInputKeys(result?.transactions);
+        pendings = [...(result?.transactions || [])];
+        if (singleTransaction && pendings.length > 1) throw chainedChangeError();
         checkFeeAgainstReview(result?.summary, expectedFeeSompi, unit);
         return result;
       },
     },
   });
-  return { kaspa: recording, keys: () => [...keys] };
+  const idOf = (pending) => { try { return String(pending?.id ?? ""); } catch { return ""; } };
+  return {
+    kaspa: recording,
+    keys: () => [...keys],
+    keysOf: (txids) => pendingInputKeys(pendings.filter((pending) => (txids || []).includes(idOf(pending)))),
+  };
 }
 
 // --- A node's rejection is its verdict (iOS NodePoolService wasRejected) ----------------------------
@@ -307,15 +353,17 @@ export function rejectionAwareRpc(withRpc, isRejection = isNodeRejection) {
 
 /**
  * One engine send, watched: `start({ kaspa, withRpc })` runs it with the recording module and the
- * rejection-aware wrapper. The coins it spent go to `onSpent(keys)` once it is out, or when it ends
- * "Not confirmed" (it may still land), or when it fails after one of its broadcasts went out (a .kas
- * transfer's reveal after its commit); a rejection or any other failure spends nothing. What's thrown
- * is the verdict, with the engine's scheduled-post words for held coins rewritten. The holding is
- * bookkeeping: if it fails, the send still reads as it went. `expectedFeeSompi`: the fee the Review
+ * rejection-aware wrapper. The coins it spent go to `onSpent(keys)` once it is out, or when it fails
+ * after one of its broadcasts went out (a .kas transfer's reveal after its commit); a rejection or
+ * any other failure spends nothing. "Not confirmed" holds none of its coins (KaPay iOS 2da5f4b: a
+ * resend picks the same ones, so at most one can land): only the earlier transactions of a chained
+ * send, which did go out, and `onNotConfirmed()` then takes the rest off the engine's own list. What's
+ * thrown is the verdict, with the engine's scheduled-post words for held coins rewritten. The holding
+ * is bookkeeping: if it fails, the send still reads as it went. `expectedFeeSompi`: the fee the Review
  * showed (recordBuiltInputs).
  */
-export async function watchedSend({ kaspa, withRpc, start, onSpent = async () => {}, holding = () => false, isRejection = isNodeRejection, expectedFeeSompi = null, unit = "KAS" }) {
-  const built = recordBuiltInputs(kaspa, { expectedFeeSompi, unit });
+export async function watchedSend({ kaspa, withRpc, start, onSpent = async () => {}, onNotConfirmed = async () => {}, holding = () => false, isRejection = isNodeRejection, expectedFeeSompi = null, unit = "KAS", singleTransaction = false }) {
+  const built = recordBuiltInputs(kaspa, { expectedFeeSompi, unit, singleTransaction });
   const guard = rejectionAwareRpc(withRpc, isRejection);
   const spent = async (keys) => { try { await onSpent(keys); } catch { /* the send's outcome stands */ } };
   let result;
@@ -323,7 +371,12 @@ export async function watchedSend({ kaspa, withRpc, start, onSpent = async () =>
     result = await start({ kaspa: built.kaspa, withRpc: guard.withRpc });
   } catch (error) {
     const verdict = heldCoinsError(guard.verdict(error), { holding: holding() });
-    if (verdict?.code === SEND_OUTCOME_UNKNOWN || guard.wentOut()) await spent(built.keys());
+    if (verdict?.code === SEND_OUTCOME_UNKNOWN) {
+      await spent(built.keysOf(verdict.submittedTxids));
+      try { await onNotConfirmed(); } catch { /* the send's outcome stands */ }
+    } else if (guard.wentOut()) {
+      await spent(built.keys());
+    }
     throw verdict;
   }
   await spent([...new Set([...built.keys(), ...outpointKeysFrom(result?.outpoints)])]);

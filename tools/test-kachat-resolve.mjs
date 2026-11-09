@@ -2,7 +2,7 @@
 // (src/kachat-resolve.js): a fake registry whose two answers differ can't slip its owner past
 // `confirmOnChain`. Run: node tools/test-kachat-resolve.mjs
 import assert from "node:assert/strict";
-import { resolveHeldChecked } from "../src/kachat-resolve.js";
+import { resolveHeldChecked, confirmLiveOnChain, answersAreCurrent } from "../src/kachat-resolve.js";
 import { NameInfo, addressOf } from "../shared/engine/kachat-names/registry-state.js";
 import { KachatNamesRegistry } from "../shared/engine/kachat-names/registry.js";
 import { key as nameKey } from "../shared/engine/kachat-names/codec.js";
@@ -84,6 +84,39 @@ await check("a registry that can't be read throws", async () => {
   const reg = fakeRegistry([]);
   reg.lookup = async () => { throw new Error("indexer down"); };
   await assert.rejects(resolveHeldChecked(reg, "alice", {}), /indexer down/);
+});
+
+// KaPay iOS 2da5f4b: a chain copy can be hours old, so its answer is checked live too.
+const chainCopy = (tracked) => ({ source: { kind: "chain" }, chainState: { name: () => tracked }, confirmOnChain() { throw new Error("the engine's check skips a chain copy"); } });
+const liveService = (seen, { live = true } = {}) => ({
+  loadManifest: async () => ({ name: "template" }),
+  liveRegistryUtxo: async (args) => { seen.push(args); if (!live) throw new Error("not on chain"); return { entry: {} }; },
+});
+await check("a record read from the chain copy is checked live on the chain, at its own script and outpoint", async () => {
+  const seen = [];
+  const info = record("alice", genuine);
+  await confirmLiveOnChain(chainCopy({ name: "alice" }), info, liveService(seen), { scriptOf: (m, n) => `${m.name}:${n.name}` });
+  assert.deepEqual(seen, [{ script: "template:alice", outpoint: info.outpoint }]);
+});
+await check("a name the chain copy says is held but the chain has moved on fails the lookup", async () => {
+  await assert.rejects(confirmLiveOnChain(chainCopy({ name: "alice" }), record("alice", genuine), liveService([], { live: false }), { scriptOf: () => "s" }), /not on chain/);
+  await assert.rejects(confirmLiveOnChain(chainCopy(null), record("alice", genuine), liveService([]), { scriptOf: () => "s" }), /not loaded/);
+});
+await check("an indexer's record still goes through the engine's check", async () => {
+  const reg = fakeRegistry([]);
+  await confirmLiveOnChain(reg, record("alice", genuine), {});
+  assert.deepEqual(reg.calls, ["confirm"]);
+});
+const walked = (over = {}) => ({ source: { kind: "chain" }, lastError: null, refreshedAt: 1_000_000, lastWalk: { rounds: 3, unresolved: [] }, ...over });
+await check("an indexer's answer is current; a chain copy's only just after a walk that reached the live UTXOs", () => {
+  assert.equal(answersAreCurrent({ source: { kind: "indexer" } }), true);
+  assert.equal(answersAreCurrent(walked(), 1_000_000 + 119_999), true);
+  assert.equal(answersAreCurrent(walked(), 1_000_000 + 120_000), false);
+  assert.equal(answersAreCurrent(walked({ lastError: "the node went away" }), 1_000_000), false);
+  assert.equal(answersAreCurrent(walked({ lastWalk: { rounds: 3, unresolved: ["a:0"] } }), 1_000_000), false);
+  assert.equal(answersAreCurrent(walked({ lastWalk: { rounds: 64, unresolved: [] } }), 1_000_000), false);
+  assert.equal(answersAreCurrent(walked({ lastWalk: null }), 1_000_000), false);
+  assert.equal(answersAreCurrent({ source: null }), false);
 });
 
 console.log(`${passed} passed`);

@@ -53,7 +53,7 @@ const { local, page } = accountDataKeys({
   addresses: ["kaspatest:qchat", "kaspatest:qspend0", "kaspa:qspend1"],
   variants,
 });
-for (const base of ["spending", "addresses", "cold", "portfolios", "portfolioFees", "pendingDiscovery"]) {
+for (const base of ["spending", "addresses", "balances", "cold", "coldBalances", "portfolios", "portfolioFees", "pendingDiscovery"]) {
   assert.ok(local.includes(`kachat.${base}.acc1`), base);
   assert.ok(local.includes(`kachat.${base}.acc1.testnet`), `${base} testnet`);
 }

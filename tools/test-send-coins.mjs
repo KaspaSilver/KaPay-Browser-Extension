@@ -1,6 +1,6 @@
 // The coins a send spends, around the engine (src/send-coins.js, KaPay iOS 0799cec): a send's inputs
-// held out of the next send, Max and fee for 120 s (also after "Not confirmed"), Max and Compound past
-// 80 coins on the largest 80 in one transaction, and a node's rejection reported as one even after
+// held out of the next send, Max and fee for 120 s (not after "Not confirmed", KaPay iOS 2da5f4b), Max
+// and Compound past 80 coins on the largest 80 in one transaction, and a node's rejection reported as one even after
 // another node timed out. The engine parts run the real engine (shared/engine/transactions.js) and
 // the real Kaspa SDK offline, against a pretend node. KaPay iOS 1652437: only a verdict is a rejection, and a
 // send rebuilt at the swipe that would pay more than the Review showed sends nothing.
@@ -11,11 +11,12 @@ import {
   SPENT_COIN_HOLD_MS, HELD_COINS_MESSAGE, liveHolds, mergeHolds, holdSpentCoins, heldKeys, heldCountAt, nextHoldExpiry,
   withoutHeldCoins, heldCoinsError, oneTransactionChunk, maxCoinKeys, pendingInputKeys, recordBuiltInputs, rejectionAwareRpc,
   watchedSend, isNodeRejection, transactionInputKeys, checkFeeAgainstReview, sendFeeChangedError, trimmedKasText,
-  REVIEW_FEE_MARGIN_SOMPI, SEND_FEE_CHANGED,
+  REVIEW_FEE_MARGIN_SOMPI, SEND_FEE_CHANGED, CHAINED_CHANGE, forgetNotConfirmedSpends, pricingChangeAtFreshSlot,
 } from "../src/send-coins.js";
 import {
   SEND_OUTCOME_UNKNOWN, MAX_SEND_INPUT_LIMIT, MAX_AMOUNT_CHANGED, setReservedOutpoints, estimateMaxSend, sendMaxKaspa, sendKaspa,
-  submitConfirmingAcceptance, planMaxSend, sanitizeUtxoEntries, clearJustSpentOutpoints, estimateOnchainFeeDetail,
+  submitConfirmingAcceptance, planMaxSend, sanitizeUtxoEntries, clearJustSpentOutpoints, estimateOnchainFeeDetail, noteSpentOutpoints,
+  excludeJustSpentUtxos,
 } from "../shared/engine/transactions.js";
 import { isRpcConnectionError } from "../shared/engine/rpc.js";
 import { quantumRedeemScript, quantumScriptPublicKey, quantumAddressForRedeem } from "../shared/engine/quantum.js";
@@ -281,15 +282,17 @@ await check("held coins stay out of the next Max; when every coin is held, the h
   setReservedOutpoints([]);
 });
 
-await check("a 'Not confirmed' send holds its coins; a rejected one holds none", async () => {
+await check("a 'Not confirmed' send holds none of its coins, and neither does a rejected one (KaPay iOS 2da5f4b)", async () => {
   const lost = pretendNode([coin(8, 1e8), coin(9, 2e8)], () => { throw timedOut(); });
   let spent = null;
+  let released = 0;
   const unknown = await watchedSend({
-    kaspa, withRpc: reconnectingWithRpc(lost), onSpent: (keys) => { spent = keys; },
+    kaspa, withRpc: reconnectingWithRpc(lost), onSpent: (keys) => { spent = keys; }, onNotConfirmed: () => { released += 1; },
     start: (engine) => sendKaspa({ ...engine, rpc: lost, privateKey: KEY, sourceAddress: SOURCE, destinationAddress: SOURCE, amountKas: "0.5", exactAmount: true }),
   }).catch((e) => e);
   assert.equal(unknown.code, SEND_OUTCOME_UNKNOWN);
-  assert.deepEqual([...spent].sort(), inputKeysOf(lost.submitted[0]).sort());
+  assert.deepEqual(spent, []);
+  assert.equal(released, 1);
 
   let tries = 0;
   const refusing = pretendNode([coin(10, 1e8), coin(11, 2e8)], () => { tries += 1; throw tries === 1 ? timedOut() : rejected(); });
@@ -300,6 +303,47 @@ await check("a 'Not confirmed' send holds its coins; a rejected one holds none",
   }).catch((e) => e);
   assert.match(verdict.message, /fee is below the minimum/);
   assert.equal(spent, null);
+});
+await check("after 'Not confirmed' a resend finds the same coins: the engine's note is taken back, other holds stay (KaPay iOS 2da5f4b)", async () => {
+  const lost = pretendNode([coin(40, 1e8), coin(41, 2e8)], () => { throw timedOut(); });
+  const holds = holdSpentCoins({}, [`${txid(42)}:0`], SOURCE);
+  noteSpentOutpoints([`${txid(42)}:0`]);
+  const unknown = await watchedSend({
+    kaspa, withRpc: reconnectingWithRpc(lost), onNotConfirmed: () => forgetNotConfirmedSpends(holds),
+    start: (engine) => sendKaspa({ ...engine, rpc: lost, privateKey: KEY, sourceAddress: SOURCE, destinationAddress: SOURCE, amountKas: "0.5", exactAmount: true }),
+  }).catch((e) => e);
+  assert.equal(unknown.code, SEND_OUTCOME_UNKNOWN);
+  // the engine noted the lost send's coins; they're back, and the other send's hold is not
+  const estimate = await estimateMaxSend({ kaspa, rpc: lost, sourceAddress: SOURCE });
+  assert.deepEqual([...estimate.outpoints].sort(), [`${txid(40)}:0`, `${txid(41)}:0`]);
+  const listed = [coin(42, 5e7), coin(43, 5e7)];
+  assert.deepEqual(excludeJustSpentUtxos(listed), [listed[1]]);
+});
+await check("the holds given back to the engine keep the expiry they had", () => {
+  const holds = holdSpentCoins({}, ["a:0"], SOURCE, T0);
+  noteSpentOutpoints(["b:0"], T0);
+  forgetNotConfirmedSpends(holds, T0 + 60_000);
+  const at = (key) => ({ outpoint: { transactionId: key, index: 0 } });
+  assert.deepEqual(excludeJustSpentUtxos([at("a"), at("b")], T0 + 119_000), [at("b")]);
+  assert.deepEqual(excludeJustSpentUtxos([at("a"), at("b")], T0 + 121_000), [at("a"), at("b")]);
+});
+await check("a chained send that ends 'Not confirmed' holds only what its earlier transactions spent", async () => {
+  const earlier = "e".repeat(64);
+  const pendings = [
+    { id: earlier, transaction: { inputs: [{ previousOutpoint: { transactionId: "aa", index: 0 } }] } },
+    { id: "f".repeat(64), transaction: { inputs: [{ previousOutpoint: { transactionId: "bb", index: 1 } }] } },
+  ];
+  const fake = Object.create(kaspa, { createTransactions: { value: async () => ({ transactions: pendings, summary: {} }) } });
+  let spent = null;
+  const error = await watchedSend({
+    kaspa: fake, withRpc: engineWithRpc({}), onSpent: (keys) => { spent = keys; },
+    start: async (engine) => {
+      await engine.kaspa.createTransactions({});
+      throw Object.assign(new Error("x"), { code: SEND_OUTCOME_UNKNOWN, submittedTxids: [earlier] });
+    },
+  }).catch((e) => e);
+  assert.equal(error.code, SEND_OUTCOME_UNKNOWN);
+  assert.deepEqual(spent, ["aa:0"]);
 });
 
 await check("bookkeeping that fails never changes how the send went", async () => {
@@ -417,12 +461,10 @@ await check("the fee-changed words are iOS's, the fee in KAS with no trailing ze
   assert.equal(error.code, SEND_FEE_CHANGED);
   assert.equal(error.message, "The network fee is now 0.00031 TKAS, more than the Review showed. Nothing was sent: check the new fee and swipe again.");
 });
-await check("within 5,000 sompi of the Review a send still goes; past it, it stops; no Review fee checks nothing", () => {
-  assert.equal(REVIEW_FEE_MARGIN_SOMPI, 5_000n);
-  // a P2SH recipient and P2SH change (35-byte scripts, the estimate's are 34): 2 x 1,100 sompi more
-  checkFeeAgainstReview({ fees: 1_002_600n }, 1_000_400n);
-  checkFeeAgainstReview({ fees: 25_000n }, 20_000n);
-  assert.throws(() => checkFeeAgainstReview({ fees: 25_001n }, 20_000n), (e) => e.code === SEND_FEE_CHANGED && e.feeSompi === 25_001n);
+await check("within 1,000 sompi of the Review a send still goes (iOS's margin, KaPay iOS 2da5f4b); past it, it stops; no Review fee checks nothing", () => {
+  assert.equal(REVIEW_FEE_MARGIN_SOMPI, 1_000n);
+  checkFeeAgainstReview({ fees: 21_000n }, 20_000n);
+  assert.throws(() => checkFeeAgainstReview({ fees: 21_001n }, 20_000n), (e) => e.code === SEND_FEE_CHANGED && e.feeSompi === 21_001n);
   // one more coin for the tip: an input's worth, refused, and the Review then pays what it said
   assert.throws(() => checkFeeAgainstReview({ fees: 7_952_200n }, 7_840_400n), (e) => e.feeSompi === 7_952_200n);
   checkFeeAgainstReview({ fees: 7_952_200n }, 7_952_200n);
@@ -467,6 +509,21 @@ await check("coins that changed after the Review make the send pay more: nothing
   assert.equal(qError.code, SEND_FEE_CHANGED);
   assert.equal(qNode.submitted.length, 0);
 });
+await check("change on a fresh quantum-safe slot is priced at its real script: 1,100 sompi more, and the send pays that (KaPay iOS 2da5f4b)", async () => {
+  const node = pretendNode([coin(50, 1e8), coin(51, 3e8)]);
+  const asSource = await estimateOnchainFeeDetail({ kaspa, rpc: node, sourceAddress: SOURCE, destinationAddress: DEST, amountKas: "1.5" });
+  const atSlot = await estimateOnchainFeeDetail({ kaspa: pricingChangeAtFreshSlot(kaspa), rpc: node, sourceAddress: SOURCE, destinationAddress: DEST, amountKas: "1.5" });
+  assert.equal(atSlot.feeSompi - asSource.feeSompi, 1_100n);
+  // the real send's change is the same shape: its fee is exactly what the Review now shows
+  const change = quantumAddressForRedeem(quantumRedeemScript("11".repeat(32)));
+  const sent = await watchedSend({
+    kaspa, withRpc: engineWithRpc(node), expectedFeeSompi: atSlot.feeSompi,
+    start: (engine) => sendKaspa({ ...engine, rpc: node, privateKey: KEY, sourceAddress: SOURCE, destinationAddress: DEST, amountKas: "1.5", changeAddress: change }),
+  });
+  assert.equal(BigInt(sent.result.summary.fees), atSlot.feeSompi);
+  // priced at the source's script, the same send is past iOS's 1,000-sompi margin
+  assert.ok(BigInt(sent.result.summary.fees) > asSource.feeSompi);
+});
 await check("a failure after one of its broadcasts went out still holds what it spent (a .kas reveal after its commit)", async () => {
   const node = pretendNode([coin(30, 1e8), coin(31, 2e8)]);
   let spent = null;
@@ -479,6 +536,22 @@ await check("a failure after one of its broadcasts went out still holds what it 
   }).catch((e) => e);
   assert.match(error.message, /bad reveal script/);
   assert.deepEqual([...spent].sort(), inputKeysOf(node.submitted[0]).sort());
+});
+
+await check("a send that must chain stops before signing when its change is a quantum-safe slot, and goes out keeping its change", async () => {
+  const redeem = quantumRedeemScript("11".repeat(32));
+  const freshSlot = quantumAddressForRedeem(redeem);
+  const coins = Array.from({ length: 120 }, (_, i) => coin(500 + i, 100_000_000));
+  const node = pretendNode(coins);
+  const sendWith = (changeAddress) => watchedSend({
+    kaspa, withRpc: engineWithRpc(node), singleTransaction: Boolean(changeAddress),
+    start: (engine) => sendKaspa({ ...engine, rpc: node, privateKey: KEY, sourceAddress: SOURCE, destinationAddress: SOURCE, amountKas: "100", changeAddress }),
+  });
+  await assert.rejects(sendWith(freshSlot), (error) => error.code === CHAINED_CHANGE);
+  assert.equal(node.submitted.length, 0);
+  const sent = await sendWith(null);
+  assert.ok(sent.txids.length > 1);
+  assert.equal(node.submitted.length, sent.txids.length);
 });
 
 globalThis.setTimeout = realSetTimeout;

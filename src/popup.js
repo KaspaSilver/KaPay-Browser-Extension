@@ -199,6 +199,8 @@ async function showHome() {
   const cached = await wallet.cachedAddresses(account.id);
   const spending = await wallet.spendingState(account.id);
   const loggedOut = await isLoggedOut();
+  // the last figures known, until a read works: a failed one is not an empty wallet (KaPay iOS 2da5f4b)
+  const knownBalances = await wallet.cachedBalances(account.id);
   // locked, logged out or switched while this was read: the next screen is already drawn
   if (epoch !== accountEpoch) return;
   // logged out in another window while this one was following its switch (a delete there)
@@ -212,7 +214,7 @@ async function showHome() {
     currency,
     addresses: cached,
     spending,
-    balances: null,
+    balances: knownBalances?.total != null ? knownBalances : null,
     kns: cached?.main ? wallet.cachedKns(cached.main) : null,
     otherNames: cached?.main ? cachedOwnedNames(cached.main) : null,
     // the saved .kachat list's count at once; the registry read corrects it (iOS f4f5c0f)
@@ -222,6 +224,7 @@ async function showHome() {
     error: "",
   };
   noteBackupContext(homeState);
+  if (homeState.balances) dock.setStatus({ balanceText: wallet.formatKas(homeState.balances.total, 8) });
   paintHome();
   refreshHome();
   followOwedConnections().catch(() => {});
@@ -429,7 +432,8 @@ async function logOut() {
   // left before the flag is written: this window doesn't follow its own log out (the listener above)
   await leaveAccount();
   await setLoggedOut(true);
-  await wallet.disconnect();
+  // not waited for: Log Out doesn't sit on a hung server (KaPay iOS 2da5f4b)
+  wallet.disconnect();
   showWelcome();
 }
 
@@ -437,22 +441,27 @@ async function lockWallet() {
   await leaveAccount();
   await vault.lock();
   tellBackground({ type: "lock" });
-  await wallet.disconnect();
+  wallet.disconnect();
   showUnlock();
 }
 
 // Receive hands out a never-used address (iOS ReceiveKaspaQRView over freshReceiveAddress):
 // "Preparing a fresh address" while it is worked out, then the white QR page with the
-// address's balance in the bar.
+// address's balance in the bar. An answer that comes back after an account switch (this window
+// followed one, or Receive was opened again meanwhile) is dropped (KaPay iOS 2da5f4b).
+let receiveSeq = 0;
 async function openReceive(onBack) {
+  const epoch = accountEpoch;
+  const mine = ++receiveSeq;
+  const stale = () => epoch !== accountEpoch || mine !== receiveSeq || app.dataset.screen !== "qr";
   showQrPending({ onBack });
   let address;
   try { address = await wallet.freshReceiveAddress(); } catch { address = null; }
-  if (app.dataset.screen !== "qr") return;
+  if (stale()) return;
   if (!address) return showQrPending({ failed: true, onBack });
   let balanceSompi = null;
   try { balanceSompi = (await wallet.balancesFor([address]))[address] ?? null; } catch { /* unknown - nothing shown */ }
-  if (app.dataset.screen !== "qr") return;
+  if (stale()) return;
   showQr({
     address,
     balanceSompi,
@@ -602,10 +611,13 @@ async function refreshHome() {
       const balances = await wallet.balances(s.addresses, []);
       if (stale()) return;
       s.balances = balances;
+      wallet.noteBalances(s.account.id, { main: balances.main, spending: balances.spending });
       // The bell: Kaspa that arrived in any of this account's addresses since the last look.
       bellReceipts(s);
       // a restored phrase's address discovery, if it never completed (audit EXT-031)
       wallet.runPendingDiscovery(s.account.id);
+      // a .kas commit whose reveal never went out (KaPay iOS 2da5f4b)
+      wallet.resumeDomainReveals();
       // "Your own address" on every To field, KasSigner's send included (iOS 56f004f)
       loadOwnAddresses();
       // A faucet visit's payment landed: Claim Testnet Kaspa locks for 24 hours.

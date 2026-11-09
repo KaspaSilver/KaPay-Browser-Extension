@@ -285,7 +285,7 @@ function showHowItWorks(isLive = false) {
     ["atPlus", "Claim", "Pick a free name and register it on Kaspa. It's yours: your name in chats, your profile, your link."],
     ["tag", "List", "Set a price. The name waits in an on-chain covenant, not with KaChat or anyone else, until someone buys it or you take it back."],
     ["cart", "Buy", "Pay the listed price. The payment reaches the seller and the name reaches you in the same transaction - both happen, or neither does."],
-    ["hand", "Offer", "Name your own price. Your KAS waits on chain until the seller accepts, you withdraw the offer, or it expires - and you can message the seller first."],
+    ["hand", "Offer", "Name your own price. Your KAS waits on chain until the seller accepts, you withdraw the offer, or it expires."],
     ["shield", "Trustless", "No middleman and no escrow account: Kaspa's own rules enforce every sale."],
   ];
   openPanel({

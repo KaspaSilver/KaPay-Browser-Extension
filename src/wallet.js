@@ -38,10 +38,10 @@ import { getLocal, setLocal, removeLocal, getSession, setSession } from "./brows
 import { IS_TESTNET, NETWORK as ACTIVE_NETWORK, NETWORK_ID, ADDRESS_PREFIX, KAS_UNIT, netKey, MAINNET_REST, TESTNET_REST, MAINNET_KNS, TESTNET_KNS, isValidKaspaAddress, networkOfAddress } from "./net.js";
 import { activeAccountSecrets, accountSecretsById, ACCOUNT_IDS_KEY } from "./vault.js";
 import { sompiFromUserText } from "./amounts.js";
-import { sourceChangedError, SOURCE_CHANGED } from "./send-guards.js";
+import { sourceChangedError, SOURCE_CHANGED, revealsToRetry, commitIsLive } from "./send-guards.js";
 import {
   HELD_COINS_MESSAGE, liveHolds, mergeHolds, holdSpentCoins, heldKeys, heldCountAt, nextHoldExpiry, withoutHeldCoins,
-  heldCoinsError, maxCoinKeys, watchedSend, recordBuiltInputs, transactionInputKeys,
+  heldCoinsError, maxCoinKeys, watchedSend, CHAINED_CHANGE, recordBuiltInputs, transactionInputKeys, forgetNotConfirmedSpends, pricingChangeAtFreshSlot,
 } from "./send-coins.js";
 import { logInfo, logWarn } from "./log.js";
 
@@ -348,10 +348,15 @@ export function connectedNodeUrl() {
   return rpc?.url || "";
 }
 
+// A hung server never answers a close (KaPay iOS 2da5f4b: Log Out and Delete don't wait on one): at
+// most a few seconds. The connection is dropped from here at once, and the close carries on.
+const DISCONNECT_WAIT_MS = 4000;
 export async function disconnect() {
   const current = rpc;
   rpc = null;
-  await disconnectRpc(current);
+  let timer;
+  await Promise.race([disconnectRpc(current), new Promise((resolve) => { timer = setTimeout(resolve, DISCONNECT_WAIT_MS); })]);
+  clearTimeout(timer);
 }
 
 /**
@@ -371,6 +376,40 @@ export async function balances(addresses, hiddenIndexes = []) {
   spendingEntries.forEach(([index], i) => { bySpendingIndex[index] = spending[i].totalSompi; });
   const total = spending.reduce((sum, b) => sum + b.totalSompi, main.totalSompi);
   return { main: main.totalSompi, spending: bySpendingIndex, total };
+}
+
+// The last balances read, per account and network (iOS balanceCacheKey, cachedSpendingAddressList):
+// a failed read isn't an empty address, so the Wallet tab, the top bar and Manage Addresses keep
+// these until a read works (KaPay iOS 2da5f4b). Gone with the account (account-scope.js).
+const BALANCES_PREFIX = "kachat.balances.";
+const balancesKey = (accountId) => netKey(`${BALANCES_PREFIX}${accountId}`);
+
+/** The last balances known: { main, spending: { index: sompi }, total }, or null. `main` and
+ *  `total` are null until the chatting address has been read. */
+export async function cachedBalances(accountId) {
+  let saved = null;
+  try { saved = await getLocal(balancesKey(accountId)); } catch { saved = null; }
+  if (!saved) return null;
+  try {
+    const spending = Object.fromEntries(Object.entries(saved.spending || {}).map(([index, sompi]) => [index, BigInt(sompi)]));
+    const main = saved.main == null ? null : BigInt(saved.main);
+    return { main, spending, total: main == null ? null : Object.values(spending).reduce((sum, sompi) => sum + sompi, main) };
+  } catch {
+    return null;
+  }
+}
+
+/** Keeps a read for next time: `main` and/or `spending` ({ index: sompi }, the whole revealed list).
+ *  Bookkeeping: a storage failure changes nothing on screen. */
+export async function noteBalances(accountId, { main = undefined, spending = undefined } = {}) {
+  try {
+    const saved = (await getLocal(balancesKey(accountId))) || {};
+    if (main !== undefined) saved.main = String(main);
+    if (spending !== undefined) saved.spending = Object.fromEntries(Object.entries(spending).map(([index, sompi]) => [index, String(sompi)]));
+    if (await accountStillExists(accountId)) await setLocal(balancesKey(accountId), saved);
+  } catch (error) {
+    logWarn("[KaPay] couldn't keep the balances:", error);
+  }
 }
 
 // --- KNS ---------------------------------------------------------------------------------
@@ -525,7 +564,8 @@ async function withRpc(fn) {
 // --- Coins a send just spent (KaPay iOS 0799cec recordSpend / unreservedUtxos) ------------------
 //
 // The node lists a spent coin until its spend is in a block, so a send's inputs stay out of the next
-// send, Max and fee for two minutes (send-coins.js), also after "Not confirmed". They're kept in
+// send, Max and fee for two minutes (send-coins.js), but not after "Not confirmed" (KaPay iOS
+// 2da5f4b: a resend picks the same coins, so at most one of the two can land). They're kept in
 // storage.session too: the popup closes when it loses focus, and a send started again from it (or
 // from the full tab) a moment later must still leave them out. The engine applies its reserved list
 // (setReservedOutpoints) to every build and estimate; it gets the live holds before each send,
@@ -569,10 +609,16 @@ export function heldCoinCount(address) { return heldCountAt(spentCoins, address)
 export { HELD_COINS_MESSAGE };
 
 /** Holds the coins of a transaction this wallet submitted outside a send (Cold Storage's
- *  broadcast): every node-pool submit holds its coins, on success and on "Not confirmed"
- *  (KaPay iOS 1652437 NodePoolService.submitTransaction). `keys`: "txid:index". */
+ *  broadcast): every node-pool submit holds its coins once it's out (KaPay iOS 1652437
+ *  NodePoolService.submitTransaction). `keys`: "txid:index". */
 export async function holdSubmittedCoins(keys, address) {
   try { await holdCoins(keys, address); } catch { /* bookkeeping: the submit stands as it went */ }
+}
+
+/** A submit ended "Not confirmed": its coins stay spendable (KaPay iOS 2da5f4b), so they come off
+ *  the engine's own list, which notes them on an unknown outcome (send-coins.js). */
+export function releaseNotConfirmedCoins() {
+  forgetNotConfirmedSpends(liveHolds(spentCoins));
 }
 
 /** Node entries less every coin held back: this page's and other windows' holds, and the ones the
@@ -684,16 +730,18 @@ export async function resolveRecipient(input) {
  * (mass x 100 sompi/gram, as on iOS) is what is shown and paid; the SDK adds its own base fee
  * automatically, so the send passes the difference as a priority tip.
  */
-export async function estimateFee({ address, destination = null, amountKas = "0.2", selectedOutpoints = null }) {
+export async function estimateFee({ address, source = null, destination = null, amountKas = "0.2", selectedOutpoints = null }) {
   // the send leaves out coins just spent, so the estimate does too (KaPay iOS 0799cec)
   await currentHolds();
+  const k = await kaspa();
   const detail = await estimateSendFeeDetail({
-    kaspa: await kaspa(),
+    // priced at the script the change really goes to (KaPay iOS 2da5f4b reviewChangeScript)
+    kaspa: (await changesToFreshSlot(source, address, destination)) ? pricingChangeAtFreshSlot(k) : k,
     rpc: await connection(),
     withRpc,
     sourceAddress: address,
     // the recipient's own output script, so the fee shown is the fee paid (KaChat-Desktop Build
-    // 272, iOS 4922804); the change still goes to the source in the estimate
+    // 272, iOS 4922804)
     destinationAddress: destination || null,
     amountKas: String(amountKas),
     payloadBytes: 0,
@@ -703,6 +751,21 @@ export async function estimateFee({ address, destination = null, amountKas = "0.
   if (!detail && heldCoinCount(address)) throw new Error(HELD_COINS_MESSAGE);
   if (!detail) return null;
   return { policyKas: Number(detail.policyFeeKas), sdkBaseKas: Number(detail.sdkFeeKas) };
+}
+
+/** Whether a send from `source` puts its change on a fresh quantum-safe slot (send() decides it the
+ *  same way, engine spendingChangeIndex): a quantum-safe source and the primary do. */
+async function changesToFreshSlot(source, address, destination) {
+  if (source?.kind !== "spending") return false;
+  try {
+    const state = await spendingState((await activeAccountSecrets()).id);
+    return spendingChangeIndex({
+      purpose: "withdraw", sourceIndex: source.index, primaryIndex: state.activeIndex, qMaxIndex: state.qMaxIndex,
+      selfSend: String(destination || address).toLowerCase() === String(address).toLowerCase(),
+    }) != null;
+  } catch {
+    return false;
+  }
 }
 
 /** Fee for spending `inputCount` coins into one output (Max, compound), at the live quoted rate.
@@ -744,15 +807,15 @@ export async function estimateMax({ address, destination = null, selectedOutpoin
 }
 
 /** One engine send from `address` (send-coins.js watchedSend, KaPay iOS 0799cec): the coins it spent
- *  are held once it's out or "Not confirmed", and a node's rejection is reported as one even when
- *  another node timed out first. `start({ kaspa, withRpc })` calls the engine with those two.
+ *  are held once it's out, not after "Not confirmed" (KaPay iOS 2da5f4b), and a node's rejection is
+ *  reported as one even when another node timed out first. `start({ kaspa, withRpc })` calls the engine with those two.
  *  `expectedFeeSompi`: the fee the Review showed; a send built that would pay more stops before
  *  anything is signed (SEND_FEE_CHANGED, KaPay iOS 1652437). */
-async function spendFrom(address, start, { expectedFeeSompi = null } = {}) {
+async function spendFrom(address, start, { expectedFeeSompi = null, singleTransaction = false } = {}) {
   await currentHolds();
   return watchedSend({
-    kaspa: await kaspa(), withRpc, start, onSpent: (keys) => holdCoins(keys, address), holding: () => heldCoinCount(address) > 0,
-    expectedFeeSompi, unit: KAS_UNIT,
+    kaspa: await kaspa(), withRpc, start, onSpent: (keys) => holdCoins(keys, address), onNotConfirmed: releaseNotConfirmedCoins, holding: () => heldCoinCount(address) > 0,
+    expectedFeeSompi, unit: KAS_UNIT, singleTransaction,
   });
 }
 
@@ -792,7 +855,7 @@ export async function send({ source, destination, amountKas = null, tipKas = "0"
       totalFeeSompi: totalFeeKas != null ? kasToSompi(String(totalFeeKas)) : null,
       selectedOutpoints: pick, redeemScript: from.redeemScript, log,
       expectedAmountSompi: maxAmountSompi, expectedOutpoints: maxOutpoints,
-    })), async () => { if (from.quantum) await markQuantumSpent(from.accountId, from.address); });
+    })), () => noteSpend(source, from));
   }
   // Where a spending address's change goes (iOS sendFromSpendingAddress, bba1b1e; engine
   // spendingChangeIndex): a quantum-safe source - its spend reveals its key - and the primary send
@@ -824,14 +887,35 @@ export async function send({ source, destination, amountKas = null, tipKas = "0"
     await saveSpendingState(from.accountId, boundPatchFor(fresh.index, await spendingState(from.accountId)));
     await cacheSpendingAddress(from.accountId, fresh.index, fresh.address);
   }
-  return afterSend(spendFrom(from.address, (engine) => sendKaspa({
+  const build = (changeAddress) => spendFrom(from.address, (engine) => sendKaspa({
     ...engine, rpc: node, privateKey: from.privateKeyHex, sourceAddress: from.address,
     destinationAddress: destination, amountKas: String(amountKas), feeKas: String(tipKas || "0"),
-    selectedOutpoints, changeAddress: fresh?.address || null, redeemScript: from.redeemScript, log,
-  }), { expectedFeeSompi }), async () => {
-    if (from.quantum) await markQuantumSpent(from.accountId, from.address);
-    if (fresh && wasPrimary) await saveSpendingState(from.accountId, { activeIndex: fresh.index });
+    selectedOutpoints, changeAddress, redeemScript: from.redeemScript, log,
+  }), { expectedFeeSompi, singleTransaction: Boolean(changeAddress) });
+  // A send that has to chain relays through its change, which the key can't sign for at a
+  // quantum-safe slot: nothing is signed yet, and a legacy source keeps its change instead. (A
+  // quantum-safe source can't keep it, its key is revealed; its sends never chain.)
+  let changeAddress = fresh?.address || null;
+  const sending = build(changeAddress).catch((error) => {
+    if (error?.code !== CHAINED_CHANGE || from.quantum) throw error;
+    changeAddress = null;
+    return build(null);
   });
+  return afterSend(sending, async () => {
+    await noteSpend(source, from, changeAddress);
+    // only the primary follows its change: from another quantum-safe address the fresh slot is
+    // listed (above) and the primary stays where it is (KaPay iOS 2da5f4b)
+    if (changeAddress && wasPrimary) await saveSpendingState(from.accountId, { activeIndex: fresh.index });
+  });
+}
+
+/** What a spend makes known about its addresses (KaPay iOS 2da5f4b noteSpend): the source and its
+ *  change have been used, so neither is offered as fresh again, whatever an older answer said, and a
+ *  quantum-safe source's key is on chain for good. */
+async function noteSpend(source, from, changeAddress = null) {
+  if (source?.kind === "spending") await markAddressUsed(from.address);
+  await markAddressUsed(changeAddress);
+  if (from.quantum) await markQuantumSpent(from.accountId, from.address);
 }
 
 /** What a send records once it's out: also after "Not confirmed", since that one may still land
@@ -853,17 +937,18 @@ async function recordQuietly(record) {
   try { await record(); } catch (error) { logWarn("[KaPay] couldn't record a send (it went out as reported):", error); }
 }
 
-/** Merges the source's coins into one (a self-send with no change) in ONE transaction: every coin,
- *  or past 80 the largest 80 (KaPay iOS 0799cec: Compound uses one transaction's worth, one chunk at
- *  a time). `outpoints`: the coins the screen worked the amount out from (send.js); else picked
- *  here the same way. `totalFeeKas` is paid as shown, raised only to the network floor. A Max send to
- *  the source itself, which a quantum-safe source signs with its redeem script like any other send.
- *  `fromAddress` / `fromAccountId`: the source the screen showed (a different key is refused,
- *  SOURCE_CHANGED). */
-export async function compound(source, totalFeeKas = null, { fromAddress = null, fromAccountId = null, outpoints = null } = {}) {
+/** Merges the source's coins into one (a self-send with no change) in ONE transaction: the coins
+ *  picked in Coin Control (KaPay iOS 2da5f4b), else every coin, or past 80 the largest 80 (KaPay iOS
+ *  0799cec: Compound uses one transaction's worth, one chunk at a time). `outpoints`: the coins the
+ *  screen worked the amount out from (send.js); else picked here the same way. `totalFeeKas` is paid
+ *  as shown, raised only to the network floor. A Max send to the source itself, which a quantum-safe
+ *  source signs with its redeem script like any other send. `fromAddress` / `fromAccountId`: the
+ *  source the screen showed (a different key is refused, SOURCE_CHANGED). */
+export async function compound(source, totalFeeKas = null, { fromAddress = null, fromAccountId = null, outpoints = null, picked = false } = {}) {
   const from = await sourceWallet(source, { address: fromAddress, accountId: fromAccountId });
   const chunked = Array.isArray(outpoints) && outpoints.length > 0;
-  await confirmSpend({ title: "Confirm Compound", amountText: chunked ? `Your ${outpoints.length} largest coins into one` : "Every coin into one", recipient: from.address });
+  const coinsText = !chunked ? "Every coin into one" : picked ? `The ${outpoints.length} coins you picked into one` : `Your ${outpoints.length} largest coins into one`;
+  await confirmSpend({ title: "Confirm Compound", amountText: coinsText, recipient: from.address });
   // picked after the password, like every send's coins
   const pick = await maxPickAt(from.address, outpoints);
   // consolidating spends too: the key is on chain now (the shield comes off)
@@ -872,11 +957,11 @@ export async function compound(source, totalFeeKas = null, { fromAddress = null,
     privateKey: from.privateKeyHex, sourceAddress: from.address, destinationAddress: from.address,
     totalFeeSompi: totalFeeKas != null ? kasToSompi(String(totalFeeKas)) : null,
     selectedOutpoints: pick, redeemScript: from.redeemScript,
-    // the 80 coins the review showed, exactly: one spent meanwhile throws MAX_AMOUNT_CHANGED rather
+    // the coins the review showed, exactly: one spent meanwhile throws MAX_AMOUNT_CHANGED rather
     // than compounding fewer at the fee worked out for all of them
     expectedOutpoints: chunked ? outpoints : null,
     log: logInfo,
-  })), async () => { if (from.quantum) await markQuantumSpent(from.accountId, from.address); });
+  })), () => noteSpend(source, from));
 }
 
 /** The source's private key as hex - for the reveal screen, behind the password. `fromAddress`:
@@ -1020,6 +1105,17 @@ const USED_KEY = netKey("kachat.usedAddresses");
  */
 const sessionUnused = new Set();
 
+/** This address has been used, as this wallet knows first hand (iOS markSpendingAddressUsed): the
+ *  session's "never used" answer for it is out of date. */
+async function markAddressUsed(address) {
+  if (!address) return;
+  sessionUnused.delete(address);
+  const used = new Set((await getLocal(USED_KEY)) || []);
+  if (used.has(address)) return;
+  used.add(address);
+  await setLocal(USED_KEY, [...used]);
+}
+
 /** What is known without asking: true (used, remembered for good), false (unused this session), or null. */
 export async function knownUsedState(address) {
   if (new Set((await getLocal(USED_KEY)) || []).has(address)) return true;
@@ -1091,7 +1187,17 @@ export async function spendingList() {
     const all = (await cachedAddresses(account.id)) || { accountId: account.id, main: null };
     await setLocal(addressCacheKey(account.id), { ...all, accountId: account.id, spending: addresses });
   }
-  const balancesByAddress = await balancesFor(indexes.map((i) => addresses[i]));
+  let balancesByAddress;
+  try {
+    balancesByAddress = await balancesFor(indexes.map((i) => addresses[i]));
+    noteBalances(account.id, { spending: Object.fromEntries(indexes.map((i) => [i, balancesByAddress[addresses[i]] ?? 0n])) });
+  } catch (error) {
+    // A failed read isn't an empty address: the last figures known, which also keeps a funded
+    // address in the From lists (KaPay iOS 2da5f4b). With none, it's said to have failed.
+    const known = await cachedBalances(account.id);
+    if (!known) throw error;
+    balancesByAddress = Object.fromEntries(indexes.map((i) => [addresses[i], known.spending[i] ?? 0n]));
+  }
   return {
     accountId: account.id,
     state,
@@ -1247,7 +1353,7 @@ export async function generateSpendingAddress(forAccount = null) {
     const deadline = Date.now() + 2000;
     for (const index of candidates) {
       const address = addresses[index];
-      if ((balances[address] ?? 0n) > 0n) continue;
+      if ((balances[address] ?? 0n) > 0n || state.qSpent.includes(String(address).toLowerCase())) continue;
       let used = await knownUsedState(address);
       if (used == null) {
         if (Date.now() >= deadline) break;
@@ -1307,9 +1413,12 @@ export async function revealSpendingAddress(index) {
 }
 
 /**
- * The Receive QR address (iOS freshReceiveAddress): the one handed out last time while it is
- * still unused, else the primary while THAT is unused, else a generated one. Never changes the
- * primary. A failed probe keeps the current answer rather than rotating on a guess.
+ * The Receive QR address (iOS freshReceiveAddress): the one handed out last time while it is still
+ * untouched and quantum-safe, else the lowest hidden quantum-safe slot never used, else a brand-new
+ * one (generateSpendingAddress). An address that has held change or spent is never shown again
+ * (KaPay iOS 2da5f4b): a send marks both at once, whatever the REST server has caught up with, and a
+ * legacy pointer, even unused, carries its key in the address itself. Never changes the primary. A
+ * failed probe keeps the current answer rather than rotating on a guess.
  */
 export async function freshReceiveAddress() {
   const { account, state } = await activeState();
@@ -1327,14 +1436,10 @@ export async function freshReceiveAddress() {
   // an answer that comes back after an account switch is dropped (iOS fb2323e): never show one
   // account's address under another
   const stillActive = async () => (await activeAccountSecrets()).id === account.id;
-  if (Number.isInteger(state.receiveIndex)) {
+  if (isQuantumIndex(state.receiveIndex)) {
     const address = await addressAt(state.receiveIndex);
-    if ((await addressUsedOrFunded(address)) !== true) return (await stillActive()) ? address : null;
-  }
-  const primary = await addressAt(state.activeIndex);
-  if ((await addressUsedOrFunded(primary)) !== true) {
-    await saveSpendingState(account.id, { receiveIndex: state.activeIndex });
-    return (await stillActive()) ? primary : null;
+    const spent = (await spendingState(account.id)).qSpent.includes(String(address).toLowerCase());
+    if (!spent && (await addressUsedOrFunded(address)) !== true) return (await stillActive()) ? address : null;
   }
   const index = await generateSpendingAddress(account);
   await saveSpendingState(account.id, { receiveIndex: index });
@@ -1518,7 +1623,9 @@ async function knsEngine(source, reviewed = null) {
 }
 
 /** Makes `domainId` the chatting address's primary name. Throws with the API's reason. */
-export async function setPrimaryDomain(domainId) {
+export async function setPrimaryDomain(domainId, domainName = "") {
+  // it acts for this wallet like any other, so it's asked for like any other (KaPay iOS 2da5f4b)
+  await confirmSpend({ title: "Set as Primary", amountText: String(domainName), message: "Confirm setting your primary domain", confirmLabel: "Confirm" });
   const engine = await knsEngine({ kind: "main" });
   await setKnsPrimaryDomain({ engine, domainId, baseUrl: knsApiUrl() });
   clearKnsCache(engine.address);
@@ -1549,27 +1656,86 @@ export async function transferDomain({ domain, assetId, toAddress, priorityFeeSo
       }
     }
   }
-  // Watched like a send (KaPay iOS 1652437: every node-pool submit holds its coins): the commit's
-  // coins are held once it's out, also when the reveal then fails or the commit is "Not confirmed".
-  const result = await spendFrom(engine.address, (watched) => {
-    engine.kaspa = watched.kaspa;
-    engine.withRpc = watched.withRpc;
-    return knsTransferDomain({
-      engine, domain, assetId, toAddress,
-      signer: { privateKey: engine.privateKey, address: engine.address },
-      // Who signs, so Finish transfer can rebuild the commit's key after a closed popup.
-      source: { kind: source?.kind || "main", index: source?.index ?? null, accountId: engine.accountId },
-      changeAddress: fresh?.address || null,
-      revealPriorityFeeSompi: priorityFeeSompi,
-      onStatus,
-      log: logInfo,
+  // The primary follows its change once the commit is out or may be (KaPay iOS 2da5f4b), whatever
+  // becomes of the reveal, which resumeDomainReveals tries again; a slip here never fails the transfer.
+  let followed = false;
+  const followChange = async () => {
+    if (!fresh || followed) return;
+    followed = true;
+    await recordQuietly(async () => {
+      await markAddressUsed(fresh.address);
+      await saveSpendingState(fresh.accountId, { activeIndex: fresh.index });
     });
-  });
-  if (fresh) {
-    // the primary moves to the change slot once it's accepted; a slip here never fails the transfer
-    await recordQuietly(() => saveSpendingState(fresh.accountId, { activeIndex: fresh.index }));
+  };
+  const markInFlow = String(assetId || "").trim();
+  transfersInFlow.add(markInFlow);
+  try {
+    // Watched like a send (KaPay iOS 1652437: every node-pool submit holds its coins): the commit's
+    // coins are held once it's out, also when the reveal then fails; not when the commit is "Not
+    // confirmed" (KaPay iOS 2da5f4b).
+    const result = await spendFrom(engine.address, (watched) => {
+      engine.kaspa = watched.kaspa;
+      engine.withRpc = watched.withRpc;
+      return knsTransferDomain({
+        engine, domain, assetId, toAddress,
+        signer: { privateKey: engine.privateKey, address: engine.address },
+        // Who signs, so Finish transfer can rebuild the commit's key after a closed popup.
+        source: { kind: source?.kind || "main", index: source?.index ?? null, accountId: engine.accountId },
+        changeAddress: fresh?.address || null,
+        revealPriorityFeeSompi: priorityFeeSompi,
+        onStatus: (update) => {
+          if (update?.status === "committed") followChange();
+          onStatus(update);
+        },
+        log: logInfo,
+      });
+    });
+    await followChange();
+    return result;
+  } catch (error) {
+    if (error?.code === SEND_OUTCOME_UNKNOWN) await followChange();
+    throw error;
+  } finally {
+    transfersInFlow.delete(markInFlow);
   }
-  return result;
+}
+
+// The asset ids of .kas transfers running in this page: they do their own reveal (iOS
+// KNSRevealRecovery.inFlow).
+const transfersInFlow = new Set();
+let resumingReveals = false;
+
+/**
+ * Sends the reveal of any .kas commit left on chain without one (iOS KNSRevealRecovery.resume, KaPay
+ * iOS 2da5f4b), for the active account, for an hour (send-guards.js revealsToRetry): called each time
+ * the Wallet tab refreshes, iOS's "becomes active". No password prompt: the reveal is the second half
+ * of the transfer the password already approved, and the deposit it spends goes back to the owner.
+ * Anything left after the hour stays on Your Domains' Finish Transfer. The keys come from the vault
+ * at the time, so nothing runs while it's locked.
+ */
+export async function resumeDomainReveals() {
+  if (resumingReveals) return;
+  resumingReveals = true;
+  try {
+    const account = await activeAccountSecrets();
+    for (const record of revealsToRetry(await listPendingKnsTransfers(), { accountId: account.id, inFlow: transfersInFlow })) {
+      if ((await activeAccountSecrets()).id !== account.id) return;
+      try {
+        const entries = (await withRpc(async (node) => checkedUtxoAnswer(await node.getUtxosByAddresses([record.commitAddress]))))?.entries;
+        if (!commitIsLive(record, entries)) continue;
+        const source = record.source?.kind === "spending" ? { kind: "spending", index: record.source.index } : { kind: "main" };
+        const engine = await knsEngine(source, { address: record.source?.address, accountId: account.id });
+        await resumeKnsTransfer({ engine, assetId: record.assetId, signer: { privateKey: engine.privateKey, address: engine.address }, log: logInfo });
+        logInfo("[KaPay] sent the reveal of a commit left without one:", record.domain);
+      } catch (error) {
+        logWarn("[KaPay] reveal of a commit left without one failed again:", error);
+      }
+    }
+  } catch (error) {
+    logWarn("[KaPay] unfinished .kas transfers:", error);
+  } finally {
+    resumingReveals = false;
+  }
 }
 
 /** Unfinished .kas transfers (commit sent, reveal not yet) of the active account on this network. */
@@ -1847,7 +2013,8 @@ export function namesNodeMethods() {
       if (!localId) {
         try { localId = transaction?.id ? String(transaction.id) : null; } catch { localId = null; }
       }
-      // its coins held once it's out or "Not confirmed" (KaPay iOS 1652437 submitRpcTransaction)
+      // its coins held once it's out (KaPay iOS 1652437 submitRpcTransaction), not after "Not
+      // confirmed" (KaPay iOS 2da5f4b)
       const spends = transactionInputKeys(transaction);
       try {
         const txid = await submitConfirmingAcceptance({
@@ -1861,7 +2028,7 @@ export function namesNodeMethods() {
         await holdSubmittedCoins(spends, this?.address || "");
         return txid;
       } catch (error) {
-        if (error?.code === SEND_OUTCOME_UNKNOWN) await holdSubmittedCoins(spends, this?.address || "");
+        if (error?.code === SEND_OUTCOME_UNKNOWN) releaseNotConfirmedCoins();
         throw error;
       }
     },

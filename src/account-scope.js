@@ -52,7 +52,7 @@ export function accountDataKeys({ accountId, chatting = null, addresses = [], va
   const both = (address) => [...new Set([address, ...(variants(address) || [])].filter(Boolean))];
   const local = [];
   if (accountId) {
-    for (const base of ["spending", "addresses", "cold", "portfolios", "portfolioFees", "pendingDiscovery"]) {
+    for (const base of ["spending", "addresses", "balances", "cold", "coldBalances", "portfolios", "portfolioFees", "pendingDiscovery"]) {
       local.push(`kachat.${base}.${accountId}`, `kachat.${base}.${accountId}.testnet`);
     }
   }

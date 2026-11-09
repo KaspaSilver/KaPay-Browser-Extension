@@ -19,7 +19,7 @@ export function cancelSpendPrompt() {
 
 /**
  * "Confirm Send" with what is being sent and to whom. Resolves true once the password checks out,
- * false when cancelled. `details`: { amountText, recipient, max, title }.
+ * false when cancelled. `details`: { amountText, recipient, max, title, message, confirmLabel }.
  *
  * While it is up nothing else starts or changes the send it waits for (iOS SwipeUpToSendScrollView
  * authPending, KaPay iOS 0799cec): a second request is turned down (false, nothing sent) and the
@@ -32,7 +32,7 @@ export function confirmSpend(details = {}) {
   return waiting;
 }
 
-function askPassword({ amountText = "", recipient = "", max = false, title = "Confirm Send", totalText = null, extraFeeText = null } = {}) {
+function askPassword({ amountText = "", recipient = "", max = false, title = "Confirm Send", totalText = null, extraFeeText = null, message = "Enter your wallet password to send.", confirmLabel = "Send" } = {}) {
   return new Promise((resolve) => {
     const backdrop = document.createElement("div");
     backdrop.className = "alert-backdrop spend-auth";
@@ -44,13 +44,13 @@ function askPassword({ amountText = "", recipient = "", max = false, title = "Co
           <div class="alert-title">${esc(title)}</div>
           <div class="alert-message">${what ? `<strong>${esc(what)}</strong>` : ""}${to ? `<br><span class="mono tiny">to ${esc(to)}</span>` : ""}</div>
           ${totalText ? `<div class="alert-message">Total <strong>${esc(totalText)}</strong>${extraFeeText ? `<br><span class="small">includes ${esc(extraFeeText)} extra fee set by the site</span>` : ""}</div>` : ""}
-          <div class="alert-message">Enter your wallet password to send.</div>
+          <div class="alert-message">${esc(message)}</div>
           <input class="alert-field" type="password" autocomplete="current-password" placeholder="Password" aria-label="Password" />
           <div class="error spend-auth-error"></div>
         </div>
         <div class="alert-buttons two">
           <button type="button" class="alert-button" data-cancel>Cancel</button>
-          <button type="submit" class="alert-button strong">Send</button>
+          <button type="submit" class="alert-button strong">${esc(confirmLabel)}</button>
         </div>
       </form>`;
     // the screen behind sits still until this answers

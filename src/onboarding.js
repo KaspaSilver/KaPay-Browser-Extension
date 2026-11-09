@@ -269,7 +269,8 @@ export async function deleteAccount(accountId, mainAddress) {
     }
   }
   await removeConnectionsFor(accountId);
-  await wallet.disconnect();
+  // not waited for: Delete doesn't sit on a hung server (KaPay iOS 2da5f4b)
+  wallet.disconnect();
 }
 
 /** A typed-in recovery phrase runs the full Discover Addresses sweep - both chains - in the
@@ -531,7 +532,7 @@ function showPassphraseEntry(flow) {
     const list = $("#preview-found");
     if (!found || found.length < 2) { list.innerHTML = ""; return; }
     list.innerHTML = `
-      <p class="muted small found-lead">We picked the first address with funds. Tap another if that's not the one you chat from.</p>
+      <p class="muted small found-lead">We picked the first address with funds. Tap another if that's not the one you use.</p>
       ${found.map((entry) => `
         <button type="button" class="found-row" data-found="${entry.index}">
           <span class="found-mark">${flow.chattingIndex === entry.index ? ICONS.circleCheck : ICONS.circle}</span>
@@ -1041,7 +1042,7 @@ function showReset() {
     await vault.resetWallet();
     await setLoggedOut(false);
     await removeConnectionsFor(null);
-    await wallet.disconnect();
+    wallet.disconnect();
     showWelcome();
   };
 }

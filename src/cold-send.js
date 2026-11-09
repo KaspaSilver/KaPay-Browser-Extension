@@ -675,7 +675,7 @@ export function showColdSend(opts) {
     s.broadcastError = "";
     swipe?.setBusy(true);
     // every node-pool submit holds its coins, Cold Storage's too (KaPay iOS 1652437): out of the
-    // next Cold Storage build for two minutes, also after "Not confirmed", which may still land
+    // next Cold Storage build for two minutes, not after "Not confirmed" (KaPay iOS 2da5f4b)
     const spends = (s.unsigned.inputs || []).map((input) => `${input.prevTxId}:${input.prevIndex}`);
     try {
       const txid = String(await broadcastSigned({ engine: await getEngine(), unsigned: s.unsigned, decoded: s.decoded }) || "");
@@ -692,7 +692,7 @@ export function showColdSend(opts) {
       swipe?.setBusy(false);
       swipe?.setEnabled(false);
     } catch (error) {
-      if (error?.code === SEND_OUTCOME_UNKNOWN) await wallet.holdSubmittedCoins(spends, from);
+      if (error?.code === SEND_OUTCOME_UNKNOWN) wallet.releaseNotConfirmedCoins();
       if (closed) return;
       logWarn("[KaPay] cold broadcast failed:", error);
       s.broadcasting = false;
