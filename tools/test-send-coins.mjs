@@ -194,6 +194,45 @@ await check("an orphan resubmit that loses its answer may still land: the earlie
   const error = await submitVia(guard.withRpc).catch((e) => e);
   assert.equal(guard.verdict(error).code, SEND_OUTCOME_UNKNOWN);
 });
+// A payment never waits in a node's orphan pool (KaPay iOS 2da5f4b escalateOrphan: false): Max and
+// Compound refuse the engine's orphan-allowed resubmit before a node sees it.
+const orphanAnswer = () => new Error("transaction is an orphan where orphan is disallowed");
+const recording = (answers) => {
+  const node = scripted(answers);
+  const plain = node.submitTransaction;
+  node.allowed = [];
+  node.submitTransaction = async (options) => { node.allowed.push(Boolean(options?.allowOrphan)); return plain(options); };
+  return node;
+};
+await check("orphanPool false: no submit allowing an orphan reaches the node; the node's orphan answer stands", async () => {
+  const node = recording([orphanAnswer(), orphanAnswer(), "f".repeat(64)]);
+  const guard = rejectionAwareRpc(reconnectingWithRpc(node), isNodeRejection, { orphanPool: false });
+  const error = await submitVia(guard.withRpc).catch((e) => e);
+  assert.deepEqual(node.allowed, [false, false]);
+  const verdict = guard.verdict(error);
+  assert.notEqual(verdict.code, SEND_OUTCOME_UNKNOWN);
+  assert.match(verdict.message, /orphan where orphan is disallowed/);
+  assert.equal(guard.wentOut(), false);
+});
+await check("orphanPool false after a lost answer: the refusal is no verdict, still 'Not confirmed'", async () => {
+  // the first submit times out, its retry and the resubmit hear "orphan" (another node may have it)
+  const node = recording([timedOut(), orphanAnswer(), orphanAnswer()]);
+  const guard = rejectionAwareRpc(reconnectingWithRpc(node), isNodeRejection, { orphanPool: false });
+  const error = await submitVia(guard.withRpc).catch((e) => e);
+  assert.ok(!node.allowed.includes(true));
+  assert.equal(guard.verdict(error).code, SEND_OUTCOME_UNKNOWN);
+});
+await check("by default (a .kas or .kachat send) the orphan-allowed resubmit still goes", async () => {
+  const node = recording([orphanAnswer(), orphanAnswer(), "f".repeat(64)]);
+  const guard = rejectionAwareRpc(reconnectingWithRpc(node));
+  assert.equal(await submitVia(guard.withRpc), "f".repeat(64));
+  assert.deepEqual(node.allowed, [false, false, true]);
+});
+await check("the wallet's sends: Max and Compound refuse the orphan pool, a normal send asks the engine not to", () => {
+  const wallet = readFileSync(new URL("../src/wallet.js", import.meta.url), "utf8");
+  assert.equal((wallet.match(/\{ orphanPool: false \}\)/g) || []).length, 2);
+  assert.match(wallet, /escalateOrphan: false,\n  \}\), \{ expectedFeeSompi/);
+});
 await check("a call that isn't a broadcast (a lookup, a UTXO fetch) is never a verdict", async () => {
   const guard = rejectionAwareRpc(async () => { throw new Error("bad answer"); });
   await assert.rejects(guard.withRpc(async () => {}, { label: "Max send UTXO fetch" }));

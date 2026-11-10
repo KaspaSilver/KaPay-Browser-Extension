@@ -287,14 +287,25 @@ export const isNodeRejection = (error) => {
 // for the transaction and ends "Not confirmed" if it can't tell. (Belongs in the engine's patterns;
 // until then, here.)
 const SOCKET_FAILURE = /websocket|disconnect|socket|channel (receive|send)|rpc client/i;
+// A payment never waits in a node's orphan pool (KaPay iOS 2da5f4b: a withdrawal and a spending
+// address's send submit with escalateOrphan: false). The engine takes that flag on sendKaspa
+// (KaChat-Desktop Build 276) but not on sendMaxKaspa, so for a Max or a Compound the orphan-allowed
+// resubmit is refused here, before any node sees it: the engine then asks the network for the
+// transaction as it does after any refusal, and otherwise reports the node's orphan answer, as iOS
+// does. The words keep "orphan" in them, so the engine never takes this for a node's verdict (that
+// would turn a send whose first answer was lost from "Not confirmed" into a plain failure).
+export const ORPHAN_POOL_REFUSED = "Not submitted to a node's orphan pool: a payment never waits there.";
+
 /** The node as the engine's submit sees it: the same client, its submit's socket failures worded
- *  as a lost connection (the engine reads them before any wrapper around it can). */
-function submittingAsLost(node) {
+ *  as a lost connection (the engine reads them before any wrapper around it can). With
+ *  `orphanPool: false`, a submit that allows an orphan is refused without reaching the node. */
+function submittingAsLost(node, { orphanPool = true } = {}) {
   if (!node || typeof node.submitTransaction !== "function") return node;
   return new Proxy(node, {
     get(target, key) {
       if (key === "submitTransaction") {
         return async (...args) => {
+          if (!orphanPool && args[0]?.allowOrphan === true) throw new Error(ORPHAN_POOL_REFUSED);
           try { return await target.submitTransaction(...args); } catch (error) { throw asConnectionLoss(error); }
         };
       }
@@ -313,8 +324,8 @@ export function asConnectionLoss(error, isConnectionError = isRpcConnectionError
 
 /** -> { withRpc, verdict(error), wentOut() }: `withRpc` for the engine, `verdict` for what it threw,
  *  `wentOut` whether a node took one of its broadcasts (a .kas transfer's commit, before its reveal
- *  failed: those coins are spent). */
-export function rejectionAwareRpc(withRpc, isRejection = isNodeRejection) {
+ *  failed: those coins are spent). `orphanPool: false`: its broadcasts never go in an orphan pool. */
+export function rejectionAwareRpc(withRpc, isRejection = isNodeRejection, { orphanPool = true } = {}) {
   let rejection = null;
   let went = false;
   const watched = (fn, options) => {
@@ -322,7 +333,7 @@ export function rejectionAwareRpc(withRpc, isRejection = isNodeRejection) {
     rejection = null;
     return withRpc(async (node) => {
       try {
-        const result = await fn(submittingAsLost(node));
+        const result = await fn(submittingAsLost(node, { orphanPool }));
         rejection = null;
         went = true;
         return result;
@@ -348,11 +359,12 @@ export function rejectionAwareRpc(withRpc, isRejection = isNodeRejection) {
  * resend picks the same ones, so at most one can land): only the earlier transactions of a chained
  * send, which did go out. What's thrown is the verdict, with the engine's scheduled-post words for held coins rewritten. The holding
  * is bookkeeping: if it fails, the send still reads as it went. `expectedFeeSompi`: the fee the Review
- * showed (recordBuiltInputs).
+ * showed (recordBuiltInputs). `orphanPool: false` (a Max or a Compound): none of its transactions is
+ * resubmitted into a node's orphan pool (ORPHAN_POOL_REFUSED).
  */
-export async function watchedSend({ kaspa, withRpc, start, onSpent = async () => {}, holding = () => false, isRejection = isNodeRejection, expectedFeeSompi = null, unit = "KAS", singleTransaction = false }) {
+export async function watchedSend({ kaspa, withRpc, start, onSpent = async () => {}, holding = () => false, isRejection = isNodeRejection, expectedFeeSompi = null, unit = "KAS", singleTransaction = false, orphanPool = true }) {
   const built = recordBuiltInputs(kaspa, { expectedFeeSompi, unit, singleTransaction });
-  const guard = rejectionAwareRpc(withRpc, isRejection);
+  const guard = rejectionAwareRpc(withRpc, isRejection, { orphanPool });
   const spent = async (keys) => { try { await onSpent(keys); } catch { /* the send's outcome stands */ } };
   let result;
   try {

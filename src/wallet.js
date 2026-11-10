@@ -805,11 +805,11 @@ export async function estimateMax({ address, destination = null, selectedOutpoin
  *  reported as one even when another node timed out first. `start({ kaspa, withRpc })` calls the engine with those two.
  *  `expectedFeeSompi`: the fee the Review showed; a send built that would pay more stops before
  *  anything is signed (SEND_FEE_CHANGED, KaPay iOS 1652437). */
-async function spendFrom(address, start, { expectedFeeSompi = null, singleTransaction = false } = {}) {
+async function spendFrom(address, start, { expectedFeeSompi = null, singleTransaction = false, orphanPool = true } = {}) {
   await currentHolds();
   return watchedSend({
     kaspa: await kaspa(), withRpc, start, onSpent: (keys) => holdCoins(keys, address), holding: () => heldCoinCount(address) > 0,
-    expectedFeeSompi, unit: KAS_UNIT, singleTransaction,
+    expectedFeeSompi, unit: KAS_UNIT, singleTransaction, orphanPool,
   });
 }
 
@@ -849,7 +849,8 @@ export async function send({ source, destination, amountKas = null, tipKas = "0"
       totalFeeSompi: totalFeeKas != null ? kasToSompi(String(totalFeeKas)) : null,
       selectedOutpoints: pick, redeemScript: from.redeemScript, log,
       expectedAmountSompi: maxAmountSompi, expectedOutpoints: maxOutpoints,
-    })), () => noteSpend(source, from));
+      // a payment never waits in a node's orphan pool (KaPay iOS 2da5f4b escalateOrphan: false)
+    }), { orphanPool: false }), () => noteSpend(source, from));
   }
   // Where a spending address's change goes (iOS sendFromSpendingAddress, bba1b1e; engine
   // spendingChangeIndex): a quantum-safe source - its spend reveals its key - and the primary send
@@ -885,6 +886,9 @@ export async function send({ source, destination, amountKas = null, tipKas = "0"
     ...engine, rpc: node, privateKey: from.privateKeyHex, sourceAddress: from.address,
     destinationAddress: destination, amountKas: String(amountKas), feeKas: String(tipKas || "0"),
     selectedOutpoints, changeAddress, redeemScript: from.redeemScript, log,
+    // a payment never waits in a node's orphan pool (KaPay iOS 2da5f4b escalateOrphan: false); the
+    // engine still lets a chained send's later transactions, which spend its own change, wait there
+    escalateOrphan: false,
   }), { expectedFeeSompi, singleTransaction: Boolean(changeAddress) });
   // A send that has to chain relays through its change, which the key can't sign for at a
   // quantum-safe slot: nothing is signed yet, and a legacy source keeps its change instead. (A
@@ -955,7 +959,7 @@ export async function compound(source, totalFeeKas = null, { fromAddress = null,
     // than compounding fewer at the fee worked out for all of them
     expectedOutpoints: chunked ? outpoints : null,
     log: logInfo,
-  })), () => noteSpend(source, from));
+  }), { orphanPool: false }), () => noteSpend(source, from));
 }
 
 /** The source's private key as hex - for the reveal screen, behind the password. `fromAddress`:
