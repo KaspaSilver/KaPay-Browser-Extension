@@ -5,7 +5,8 @@
 //                         Log Out in Settings lands here, as on iOS.
 //   create                one tap (KaPay iOS 99ab88a), or Advanced: CreateWalletView ->
 //                         PassphraseOptionView's entry
-//   import                ImportSourceWalletView -> ImportWalletView -> PassphraseOptionView
+//   import                ImportNameStep -> ImportWalletView -> PassphraseOptionView, which finds
+//                         the wallet type from the words (KaPay iOS 018e634)
 //   unlock / reset        the browser's stand-in for Face ID: the wallet password
 //
 // The first account also sets the wallet password (the vault); later accounts are added to the
@@ -27,6 +28,7 @@ import { forgetAccount as forgetBell } from "./bell.js";
 import { forgetKachatSigner } from "./kachat-names.js";
 import { reencodeAddress } from "./net.js";
 import { accountDataKeys, withoutAccount } from "./account-scope.js";
+import { DEFAULT_IMPORT_CHOICE, candidateId, sameChoice, visibleImportRows, walletTypeName } from "./import-search.js";
 
 let goHome = () => {};
 let goSettings = () => {};
@@ -126,7 +128,7 @@ export async function showWelcome() {
   $("#app-settings").onclick = () => goSettings({ appSettings: true, onBack: showWelcome });
   $("#create").onclick = createAccount;
   $("#advanced").onclick = createWithPassphrase;
-  $("#import").onclick = () => { importDraft = null; showImportSource(); };
+  $("#import").onclick = () => { importDraft = null; showImportName(); };
   for (const button of app.querySelectorAll("[data-sign-in]")) {
     button.onclick = () => runAccountAction(async () => {
       try {
@@ -442,22 +444,173 @@ function showPassphraseQuestion(flow) {
     </section>`, "passphrase");
   $("#back").onclick = flow.onBack;
   $("#yes").onclick = () => showPassphraseEntry(flow);
-  $("#no").onclick = () => flow.onProceed("");
+  // import with no passphrase: the account these words were found in (KaPay iOS 018e634)
+  $("#no").onclick = () => (flow.mode === "import" ? showImportFound(flow) : flow.onProceed(""));
   $("#what").onclick = () => showPassphraseExplainer(flow, () => showPassphraseQuestion(flow));
 }
 
+const ADDRESS_PREVIEW_HTML = `
+  <div class="preview">
+    <div class="muted small">Your chatting address</div>
+    <div class="preview-address" id="preview">Checking...</div>
+    <div class="preview-balance"><span class="muted small">Balance</span><span id="preview-balance"><span class="spinner small-spin"></span></span></div>
+    <div class="small" id="preview-hint" hidden></div>
+    <div id="preview-found"></div>
+    <div id="preview-every"></div>
+    <div id="preview-incomplete"></div>
+    <div class="muted small" id="preview-note">This is the account your 12 or 24 words open on their own.</div>
+  </div>`;
+
 /**
- * The passphrase field, with the chatting address it produces and that address's balance updating
- * underneath (KaPay iOS 99ab88a PassphraseAddressPreview): the only direct evidence that a
- * passphrase opens a different account, and how someone importing tells they typed the right one.
- * On import it checks the first 50 chatting addresses, picks the first with funds and lists any
- * others to choose from (iOS 4f5dfd2); the import lands on the chosen one. The search is a network
- * round trip, so it's never the only way forward (KaPay iOS 1652437): "Skip the Search" imports on
- * #0 at once, and a search that fails or takes past PASSPHRASE_SEARCH_TIMEOUT_MS lets Import go onto
- * #0, says so, and offers Search Again; an answer that comes later is ignored. Creating opens here
- * (Advanced: Create with a Passphrase), so its Back is the accounts screen.
+ * The chatting-address box (KaPay iOS 018e634 PassphraseAddressPreview), in ADDRESS_PREVIEW_HTML:
+ * the address a passphrase produces and its balance, updating as it's typed - the only direct
+ * evidence that a passphrase opens a different account. On import it searches every wallet type
+ * (wallet.findImportAccounts), picks the likeliest account into `flow.choice` and lists the others
+ * when there are several; "See Every Wallet Type" adds each type's #0. The search is a network round
+ * trip, so it's never the only way forward (KaPay iOS 1652437): `onSearching(true)` holds Import
+ * from the first keystroke, and a search that fails or runs past PASSPHRASE_SEARCH_TIMEOUT_MS lets
+ * Import go onto Standard #0, says so and offers Search Again; an answer that comes later is ignored.
+ * Creating (Advanced: Create with a Passphrase) shows the standard #0 and its balance only.
+ * -> `schedule()`, to call when the passphrase changes.
  */
 const PASSPHRASE_SEARCH_TIMEOUT_MS = 12_000;
+function mountAddressPreview({ flow, typed, onSearching = () => {} }) {
+  const searches = flow.mode === "import";
+  // This box's own elements: a search still running for a screen that was left (Back, then No)
+  // never paints into the next screen's box or changes what it imports.
+  const root = app.querySelector(".preview");
+  const el = (id) => (root?.isConnected ? root.querySelector(`#${id}`) : null);
+  let found = [];
+  let everyType = [];
+  let showsEveryType = false;
+  let searching = false;
+  let seq = 0;
+  let previewTimer = null;
+  let searchTimer = null;
+  const setSearching = (on) => { if (!root?.isConnected) return; searching = on; onSearching(on); paintRows(); };
+  const showBalance = (balanceSompi, hasHistory = false) => {
+    const holds = balanceSompi > 0n;
+    el("preview-balance").innerHTML = `<span class="strong small ${holds ? "good-text" : ""}">${esc(wallet.formatKas(balanceSompi, 8))} KAS</span>`;
+    if (!searches) return;
+    const hint = el("preview-hint");
+    hint.hidden = false;
+    if (holds || hasHistory) {
+      hint.className = "small good-text";
+      hint.textContent = holds
+        ? "This address holds funds, so this looks like the right account."
+        : "This address has history, so this looks like the right account.";
+    } else if (!typed()) {
+      hint.className = "small muted";
+      hint.textContent = "No funds or history on this address.";
+    } else {
+      hint.className = "small warn-text";
+      hint.textContent = "No funds on this address. If you expected funds here, check your passphrase.";
+    }
+  };
+  const select = (row) => {
+    if (!root?.isConnected) return;
+    flow.choice = { family: row.family, index: row.index };
+    el("preview").textContent = row.address;
+    showBalance(row.balanceSompi, row.hasHistory);
+    paintRows();
+  };
+  function paintRows() {
+    const list = el("preview-found");
+    const every = el("preview-every");
+    if (!list || !every) return;
+    const rows = visibleImportRows(found, everyType, showsEveryType);
+    list.innerHTML = found.length > 1 || showsEveryType ? `
+      <p class="muted small found-lead">We picked the most likely account. Tap another if that's not the one you use.</p>
+      ${rows.map((row) => `
+        <button type="button" class="found-row" data-found="${esc(candidateId(row))}">
+          <span class="found-mark">${sameChoice(flow.choice, row) ? ICONS.circleCheck : ICONS.circle}</span>
+          <span class="found-text">
+            <span class="small strong">${esc(walletTypeName(row.family))}</span>
+            <span class="tiny muted">Address #${row.index}</span>
+            <span class="mono tiny muted">${esc(`${row.address.slice(0, 14)}...${row.address.slice(-6)}`)}</span>
+          </span>
+          ${row.balanceSompi > 0n
+            ? `<span class="small strong good-text">${esc(wallet.formatKas(row.balanceSompi, 8))} KAS</span>`
+            : row.hasHistory ? '<span class="small muted">Has history</span>' : ""}
+        </button>`).join("")}` : "";
+    for (const button of list.querySelectorAll("[data-found]")) {
+      button.onclick = () => select(rows.find((row) => candidateId(row) === button.dataset.found));
+    }
+    every.innerHTML = searches && !searching && everyType.length && !showsEveryType
+      ? '<button type="button" class="link-button small" id="every-type">See Every Wallet Type</button>' : "";
+    const everyButton = el("every-type");
+    if (everyButton) everyButton.onclick = () => { showsEveryType = true; paintRows(); };
+  }
+  /** The search failed or ran out of time: Import goes to Standard #0, and the box says so. */
+  const searchIncomplete = () => {
+    const box = el("preview-incomplete");
+    if (!box) return;
+    box.innerHTML = `
+      <p class="small warn-text">The search for funds on this account's other addresses didn't finish, so Import uses address #0.</p>
+      <button type="button" class="link-button small" id="search-again">Search Again</button>`;
+    el("search-again").onclick = () => schedule();
+  };
+  // Address #0 for the passphrase as typed, on a short debounce (the derivation is PBKDF2), then a
+  // further pause, so only the passphrase someone stopped typing is looked up.
+  function schedule() {
+    if (!root?.isConnected) return;
+    clearTimeout(previewTimer);
+    clearTimeout(searchTimer);
+    const passphrase = typed();
+    flow.choice = { ...DEFAULT_IMPORT_CHOICE };
+    found = [];
+    everyType = [];
+    showsEveryType = false;
+    el("preview-incomplete").innerHTML = "";
+    el("preview-note").textContent = passphrase
+      ? "A different passphrase gives a different address, and a different account."
+      : "This is the account your 12 or 24 words open on their own.";
+    el("preview-balance").innerHTML = '<span class="spinner small-spin"></span>';
+    el("preview-hint").hidden = true;
+    if (searches) setSearching(true); else paintRows();
+    const mine = ++seq;
+    const current = () => mine === seq && Boolean(root?.isConnected);
+    const failed = () => { setSearching(false); el("preview-balance").innerHTML = '<span class="muted small">Couldn\'t check</span>'; };
+    previewTimer = setTimeout(async () => {
+      const address = await wallet.previewMainAddress(flow.phrase, passphrase, DEFAULT_IMPORT_CHOICE.family);
+      if (!current()) return;
+      el("preview").textContent = address || "Checking...";
+      if (!address) return failed();
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      if (!current()) return;
+      if (searches) {
+        everyType = await wallet.importAddressesAtZero(flow.phrase, passphrase);
+        if (!current()) return;
+        // A slow or unreachable node lets Import go after the timeout, onto #0, and says so.
+        searchTimer = setTimeout(() => {
+          if (!current()) return;
+          seq += 1; // the answer that comes later is ignored
+          failed();
+          searchIncomplete();
+        }, PASSPHRASE_SEARCH_TIMEOUT_MS);
+        const answer = await wallet.findImportAccounts(flow.phrase, passphrase);
+        clearTimeout(searchTimer);
+        if (!current()) return;
+        if (!answer) { failed(); searchIncomplete(); return; }
+        found = answer;
+        setSearching(false);
+        if (found.length) select(found[0]); else showBalance(0n);
+        return;
+      }
+      let balances = null;
+      try { balances = await wallet.balancesFor([address]); } catch { balances = null; }
+      if (!current()) return;
+      if (balances) showBalance(balances[address] ?? 0n); else failed();
+    }, 250);
+  }
+  schedule();
+  return { schedule };
+}
+
+/**
+ * The passphrase field, with the address box underneath (mountAddressPreview). Creating opens here
+ * (Advanced: Create with a Passphrase), so its Back is the accounts screen.
+ */
 function showPassphraseEntry(flow) {
   const create = flow.mode === "create";
   render(`
@@ -472,15 +625,7 @@ function showPassphraseEntry(flow) {
         <button class="icon" id="eye" type="button" aria-label="Show passphrase">${ICONS.eye}</button>
       </div>
       ${create ? '<input id="pp2" type="password" placeholder="Re-enter passphrase" autocomplete="off" autocapitalize="off" spellcheck="false" />' : ""}
-      <div class="preview">
-        <div class="muted small">Your chatting address</div>
-        <div class="preview-address" id="preview">Checking...</div>
-        <div class="preview-balance"><span class="muted small">Balance</span><span id="preview-balance"><span class="spinner small-spin"></span></span></div>
-        <div class="small" id="preview-hint" hidden></div>
-        <div id="preview-found"></div>
-        <div id="preview-incomplete"></div>
-        <div class="muted small" id="preview-note">This is the account your 12 or 24 words open on their own.</div>
-      </div>
+      ${ADDRESS_PREVIEW_HTML}
       <p class="error" id="error"></p>
       <button id="continue" class="big" disabled>${create ? "Continue" : "Import"}</button>
       ${create ? "" : '<button id="skip-search" class="ghost" hidden>Skip the Search: Import on Address #0</button>'}
@@ -495,9 +640,7 @@ function showPassphraseEntry(flow) {
     flow.typed = { pp: pp.value, pp2: pp2?.value || "" };
     showPassphraseExplainer(flow, () => showPassphraseEntry(flow));
   };
-  // The import's search for the address holding funds: Import waits for it, or it would import onto
-  // #0 while the funds sit on another address. Held from the first keystroke, not only once the
-  // lookup starts (KaPay iOS 0799cec).
+  // Import waits for the search, or it would import onto #0 while the funds sit somewhere else.
   let searching = false;
   let busy = false;
   const paintContinue = () => {
@@ -509,7 +652,6 @@ function showPassphraseEntry(flow) {
     const skip = $("#skip-search");
     if (skip) skip.hidden = !waiting || busy;
   };
-  const setSearching = (on) => { searching = on; paintContinue(); };
   let revealed = false;
   $("#eye").onclick = () => {
     revealed = !revealed;
@@ -517,109 +659,18 @@ function showPassphraseEntry(flow) {
     $("#eye").innerHTML = revealed ? ICONS.eyeSlash : ICONS.eye;
     $("#eye").setAttribute("aria-label", revealed ? "Hide passphrase" : "Show passphrase");
   };
-  const showBalance = (balanceSompi) => {
-    const holds = balanceSompi > 0n;
-    $("#preview-balance").innerHTML = `<span class="strong small ${holds ? "good-text" : ""}">${esc(wallet.formatKas(balanceSompi, 8))} KAS</span>`;
-    if (create) return;
-    const hint = $("#preview-hint");
-    hint.hidden = false;
-    hint.className = `small ${holds ? "good-text" : "warn-text"}`;
-    hint.textContent = holds
-      ? "This address holds funds, so this looks like the right account."
-      : "No funds on this address. If you expected funds here, check your passphrase.";
-  };
-  const showFound = (found) => {
-    const list = $("#preview-found");
-    if (!found || found.length < 2) { list.innerHTML = ""; return; }
-    list.innerHTML = `
-      <p class="muted small found-lead">We picked the first address with funds. Tap another if that's not the one you use.</p>
-      ${found.map((entry) => `
-        <button type="button" class="found-row" data-found="${entry.index}">
-          <span class="found-mark">${flow.chattingIndex === entry.index ? ICONS.circleCheck : ICONS.circle}</span>
-          <span class="found-text"><span class="small strong">Address #${entry.index}</span><span class="mono tiny muted">${esc(`${entry.address.slice(0, 14)}...${entry.address.slice(-6)}`)}</span></span>
-          <span class="small strong ${entry.balanceSompi > 0n ? "good-text" : "muted"}">${esc(wallet.formatKas(entry.balanceSompi, 8))} KAS</span>
-        </button>`).join("")}`;
-    for (const row of list.querySelectorAll("[data-found]")) {
-      row.onclick = () => select(found, found.find((entry) => entry.index === Number(row.dataset.found)));
-    }
-  };
-  const select = (found, entry) => {
-    flow.chattingIndex = entry.index;
-    $("#preview").textContent = entry.address;
-    showBalance(entry.balanceSompi);
-    showFound(found);
-  };
-  // Address #0 for the passphrase as typed, on a short debounce (the derivation is PBKDF2), then a
-  // further pause, so only the passphrase someone stopped typing is looked up.
-  let previewTimer = null;
-  let previewSeq = 0;
-  let searchTimer = null;
-  /** The funds search failed or ran out of time: Import goes to #0, and the screen says so. */
-  const searchIncomplete = () => {
-    const box = $("#preview-incomplete");
-    if (!box) return;
-    box.innerHTML = `
-      <p class="small warn-text">The search for funds on this account's other addresses didn't finish, so Import uses address #0.</p>
-      <button type="button" class="link-button small" id="search-again">Search Again</button>`;
-    $("#search-again").onclick = () => schedulePreview();
-  };
-  const schedulePreview = () => {
-    clearTimeout(previewTimer);
-    clearTimeout(searchTimer);
-    $("#preview-incomplete").innerHTML = "";
-    const typed = pp.value;
-    flow.chattingIndex = 0;
-    $("#preview-note").textContent = typed
-      ? "A different passphrase gives a different address, and a different account."
-      : "This is the account your 12 or 24 words open on their own.";
-    $("#preview-balance").innerHTML = '<span class="spinner small-spin"></span>';
-    $("#preview-hint").hidden = true;
-    $("#preview-found").innerHTML = "";
-    if (!create) setSearching(true);
-    const seq = ++previewSeq;
-    previewTimer = setTimeout(async () => {
-      const address = await wallet.previewMainAddress(flow.phrase, typed, flow.family);
-      if (seq !== previewSeq || !$("#preview")) return;
-      $("#preview").textContent = address || "Checking...";
-      const failed = () => { setSearching(false); $("#preview-balance").innerHTML = '<span class="muted small">Couldn\'t check</span>'; };
-      if (!address) return failed();
-      await new Promise((resolve) => setTimeout(resolve, 450));
-      if (seq !== previewSeq) return;
-      if (!create) {
-        // A slow or unreachable node lets Import go after the timeout, onto #0, and says so.
-        searchTimer = setTimeout(() => {
-          if (seq !== previewSeq || !$("#preview")) return;
-          previewSeq += 1; // the answer that comes later is ignored
-          failed();
-          searchIncomplete();
-        }, PASSPHRASE_SEARCH_TIMEOUT_MS);
-        const found = await wallet.findChattingAddresses(flow.phrase, typed, flow.family);
-        clearTimeout(searchTimer);
-        if (seq !== previewSeq || !$("#preview")) return;
-        const first = found?.find((entry) => entry.balanceSompi > 0n) || found?.[0];
-        if (!first) { failed(); searchIncomplete(); return; }
-        select(found, first);
-        setSearching(false);
-        return;
-      }
-      let balances = null;
-      try { balances = await wallet.balancesFor([address]); } catch { balances = null; }
-      if (seq !== previewSeq || !$("#preview")) return;
-      if (balances) showBalance(balances[address] ?? 0n); else failed();
-    }, 250);
-  };
-  pp.oninput = () => { schedulePreview(); paintContinue(); };
-  schedulePreview();
+  const preview = mountAddressPreview({ flow, typed: () => pp.value, onSearching: (on) => { searching = on; paintContinue(); } });
+  pp.oninput = () => { preview.schedule(); paintContinue(); };
   paintContinue();
-  /** `skippingSearch`: Import on address #0 without waiting for the funds search. */
+  /** `skippingSearch`: Import on Standard #0 without waiting for the search. */
   const proceed = (skippingSearch = false) => {
     if (!create && searching && !skippingSearch) return;
     const error = $("#error");
     error.textContent = "";
     if (!pp.value) { error.textContent = "Enter a passphrase, or go back and choose No."; return; }
     if (create && pp.value !== pp2.value) { error.textContent = "The passphrases do not match. Please re-enter them."; return; }
-    // the import reads the address now: a search answer after this only redraws the preview
-    if (skippingSearch) { flow.chattingIndex = 0; searching = false; }
+    // the import reads the choice now: a search answer after this only redraws the box
+    if (skippingSearch) { flow.choice = { ...DEFAULT_IMPORT_CHOICE }; searching = false; }
     flow.typed = null;
     // nothing changes the account once it is being made (KaPay iOS 0799cec)
     busy = true;
@@ -636,6 +687,49 @@ function showPassphraseEntry(flow) {
   $("#continue").onclick = () => proceed(false);
   const skipSearch = $("#skip-search");
   if (skipSearch) skipSearch.onclick = () => proceed(true);
+}
+
+/** Import with no passphrase (KaPay iOS 018e634 PassphraseOptionView's found step): the account the
+ *  words were found in, and Import onto it; Skip the Search imports on Standard #0. */
+function showImportFound(flow) {
+  render(`
+    ${navHeader({ title: "Import Account" })}
+    <section class="screen passphrase-entry">
+      <h2>Your Account</h2>
+      <p class="muted">KaPay checks your words against every kind of Kaspa wallet, so you don't need to know which one they came from.</p>
+      ${ADDRESS_PREVIEW_HTML}
+      <p class="error" id="error"></p>
+      <button id="continue" class="big" disabled>Import</button>
+      <button id="skip-search" class="ghost" hidden>Skip the Search: Import on Address #0</button>
+    </section>`, "passphrase");
+  $("#back").onclick = () => showPassphraseQuestion(flow);
+  let searching = true;
+  let busy = false;
+  const paintContinue = () => {
+    const button = $("#continue");
+    if (!button) return;
+    button.disabled = busy || searching;
+    button.innerHTML = searching && !busy ? '<span class="spinner"></span><span>Finding your address...</span>' : "Import";
+    $("#skip-search").hidden = !searching || busy;
+  };
+  mountAddressPreview({ flow, typed: () => "", onSearching: (on) => { searching = on; paintContinue(); } });
+  paintContinue();
+  const proceed = (skippingSearch) => {
+    if (busy || (searching && !skippingSearch)) return;
+    if (skippingSearch) { flow.choice = { ...DEFAULT_IMPORT_CHOICE }; searching = false; }
+    busy = true;
+    const buttons = [$("#continue"), $("#skip-search"), $("#back")].filter(Boolean);
+    for (const button of buttons) button.disabled = true;
+    paintContinue();
+    Promise.resolve(flow.onProceed("")).finally(() => {
+      busy = false;
+      if (!$("#skip-search")) return;
+      for (const button of buttons) button.disabled = false;
+      paintContinue();
+    });
+  };
+  $("#continue").onclick = () => proceed(false);
+  $("#skip-search").onclick = () => proceed(true);
 }
 
 /** Back returns to the screen it was opened from: the question, or the entry screen, which links it
@@ -659,37 +753,9 @@ function showPassphraseExplainer(flow, onBack) {
   $("#back").onclick = onBack;
 }
 
-// --- import account: iOS ImportSourceWalletView -> ImportWalletView -> PassphraseOptionView ---
-
-// Where the phrase came from decides the chatting address's derivation path. Same list, order,
-// names and paths as iOS; KaChat (standard) is the default.
-const SOURCE_ICONS = {
-  bubbles: '<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.5A2.5 2.5 0 0 1 5.5 3h8A2.5 2.5 0 0 1 16 5.5v5a2.5 2.5 0 0 1-2.5 2.5H8l-3.5 3V13A2.5 2.5 0 0 1 3 10.5z" fill="currentColor"/><path d="M18 8h.5A2.5 2.5 0 0 1 21 10.5v5a2.5 2.5 0 0 1-1.5 2.3V21l-3.2-2.5H11A2.5 2.5 0 0 1 8.6 16" fill="currentColor" opacity=".75"/></svg>',
-  puzzle: '<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3a2 2 0 0 1 2 2v1h4a1 1 0 0 1 1 1v4h1a2 2 0 1 1 0 4h-1v4a1 1 0 0 1-1 1h-4v-1a2 2 0 1 0-4 0v1H3v-6h1a2 2 0 1 0 0-4H3V7a1 1 0 0 1 1-1h3V5a2 2 0 0 1 2-2z" fill="currentColor"/></svg>',
-  phone: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10.5 18.5h3" stroke-linecap="round"/></svg>',
-  shield: '<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l8 3v6c0 5-3.4 9.3-8 11-4.6-1.7-8-6-8-11V5l8-3z" fill="currentColor"/></svg>',
-  desktop: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="2.5" y="3.5" width="19" height="13" rx="2"/><path d="M8 21h8M12 16.5V21"/></svg>',
-  terminal: '<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="3.5" width="20" height="17" rx="3" fill="currentColor"/><path d="M6.5 9l3 3-3 3M11.5 15.5h5" fill="none" stroke="var(--bg)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-  grid: '<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="2" fill="currentColor"/><rect x="13" y="3" width="8" height="8" rx="2" fill="currentColor"/><rect x="3" y="13" width="8" height="8" rx="2" fill="currentColor"/><rect x="13" y="13" width="8" height="8" rx="2" fill="currentColor"/></svg>',
-  key: '<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><circle cx="7.5" cy="15.5" r="5" fill="currentColor"/><circle cx="7.5" cy="15.5" r="1.8" fill="var(--bg)"/><path d="M11 12L20.5 2.5M16 7l3 3M18.3 4.7l2.2 2.2" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>',
-  drive: '<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 4h13l3 9v5a2 2 0 0 1-2 2h-15a2 2 0 0 1-2-2v-5z" fill="currentColor"/><path d="M2.5 13h19" stroke="var(--bg)" stroke-width="1.5"/><circle cx="17.5" cy="16.5" r="1.2" fill="var(--bg)"/></svg>',
-};
-const IMPORT_SOURCES = [
-  { id: "kachat", name: "KaChat", icon: "bubbles", family: "kaspaStandard", isDefault: true },
-  { id: "kasware", name: "KasWare Wallet", icon: "puzzle", family: "kaspaStandard" },
-  { id: "kaspium", name: "Kaspium Wallet", icon: "phone", family: "kaspaStandard" },
-  { id: "kastle", name: "Kastle Wallet", icon: "shield", family: "kaspaStandard" },
-  { id: "kdx", name: "KDX Wallet", icon: "desktop", family: "kaspaLegacy972" },
-  { id: "cli", name: "Core Golang Cli Wallet", icon: "terminal", family: "kaspaStandard" },
-  { id: "okx", name: "OKX Wallet", icon: "grid", family: "kaspaStandard" },
-  { id: "onekey", name: "OneKey Wallet", icon: "key", family: "oneKey" },
-  { id: "ledger", name: "Ledger Wallet", icon: "drive", family: "kaspaStandard" },
-];
-const FAMILY_PATHS = {
-  kaspaStandard: "m/44'/111111'/0'",
-  kaspaLegacy972: "m/44'/972/0'",
-  oneKey: "m/44'/111111'/0' (OneKey)",
-};
+// --- import account: iOS ImportNameStep -> ImportLengthStep -> ImportWalletView -> PassphraseOptionView ---
+// No "Where are your 12 or 24 words from?" list (KaPay iOS 018e634): the passphrase step finds the
+// wallet type from the words (mountAddressPreview).
 
 let importDraft = null;
 
@@ -702,51 +768,13 @@ export function clearImportDraft() {
 function freshImportDraft() {
   // As with Create Account, nothing is preset: no name and no word count until one is chosen
   // (pasting a phrase picks the count for you).
-  return { sourceId: "kachat", family: "kaspaStandard", name: "", wordCount: null, words: Array(24).fill(""), active: 0 };
+  return { name: "", wordCount: null, words: Array(24).fill(""), active: 0 };
 }
 
-function showImportSource() {
-  if (!importDraft) importDraft = freshImportDraft();
-  const d = importDraft;
-  render(`
-    ${navHeader({ title: "Import Account" })}
-    <section class="screen import-source">
-      <div class="source-head">
-        <span class="source-head-icon">${ICONS.wallet}</span>
-        <h2>Where are your 12 or 24 words from?</h2>
-        <p class="muted">Different wallets store your Kaspa on different address paths. Pick where these words come from so KaPay finds your funds and domains.</p>
-      </div>
-      <div class="source-list" role="radiogroup" aria-label="Wallet">
-        ${IMPORT_SOURCES.map((source) => `
-          <button class="source-row" role="radio" data-source="${source.id}" aria-checked="${d.sourceId === source.id}">
-            <span class="source-radio">${d.sourceId === source.id ? ICONS.circleCheck : ICONS.circle}</span>
-            <span class="source-icon">${SOURCE_ICONS[source.icon]}</span>
-            <span class="source-text">
-              <span class="source-name">${esc(source.name)}${source.isDefault ? '<span class="source-default">Default</span>' : ""}</span>
-              <span class="source-path">${esc(FAMILY_PATHS[source.family])}</span>
-            </span>
-          </button>`).join("")}
-      </div>
-      <button id="continue" class="with-icon">${ICONS.arrowRightCircle}<span>Continue</span></button>
-    </section>`, "import");
-  $("#back").onclick = () => { importDraft = null; showWelcome(); };
-  for (const row of app.querySelectorAll("[data-source]")) {
-    row.onclick = () => {
-      const source = IMPORT_SOURCES.find((s) => s.id === row.dataset.source);
-      d.sourceId = source.id;
-      d.family = source.family;
-      const scroll = app.querySelector(".source-list")?.scrollTop || 0;
-      showImportSource();
-      const list = app.querySelector(".source-list");
-      if (list) list.scrollTop = scroll;
-    };
-  }
-  $("#continue").onclick = showImportName;
-}
-
-/** Import Account, step 2 (iOS dd0aab1 ImportNameStep): the same name screen as Create Account. */
+/** Import Account's first screen (iOS ImportNameStep): the same name screen as Create Account. */
 function showImportName() {
-  showAccountName({ title: "Import Account", draft: importDraft, onBack: showImportSource, onNext: showImportLength });
+  if (!importDraft) importDraft = freshImportDraft();
+  showAccountName({ title: "Import Account", draft: importDraft, onBack: () => { clearImportDraft(); showWelcome(); }, onNext: showImportLength });
 }
 
 /** Import Account, step 3 (iOS ImportLengthStep): how many words the phrase being imported has. */
@@ -940,10 +968,11 @@ function showImportWords() {
       button.disabled = false;
       return;
     }
-    const flow = { mode: "import", phrase, family: d.family, chattingIndex: 0, onBack: showImportWords, onProceed: null };
+    const flow = { mode: "import", phrase, choice: { ...DEFAULT_IMPORT_CHOICE }, onBack: showImportWords, onProceed: null };
     flow.onProceed = (passphrase) => finishAccount(
-      // the address the passphrase step found or was told (KaPay iOS 4f5dfd2); No is address #0
-      { mnemonic: phrase, passphrase, family: d.family, name: d.name.trim(), imported: true, identityIndex: passphrase ? flow.chattingIndex : 0 },
+      // the wallet type and address the passphrase step found or was told, with a passphrase or
+      // without (KaPay iOS 018e634: no longer always #0 without one)
+      { mnemonic: phrase, passphrase, family: flow.choice.family, name: d.name.trim(), imported: true, identityIndex: flow.choice.index },
       () => showPassphraseQuestion(flow),
       "Import Account",
     );

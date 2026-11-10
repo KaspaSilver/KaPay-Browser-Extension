@@ -29,7 +29,7 @@ KaPay brings the wallet from the KaPay and KaChat apps to your browser. Your 12 
 the same addresses as KaPay on iPhone and KaChat on iPhone, Android and desktop.
 
 - Create a new account in one tap, or import one from KaChat, KasWare, Kaspium, Kastle, KDX, OKX,
-  OneKey, Ledger or the Kaspa CLI wallet
+  OneKey, Ledger or the Kaspa CLI wallet: KaPay finds which kind from your words
 - Back up your 12 or 24 words step by step, with a check that your paper copy is right, and a
   Backup Hygiene check every six months
 - Send Kaspa step by step: a keypad for the amount, .kas and .kachat name lookup, Max, coin

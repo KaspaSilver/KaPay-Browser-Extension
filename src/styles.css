@@ -478,21 +478,13 @@ textarea.recipient { background: transparent; border: 0; border-radius: 0; min-h
 @keyframes fade { from { opacity: 0; } }
 @keyframes rise { from { transform: translateY(40px); } }
 
-/* --- Import: ImportSourceWalletView / ImportWalletView ------------------------------------------ */
+/* --- Import: ImportWalletView ------------------------------------------------------------------ */
+/* a centered head and a radio mark, used by Manage and the approval screen's pickers */
 .source-head { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 6px; }
 .source-head h2 { margin: 4px 0 0; font-size: 19px; }
 .source-head p { margin: 0; font-size: 13px; }
 .source-head-icon { color: var(--kaspa); }
-.source-list { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; flex: 1; min-height: 0; }
-.source-row { display: flex; align-items: center; gap: 10px; padding: 11px 12px; border-radius: 12px; background: rgba(44,44,46,.72); border: .8px solid rgba(255,255,255,.18); color: var(--text); text-align: left; font-weight: 400; flex-shrink: 0; }
-.source-row[aria-checked="true"] { border: 1.2px solid rgba(112,199,186,.6); }
 .source-radio { display: inline-flex; color: var(--muted); }
-.source-icon { color: var(--kaspa); width: 24px; display: inline-flex; justify-content: center; }
-.source-text { display: flex; flex-direction: column; gap: 2px; }
-.source-name { font-weight: 600; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
-.source-default { font-size: 10px; font-weight: 800; color: var(--kaspa); }
-.source-path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--muted); }
-.screen.import-source { gap: 14px; }
 .screen.import-words { gap: 12px; }
 .words-head { display: flex; align-items: center; gap: 8px; font-size: 14px; }
 .words-head > span:first-child { flex: 1; }

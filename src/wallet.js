@@ -15,7 +15,7 @@ import {
   deriveSpendingAddressRange,
   deriveIdentityAddressRange,
 } from "../shared/engine/wallet.js";
-import { IMPORT_ADDRESS_SEARCH_DEPTH, foundChattingAddresses } from "../shared/ui/account-import.js";
+import { IMPORT_WALLET_TYPES, rankImportCandidates } from "./import-search.js";
 import {
   QUANTUM_INDEX_BASE, QUANTUM_SCAN_FLOOR, KIP22_SIGNATURE_SCRIPT_SIZE, isQuantumIndex, chainLocalIndex, spendingIndexTitle,
   spendingStateFromRecord, spendingRecordFromState, revealedSpendingIndices, nextFreshQuantumIndex, spendingChangeIndex,
@@ -1764,22 +1764,64 @@ export function discardDomainTransfer(assetId) {
 // --- Chatting address picker (iOS ChattingAddressPickerView) ---------------------------------
 
 /**
- * For an import's passphrase step, before there's an account (KaPay iOS 4f5dfd2
- * WalletManager.findChattingAddresses): address #0 plus every other address among the first
- * IMPORT_ADDRESS_SEARCH_DEPTH of the identity chain holding funds, in index order, each with its
- * balance (`sompi` a Number for the rules, `balanceSompi` the exact BigInt). Null when the words
- * are invalid or the balances couldn't be checked.
+ * Import's search, before there's an account (KaPay iOS 018e634 WalletManager.findImportAccounts):
+ * every wallet type's addresses (import-search.js IMPORT_WALLET_TYPES) in one balance read, plus a
+ * history probe of each type's #0. -> the addresses with funds or history, likeliest first
+ * (rankImportCandidates); empty when nothing has any activity; null when the words are invalid or
+ * the balances couldn't be read.
  */
-export async function findChattingAddresses(phrase, passphrase = "", family = "kaspaStandard") {
+export async function findImportAccounts(phrase, passphrase = "") {
   try {
-    const derived = await deriveIdentityAddressRange(await kaspa(), phrase, String(passphrase || "").normalize("NFKD"), { family, start: 0, count: IMPORT_ADDRESS_SEARCH_DEPTH });
-    if (!derived.length) return null;
-    const balancesByAddress = await balancesFor(derived.map((d) => d.address));
-    const found = foundChattingAddresses(derived, new Map(Object.entries(balancesByAddress).map(([address, sompi]) => [address, Number(sompi)])));
-    return found.map((entry) => ({ ...entry, balanceSompi: balancesByAddress[entry.address] ?? 0n }));
+    const candidates = await importCandidates(phrase, passphrase, (type) => type.depth);
+    if (!candidates.length) return null;
+    const [balances, withHistory] = await Promise.all([
+      balancesFor(candidates.map((c) => c.address)).catch(() => null),
+      addressesWithHistory(candidates.filter((c) => c.index === 0).map((c) => c.address)),
+    ]);
+    if (!balances) return null;
+    return rankImportCandidates(candidates, balances, withHistory);
   } catch {
     return null;
   }
+}
+
+/** Address #0 of every wallet type these words could be: the rows "See Every Wallet Type" offers.
+ *  Needs no network. */
+export async function importAddressesAtZero(phrase, passphrase = "") {
+  try {
+    const rows = await importCandidates(phrase, passphrase, () => 1);
+    return rows.map((row) => ({ ...row, balanceSompi: 0n, hasHistory: false }));
+  } catch {
+    return [];
+  }
+}
+
+async function importCandidates(phrase, passphrase, countOf) {
+  const k = await kaspa();
+  // NFKD, as the account will be stored and as iOS derives it (audit EXT-010)
+  const normalized = String(passphrase || "").normalize("NFKD");
+  const candidates = [];
+  for (const type of IMPORT_WALLET_TYPES) {
+    const derived = await deriveIdentityAddressRange(k, phrase, normalized, { family: type.family, start: 0, count: countOf(type) });
+    for (const { index, address } of derived) candidates.push({ family: type.family, index, address });
+  }
+  return candidates;
+}
+
+/** The addresses with at least one transaction (REST transactions-count, 8 s each). Nothing is
+ *  remembered - there's no account yet - and a failed probe counts as no history: this only ranks
+ *  what import shows first, and every wallet type stays one tap away. */
+async function addressesWithHistory(addresses) {
+  const answers = await Promise.all(addresses.map(async (address) => {
+    try {
+      const response = await fetch(`${restBase()}/addresses/${encodeURIComponent(address)}/transactions-count`, { cache: "no-store", signal: AbortSignal.timeout(8000) });
+      if (!response.ok) return null;
+      return Number((await response.json())?.total ?? 0) > 0 ? address : null;
+    } catch {
+      return null;
+    }
+  }));
+  return new Set(answers.filter(Boolean));
 }
 
 /**
