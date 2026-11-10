@@ -28,7 +28,7 @@ import { forgetAccount as forgetBell } from "./bell.js";
 import { forgetKachatSigner } from "./kachat-names.js";
 import { reencodeAddress } from "./net.js";
 import { accountDataKeys, withoutAccount } from "./account-scope.js";
-import { DEFAULT_IMPORT_CHOICE, candidateId, sameChoice, visibleImportRows, walletTypeName } from "./import-search.js";
+import { DEFAULT_IMPORT_CHOICE, candidateId, sameChoice, visibleImportRows, walletTypeName, importFundsHint } from "./import-search.js";
 
 let goHome = () => {};
 let goSettings = () => {};
@@ -493,19 +493,11 @@ function mountAddressPreview({ flow, typed, onSearching = () => {} }) {
     el("preview-balance").innerHTML = `<span class="strong small ${holds ? "good-text" : ""}">${esc(wallet.formatKas(balanceSompi, 8))} KAS</span>`;
     if (!searches) return;
     const hint = el("preview-hint");
+    // iOS fundsHint, as KaChat-Desktop words it (shared/ui/account-import.js)
+    const { tone, text } = importFundsHint({ sompi: holds ? 1 : 0, hasHistory, passphrase: typed() });
     hint.hidden = false;
-    if (holds || hasHistory) {
-      hint.className = "small good-text";
-      hint.textContent = holds
-        ? "This address holds funds, so this looks like the right account."
-        : "This address has history, so this looks like the right account.";
-    } else if (!typed()) {
-      hint.className = "small muted";
-      hint.textContent = "No funds or history on this address.";
-    } else {
-      hint.className = "small warn-text";
-      hint.textContent = "No funds on this address. If you expected funds here, check your passphrase.";
-    }
+    hint.className = `small ${tone === "funds" ? "good-text" : tone === "warn" ? "warn-text" : "muted"}`;
+    hint.textContent = text;
   };
   const select = (row) => {
     if (!root?.isConnected) return;

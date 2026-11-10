@@ -14,6 +14,7 @@ import {
   deriveSpendingWallet,
   deriveSpendingAddressRange,
   deriveIdentityAddressRange,
+  sourceFamilySupportsIndexScan,
 } from "../shared/engine/wallet.js";
 import { IMPORT_WALLET_TYPES, rankImportCandidates } from "./import-search.js";
 import {
@@ -1827,12 +1828,16 @@ async function addressesWithHistory(addresses) {
 /**
  * Identity addresses `start..start+count-1` of the active account's family, each with its
  * balance and KNS domains. Listed when they hold something, are index 0, or are current.
+ * `scansFurther` false: a single-address wallet type (Chainge, KaChat-Desktop Build 277), whose
+ * only address is #0.
  */
 export async function scanIdentityAddresses(start = 0, count = 50) {
   const account = await activeAccountSecrets();
   const k = await kaspa();
+  const scansFurther = sourceFamilySupportsIndexScan(account.family);
   const rows = [];
   for (let index = start; index < start + count; index += 1) {
+    if (index > 0 && !scansFurther) break;
     const derived = await importMnemonicWithFamily(k, account.mnemonic, account.passphrase, { family: account.family, index });
     rows.push({ index, address: derived.address });
   }
@@ -1857,7 +1862,7 @@ export async function scanIdentityAddresses(start = 0, count = 50) {
     row.balanceSompi = balancesByAddress[row.address] ?? 0n;
     row.otherNames = otherNames[row.address] || [];
   }
-  return { rows, currentIndex: account.identityIndex || 0 };
+  return { rows, currentIndex: account.identityIndex || 0, scansFurther };
 }
 
 // --- Website connect --------------------------------------------------------------------------

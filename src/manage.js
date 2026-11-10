@@ -988,7 +988,7 @@ function showVisibility({ onBack }) {
 // Kaspa or domains, or is #0, or is the current one.
 
 function showChattingAddressPicker({ onBack, onChanged }) {
-  const state = { rows: [], scanned: 0, scanning: false, current: 0, error: "" };
+  const state = { rows: [], scanned: 0, scanning: false, current: 0, error: "", scansFurther: true };
   const pickerBack = () => { state.scanning = false; paint(); };
 
   const scan = async () => {
@@ -996,8 +996,9 @@ function showChattingAddressPicker({ onBack, onChanged }) {
     state.error = "";
     paint();
     try {
-      const { rows, currentIndex } = await wallet.scanIdentityAddresses(state.scanned, 50);
+      const { rows, currentIndex, scansFurther } = await wallet.scanIdentityAddresses(state.scanned, 50);
       state.current = currentIndex;
+      state.scansFurther = scansFurther !== false;
       state.rows.push(...rows);
       state.scanned += 50;
     } catch {
@@ -1030,8 +1031,11 @@ function showChattingAddressPicker({ onBack, onChanged }) {
         </div>
         ${state.error ? `<p class="error">${esc(state.error)}</p>` : ""}
         ${state.scanning
-          ? `<p class="muted small center-text"><span class="spinner small-spin"></span> Scanning addresses ${state.scanned + 1} to ${state.scanned + 50}...</p>`
-          : state.scanned ? `<p class="muted small center-text">Scanned the first ${state.scanned} addresses.</p><button class="soft with-icon" id="further">${ICONS.search}<span>Scan Further</span></button>` : ""}
+          ? `<p class="muted small center-text"><span class="spinner small-spin"></span> ${state.scansFurther ? `Scanning addresses ${state.scanned + 1} to ${state.scanned + 50}...` : "Checking this wallet's address..."}</p>`
+          // a single-address wallet type (Chainge) has nothing further to scan (KaChat-Desktop Build 277)
+          : !state.scanned ? ""
+          : !state.scansFurther ? '<p class="muted small center-text">This wallet type has a single address, so there is nothing further to scan.</p>'
+          : `<p class="muted small center-text">Scanned the first ${state.scanned} addresses.</p><button class="soft with-icon" id="further">${ICONS.search}<span>Scan Further</span></button>`}
       </section>`, "identity-picker");
     $("#back").onclick = onBack;
     const further = $("#further");
