@@ -12,7 +12,17 @@ import { kachatRegistry } from "./kachat-names.js";
 import { KachatNamesRegistry } from "../shared/engine/kachat-names/registry.js";
 
 const SERVICES = [["kachat", ".kachat"], ["k", ".k"], ["kaspa", ".kaspa"], ["kas", ".kas"]];
-const cache = new Map(); // address -> { lists: { tld: names[] | null }, loading, open }
+const cache = new Map(); // address -> { lists: { tld: names[] | null }, loading, open, loadedAt }
+// Counts older than this are looked up again the next time the tab is shown (audit 2026-11-13).
+const FRESH_MS = 2 * 60_000;
+// Set once a domain has left this wallet: lookups skip the KNS answer cached before it moved.
+let knsChanged = false;
+
+/** A domain was sent or transferred: every address's counts are looked up again. */
+export function forgetAddressDomains() {
+  cache.clear();
+  knsChanged = true;
+}
 
 const GLOBE = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M2.5 12h19M12 2.5c2.6 2.8 3.9 6 3.9 9.5S14.6 18.7 12 21.5M12 2.5C9.4 5.3 8.1 8.5 8.1 12s1.3 6.7 3.9 9.5"/></svg>';
 
@@ -29,7 +39,7 @@ function load(address, entry, repaint) {
       return (await reg.heldNames(owner)).map((n) => n.display);
     } catch { return null; }
   })();
-  const kas = wallet.domains(address).then((d) => (d.domains || []).map((x) => x.fullName || x.name).filter(Boolean)).catch(() => null);
+  const kas = wallet.domains(address, { force: knsChanged }).then((d) => (d.domains || []).map((x) => x.fullName || x.name).filter(Boolean)).catch(() => null);
   const others = ownedNamesByService(address).catch(() => ({ k: null, kaspa: null }));
   Promise.all([kachat, kas, others]).then(([kachatNames, kasNames, o]) => {
     entry.lists = {
@@ -39,7 +49,9 @@ function load(address, entry, repaint) {
       kaspa: o.kaspa == null ? null : o.kaspa.map((n) => n.display || n.name),
     };
     entry.loading = false;
-    repaint();
+    entry.loadedAt = Date.now();
+    // a forget meanwhile: this answer is from before it, and isn't kept
+    if (cache.get(address) === entry) repaint();
   });
 }
 
@@ -47,7 +59,7 @@ function load(address, entry, repaint) {
 export function addressDomainsTab({ address, repaint }) {
   const entry = cache.get(address) || { lists: null, loading: false, open: null };
   cache.set(address, entry);
-  if (!entry.lists) load(address, entry, repaint);
+  if (!entry.lists || (!entry.loading && Date.now() - (entry.loadedAt || 0) > FRESH_MS)) load(address, entry, repaint);
   let kachatTab = null;
 
   let html;

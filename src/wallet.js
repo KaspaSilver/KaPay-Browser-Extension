@@ -40,9 +40,11 @@ import { IS_TESTNET, NETWORK as ACTIVE_NETWORK, NETWORK_ID, ADDRESS_PREFIX, KAS_
 import { activeAccountSecrets, accountSecretsById, ACCOUNT_IDS_KEY } from "./vault.js";
 import { sompiFromUserText } from "./amounts.js";
 import { sourceChangedError, SOURCE_CHANGED, revealsToRetry, commitIsLive } from "./send-guards.js";
+import { shownAccount, SWITCHED_ELSEWHERE } from "./account-scope.js";
 import {
   HELD_COINS_MESSAGE, liveHolds, mergeHolds, holdSpentCoins, heldKeys, heldCountAt, nextHoldExpiry, withoutHeldCoins,
   heldCoinsError, maxCoinKeys, watchedSend, CHAINED_CHANGE, recordBuiltInputs, transactionInputKeys, pricingChangeAtFreshSlot,
+  submittingAsLost,
 } from "./send-coins.js";
 import { logInfo, logWarn } from "./log.js";
 
@@ -166,10 +168,25 @@ async function accountStillExists(accountId) {
   return !Array.isArray(ids) || ids.includes(accountId);
 }
 
+// Every window writes an account's spending state in turn, through one Web Lock (audit 2026-11-13),
+// and the chains' ends never move back: a patch worked out from an older read (another window
+// revealed a change address meanwhile) can't drop the newer addresses out of the list.
+function withSpendingLock(accountId, fn) {
+  const locks = globalThis.navigator?.locks;
+  return locks?.request ? locks.request(`kapay-spending-${accountId}`, fn) : fn();
+}
+
 export async function saveSpendingState(accountId, patch) {
+  return withSpendingLock(accountId, () => writeSpendingState(accountId, patch));
+}
+
+async function writeSpendingState(accountId, patch) {
   if (!(await accountStillExists(accountId))) return spendingState(accountId);
   const previous = (await getLocal(spendingStateKey(accountId))) || {};
-  const next = { ...(await spendingState(accountId)), ...patch };
+  const current = await spendingState(accountId);
+  const next = { ...current, ...patch };
+  next.maxIndex = Math.max(Number(next.maxIndex) || 0, Number(current.maxIndex) || 0);
+  next.qMaxIndex = Math.max(Number(next.qMaxIndex) || 0, Number(current.qMaxIndex) || 0);
   // a revealed index widens its own chain's bound only: a quantum one never the legacy chain
   for (const index of [next.receiveIndex, next.activeIndex]) {
     if (!Number.isInteger(index)) continue;
@@ -598,9 +615,15 @@ async function holdCoins(keys, address) {
   spentCoins = holdSpentCoins(spentCoins, keys, address);
   pushHolds();
   try {
-    spentCoins = mergeHolds(spentCoins, await getSession(SPENT_COINS_KEY));
-    pushHolds();
-    await setSession(SPENT_COINS_KEY, spentCoins);
+    // read, merged and written back in turn with every other window (audit 2026-11-13): two sends
+    // at once in two windows can't each write over the other's holds
+    const update = async () => {
+      spentCoins = mergeHolds(spentCoins, await getSession(SPENT_COINS_KEY));
+      pushHolds();
+      await setSession(SPENT_COINS_KEY, spentCoins);
+    };
+    const locks = globalThis.navigator?.locks;
+    await (locks?.request ? locks.request("kapay-coin-holds", update) : update());
   } catch (error) {
     logWarn("[KaPay] couldn't keep a send's coins for other windows:", error);
   }
@@ -1121,6 +1144,19 @@ export async function knownUsedState(address) {
   return sessionUnused.has(address) ? false : null;
 }
 
+/** A deleted account's addresses leave the "used" lists of both networks, except `keep` (addresses
+ *  another account still lists: the same words saved twice share them). */
+export async function forgetUsedAddresses(addresses, keep = []) {
+  const kept = new Set(keep.filter(Boolean).map((a) => String(a).toLowerCase()));
+  const gone = new Set(addresses.filter(Boolean).map((a) => String(a).toLowerCase()).filter((a) => !kept.has(a)));
+  if (!gone.size) return;
+  for (const key of ["kachat.usedAddresses", "kachat.usedAddresses.testnet"]) {
+    const list = (await getLocal(key)) || [];
+    const left = list.filter((address) => !gone.has(String(address).toLowerCase()));
+    if (left.length !== list.length) await setLocal(key, left);
+  }
+}
+
 /** Every address remembered as used (for good). */
 export async function knownUsedAddresses() {
   return (await getLocal(USED_KEY)) || [];
@@ -1285,15 +1321,25 @@ async function activeState() {
   return { account, state: await spendingState(account.id) };
 }
 
+/** activeState for a change you make on a screen (rename, hide, primary, reveal): refused when
+ *  another window made a different account active since this one showed its own (audit
+ *  2026-11-13), so it never lands on an account you aren't looking at. */
+async function editableState() {
+  const got = await activeState();
+  const shownId = shownAccount().id;
+  if (shownId && got.account.id !== shownId) throw new Error(SWITCHED_ELSEWHERE);
+  return got;
+}
+
 /** Address Visibility's Hide All (iOS 245a5d2): every spending address hidden - the list starts
  *  over with only the chatting address. */
 export async function hideAllSpending() {
-  const { account, state } = await activeState();
+  const { account, state } = await editableState();
   return saveSpendingState(account.id, { hidden: revealedSpendingIndices(state) });
 }
 
 export async function setSpendingHidden(index, hidden, accountId = null) {
-  const { account, state } = accountId ? { account: { id: accountId }, state: await spendingState(accountId) } : await activeState();
+  const { account, state } = accountId ? { account: { id: accountId }, state: await spendingState(accountId) } : await editableState();
   // every address toggles both ways, funded ones too (iOS 245a5d2); totals count hidden ones
   const set = new Set(state.hidden);
   if (hidden) set.add(index); else set.delete(index);
@@ -1301,7 +1347,7 @@ export async function setSpendingHidden(index, hidden, accountId = null) {
 }
 
 export async function setSpendingLabel(index, label) {
-  const { account, state } = await activeState();
+  const { account, state } = await editableState();
   const labels = { ...state.labels };
   const clean = String(label || "").trim();
   if (clean) labels[index] = clean; else delete labels[index];
@@ -1309,7 +1355,7 @@ export async function setSpendingLabel(index, label) {
 }
 
 export async function setPrimarySpending(index) {
-  const { account, state } = await activeState();
+  const { account, state } = await editableState();
   const hidden = state.hidden.filter((i) => i !== index);
   return saveSpendingState(account.id, { activeIndex: index, ...boundPatchFor(index, state), hidden });
 }
@@ -1380,11 +1426,22 @@ export async function nextSwapPayoutAddress() {
   const index = state.maxIndex + 1;
   return { index, address: (await spendingAddressRange(index, 1, account))[index] };
 }
-/** Reserves the next legacy slot for a swap that was just created. -> { index, address } */
-export async function reserveSwapPayoutAddress() {
-  const { account, state } = await activeState();
+export const PAYOUT_CHANGED = "PAYOUT_CHANGED";
+
+/** Reserves the next legacy slot for a swap that was just created. -> { index, address }.
+ *  `shownAddress`: the payout the swap screen showed; when the next slot is another address now
+ *  (another window took that one, or switched accounts) nothing is reserved and PAYOUT_CHANGED is
+ *  thrown with the new one as `next` (audit 2026-11-13). */
+export async function reserveSwapPayoutAddress(shownAddress = null) {
+  const { account, state } = await editableState();
   const index = state.maxIndex + 1;
   const address = (await spendingAddressRange(index, 1, account))[index];
+  if (shownAddress && shownAddress !== address) {
+    const error = new Error("The receiving address changed in another KaPay window. Check the new one and try again.");
+    error.code = PAYOUT_CHANGED;
+    error.next = { index, address };
+    throw error;
+  }
   await saveSpendingState(account.id, { maxIndex: index });
   await cacheSpendingAddress(account.id, index, address);
   return { index, address };
@@ -1398,7 +1455,7 @@ export async function swapPayoutAddressAt(index) {
 /** Extends `index`'s own chain to it (Address Visibility past the end): the ones between are hidden.
  *  A quantum-safe index extends the quantum chain, never the legacy one. */
 export async function revealSpendingAddress(index) {
-  const { account, state } = await activeState();
+  const { account, state } = await editableState();
   const quantum = isQuantumIndex(index);
   const end = quantum ? QUANTUM_INDEX_BASE + state.qMaxIndex : state.maxIndex;
   if (index <= end) return setSpendingHidden(index, false);
@@ -1740,13 +1797,18 @@ export async function resumeDomainReveals() {
 /** Unfinished .kas transfers (commit sent, reveal not yet) of the active account on this network. */
 export async function pendingDomainTransfers() {
   const account = await activeAccountSecrets();
-  return (await listPendingKnsTransfers()).filter((r) => !r.source?.accountId || r.source.accountId === account.id);
+  // Kept when an account is deleted, on purpose: the commit holds 2 KAS only these words can reveal.
+  // So an account imported again (a new id) finds its own by the address that sent them.
+  const cache = await cachedAddresses(account.id);
+  const mine = new Set([cache?.main, ...Object.values(cache?.spending || {})].filter(Boolean));
+  return (await listPendingKnsTransfers()).filter((r) => !r.source?.accountId || r.source.accountId === account.id || mine.has(r.source?.address));
 }
 
 /** Finishes an unfinished transfer: reveals its commit with the key that sent it.
  *  -> { status: "revealed" | "already-transferred" | "no-commit", ... } */
 export async function finishDomainTransfer(record, onStatus = () => {}) {
-  await confirmSpend({ title: "Finish Transfer", amountText: String(record?.domainName || record?.name || "Domain transfer"), recipient: record?.toAddress || "" });
+  // the record's own fields (kns-write.js savePendingTransfer): the name being moved and who gets it
+  await confirmSpend({ title: "Finish Transfer", amountText: String(record?.domain || "Domain transfer"), recipient: record?.recipient || "" });
   const source = record.source?.kind === "spending" ? { kind: "spending", index: record.source.index } : { kind: "main" };
   const engine = await knsEngine(source);
   return resumeKnsTransfer({
@@ -1755,6 +1817,26 @@ export async function finishDomainTransfer(record, onStatus = () => {}) {
     onStatus,
     log: logInfo,
   });
+}
+
+/** A transfer's commit can't still be on its way after this long: by then it is on chain or gone. */
+export const COMMIT_SETTLE_MS = 10 * 60_000;
+
+/**
+ * Whether an unfinished transfer the engine found "no-commit" may be forgotten: its commit address
+ * read cleanly as empty (a failed read is never "empty"), and the record is old enough that a
+ * commit whose broadcast went unanswered ("commit-unknown") would be on chain by now. Forgetting
+ * one whose commit did land would leave its 2 KAS with no record to reveal them (audit 2026-11-13).
+ */
+export async function domainTransferForgettable(record, now = Date.now()) {
+  const since = Number(record?.updatedAt || record?.createdAt || 0);
+  if (!record?.commitAddress || !(now - since >= COMMIT_SETTLE_MS)) return false;
+  try {
+    const balances = await balancesFor([record.commitAddress]);
+    return (balances[record.commitAddress] ?? 0n) === 0n;
+  } catch {
+    return false;
+  }
 }
 
 /** Forgets an unfinished transfer whose commit was never found on chain. */
@@ -1915,7 +1997,9 @@ export async function ksptEngine() {
   return {
     kaspa: k,
     connect: () => connection(),
-    withRpc: (fn) => withRpc(fn),
+    // a broadcast whose socket drops reads as "may have gone through", never as failed (audit
+    // 2026-11-13): the same node wrapper Send's broadcasts use
+    withRpc: (fn) => withRpc((node) => fn(submittingAsLost(node))),
     // the coins a Cold Storage build may spend: not the ones its last broadcast (or a send) just
     // spent, which the node still lists (KaPay iOS 1652437 holds every node-pool submit's coins)
     balanceForAddress: async (address) => {
@@ -2063,7 +2147,8 @@ export function namesNodeMethods() {
       const spends = transactionInputKeys(transaction);
       const txid = await submitConfirmingAcceptance({
         withRpc,
-        submit: (node, { allowOrphan = false } = {}) => node.submitTransaction({ transaction, allowOrphan }),
+        // a socket that drops mid-submit is a lost answer, looked up before it fails (audit 2026-11-13)
+        submit: (node, { allowOrphan = false } = {}) => submittingAsLost(node).submitTransaction({ transaction, allowOrphan }),
         txid: localId,
         spends,
         label: "Transaction submit",

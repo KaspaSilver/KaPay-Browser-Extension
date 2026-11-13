@@ -26,12 +26,14 @@ export function approvalAnswer(entry, message) {
 /**
  * Whether the approval window may act (connect, sign, send) on request `entry` now: the worker
  * still holds it (a restarted worker has already told the site "KaPay is unavailable"), it isn't
- * answered, and KaPay is unlocked and signed in.
+ * answered, and KaPay is unlocked and signed in. `connected`: the site is still connected; a sign
+ * or send for a site removed in Settings while its window was open is refused (audit 2026-11-13).
  */
-export function claimDecision({ entry, unlocked, loggedOut }) {
+export function claimDecision({ entry, unlocked, loggedOut, connected = true }) {
   if (!entry || entry.done) return { ok: false, reason: "expired" };
   if (loggedOut) return { ok: false, reason: "signedOut" };
   if (!unlocked) return { ok: false, reason: "locked" };
+  if (entry.kind !== "connect" && !connected) return { ok: false, reason: "disconnected" };
   return { ok: true };
 }
 

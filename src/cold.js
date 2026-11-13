@@ -84,8 +84,11 @@ export async function coldWatchAddresses() {
   return out;
 }
 
-async function saveAccounts(accounts) {
-  const key = await storageKey();
+/** Writes the list back under the key it was read from (`key`, from loadAccounts' store), never one
+ *  worked out again: an account switched in another window meanwhile would otherwise get this
+ *  account's watch list (audit 2026-11-13). */
+async function saveAccounts(accounts, key) {
+  if (!key) throw new Error("Cold Storage list written without the account it was read for.");
   store = { key, accounts };
   await setLocal(key, accounts);
 }
@@ -97,21 +100,23 @@ async function getAccount(id) {
 /** Reads fresh, changes one account, writes back. Returns the changed account (or null). */
 async function updateAccount(id, change) {
   const accounts = await loadAccounts();
+  const { key } = store;
   const account = accounts.find((a) => a.id === id);
   if (!account) return null;
   change(account);
-  await saveAccounts(accounts);
+  await saveAccounts(accounts, key);
   return account;
 }
 
 /** iOS importAccount: a kpub already watched only takes the new name. */
 async function importAccount(kpub, label) {
   const accounts = await loadAccounts();
+  const { key } = store;
   const name = label.trim() || `Cold Storage ${accounts.length + 1}`;
   const existing = accounts.find((a) => a.kpub === kpub);
   if (existing) existing.label = name;
   else accounts.push(normalize({ id: crypto.randomUUID(), label: name, kpub, maxAddressIndex: 0, importedAt: Date.now() }));
-  await saveAccounts(accounts);
+  await saveAccounts(accounts, key);
 }
 
 function labelOf(account, index) {
@@ -738,7 +743,8 @@ function showAccount({ accountId, onBack }) {
       confirmLabel: "Remove",
       cancelLabel: "Cancel",
       onConfirm: async () => {
-        await saveAccounts((await loadAccounts()).filter((a) => a.id !== accountId));
+        const accounts = await loadAccounts();
+        await saveAccounts(accounts.filter((a) => a.id !== accountId), store.key);
         onBack();
       },
     });

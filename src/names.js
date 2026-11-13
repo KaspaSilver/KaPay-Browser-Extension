@@ -14,7 +14,7 @@
 // A typed name is resolved on every live service at once; the answer is the ending typed, else
 // the first in .kachat, .kas, .k, .kaspa that resolves, and the rest are offered as "Other domains".
 
-import { normalizeDomainLabel, resolveDomain } from "../shared/engine/kns.js";
+import { normalizeDomainLabel } from "../shared/engine/kns.js";
 import { getEndpoint } from "../shared/engine/endpoints.js";
 import { dotkCanonical, kaspaNamesCanonical } from "./names-normalize.js";
 import { esc, ICONS } from "./ui.js";
@@ -94,12 +94,14 @@ async function resolveKas(label) {
   const canonical = normalizeDomainLabel(label);
   if (!canonical) return null;
   const display = `${canonical}.kas`;
-  try {
-    const resolution = await resolveDomain(display, { baseUrl: knsBase() });
-    return { tld: "kas", display, address: resolution?.ownerAddress || null, failed: false };
-  } catch {
-    return { tld: "kas", display, address: null, failed: true };
-  }
+  // The owner lookup the engine's resolveDomain makes, read here so a lookup that failed (offline,
+  // a 5xx, a timeout) says "Couldn't look up .kas" instead of "No .kas domain found": the engine
+  // answers null for both (audit 2026-11-13). Only a 404, or an answer without an owner, is "none".
+  const outcome = await getJson(`${knsBase().replace(/\/+$/, "")}/${encodeURIComponent(display)}/owner`);
+  if (outcome.status === "failed") return { tld: "kas", display, address: null, failed: true };
+  const data = outcome.status === "found" && outcome.body?.success ? outcome.body.data : null;
+  const owner = data?.asset === display ? String(data.owner || "").trim() : "";
+  return { tld: "kas", display, address: owner || null, failed: false };
 }
 
 async function resolveDotk(label) {

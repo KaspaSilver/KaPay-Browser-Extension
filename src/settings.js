@@ -769,8 +769,12 @@ async function showSeedPhrase({ password, onBack }) {
     if (reveal) reveal.onclick = () => {
       revealed = true;
       paint();
-      // iOS hides the words again after 20 seconds (KaPay iOS 99ab88a).
-      hideTimer = setTimeout(() => { revealed = false; if (app.dataset.screen === "seed") paint(); }, 20_000);
+      // iOS hides the words again after 20 seconds (KaPay iOS 99ab88a). Only this screen is
+      // repainted: another account's "seed" screen opened since then is left alone, so it never
+      // shows these words.
+      const shown = $(".seed-grid");
+      clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => { revealed = false; if (shown?.isConnected) paint(); }, 20_000);
     };
     const copySeed = $("#copy-seed");
     if (copySeed) copySeed.onclick = () => copySecret(secrets.mnemonic, "Words copied. Clipboard will clear in 30s.");

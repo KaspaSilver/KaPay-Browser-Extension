@@ -246,8 +246,8 @@ ext.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // "KaPay is unavailable", so nothing may happen for it (audit 2026-11-07).
       if (!fromExtensionPage(sender)) return false;
       const entry = approvals.get(message.id);
-      Promise.all([isUnlocked(), isLoggedOut()])
-        .then(([unlocked, loggedOut]) => sendResponse(claimDecision({ entry, unlocked, loggedOut })))
+      Promise.all([isUnlocked(), isLoggedOut(), connections()])
+        .then(([unlocked, loggedOut, all]) => sendResponse(claimDecision({ entry, unlocked, loggedOut, connected: Boolean(entry && all[entry.origin]) })))
         .catch(() => sendResponse({ ok: false, reason: "expired" }));
       return true;
     }
@@ -314,7 +314,8 @@ async function clearClipboard() {
 // Chrome documents setAccessLevel on every storage area, but the browser may still refuse it for
 // storage.local (Chromium first shipped it for storage.session only). A refusal is logged, never
 // swallowed, so the worker's console says whether storage.local is closed to content scripts here
-// (audit 2026-11-07); either way the vault in it is sealed with the wallet password.
+// (audit 2026-11-07). The sealed vault itself is no longer here: it lives in KaPay's own IndexedDB,
+// which a web page's process is never given (vault-store.js, audit 2026-11-13).
 function lockStorageToExtension() {
   const failed = (error) => console.warn("[KaPay] storage.local could not be limited to KaPay's own pages:", error?.message || error);
   if (typeof ext.storage.local.setAccessLevel !== "function") { failed(new Error("setAccessLevel is not available in this browser")); return; }

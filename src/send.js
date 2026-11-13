@@ -631,6 +631,11 @@ export function showSend(opts) {
     // the last address's fee estimate, waiting or on its way, is not this one's
     clearTimeout(estimateTimer);
     estimateSeq += 1;
+    // and neither one, answering late, clears its spinner any more: cleared here, or Max and the
+    // Review would stay "working out the fee" for good (audit 2026-11-13)
+    state.estimating = false;
+    state.fillingMax = false;
+    state.maxCapped = false;
     state.coins = null;
     state.heldCoins = [];
     state.selected = null;

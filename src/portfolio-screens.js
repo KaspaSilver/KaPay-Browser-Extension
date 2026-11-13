@@ -290,7 +290,9 @@ export function showValueScreen({ onBack }) {
         ${row("Holdings", hidden() ? `${core.MASKED} KAS` : core.kas(s.holdingsKas))}
         ${row("Current Value", money(s.currentValue))}
         ${row("Total Invested", money(s.totalInvested))}
-        ${row("Total P&L", hidden() ? `${s.totalPLPercent.toFixed(1)}%` : `${core.currency(s.totalPL)} (${s.totalPLPercent.toFixed(1)}%)`, s.totalPL >= 0 ? "up" : "down")}
+        ${s.totalPL == null
+          ? row("Total P&L", "—")
+          : row("Total P&L", hidden() ? `${s.totalPLPercent.toFixed(1)}%` : `${core.currency(s.totalPL)} (${s.totalPLPercent.toFixed(1)}%)`, s.totalPL >= 0 ? "up" : "down")}
         ${s.averageBuyPrice != null ? row("Avg. Buy Price", core.price(s.averageBuyPrice)) : ""}
       </div>`;
   };

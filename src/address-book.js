@@ -39,6 +39,9 @@ let entries = [];        // sorted by name
 let deleted = {};        // address -> deletedAt (ms)
 let photos = {};         // address -> data: URL (JPEG)
 let loading = null;
+// The stored book couldn't be read (storage busy or failing): what this window shows started empty,
+// so the next save reads it again and adds to it instead of writing over it (audit 2026-11-13).
+let readFailed = false;
 const listeners = new Set();
 
 /** The name an entry shows: the one you gave it, else the short address (iOS 2831fab:
@@ -58,12 +61,15 @@ export function useWallet(main) {
   entries = [];
   deleted = {};
   photos = {};
+  readFailed = false;
   if (!key) { changed(); return Promise.resolve(); }
   loading = (async () => {
+    let failed = false;
     const [stored, tombstones, storedPhotos] = await Promise.all([
       getLocal(ENTRIES_PREFIX + key), getLocal(DELETED_PREFIX + key), getLocal(PHOTOS_PREFIX + key),
-    ]).catch(() => [null, null, null]);
+    ]).catch(() => { failed = true; return [null, null, null]; });
     if (walletKey !== key) return;
+    readFailed = failed;
     entries = (Array.isArray(stored) ? stored : []).filter((e) => e && e.address).sort(byName);
     deleted = tombstones && typeof tombstones === "object" ? tombstones : {};
     photos = storedPhotos && typeof storedPhotos === "object" ? storedPhotos : {};
@@ -120,6 +126,19 @@ function search(query) {
 
 async function persist() {
   if (!walletKey) return;
+  if (readFailed) {
+    // read again first: a save never writes over contacts this window couldn't read. Still
+    // unreadable: nothing is written.
+    const key = walletKey;
+    const [stored, tombstones, storedPhotos] = await Promise.all([
+      getLocal(ENTRIES_PREFIX + key), getLocal(DELETED_PREFIX + key), getLocal(PHOTOS_PREFIX + key),
+    ]).catch(() => { throw new Error("Couldn't read your saved contacts, so this change wasn't saved. Try again."); });
+    if (walletKey !== key) return;
+    entries = mergeContacts(entries, stored).sort(byName);
+    deleted = { ...(tombstones && typeof tombstones === "object" ? tombstones : {}), ...deleted };
+    photos = { ...(storedPhotos && typeof storedPhotos === "object" ? storedPhotos : {}), ...photos };
+    readFailed = false;
+  }
   await Promise.all([
     setLocal(ENTRIES_PREFIX + walletKey, entries),
     setLocal(DELETED_PREFIX + walletKey, deleted),

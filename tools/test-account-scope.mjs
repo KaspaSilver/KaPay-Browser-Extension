@@ -131,4 +131,12 @@ assert.equal(datedAfterDeletion(1_700_000_000_000, 1_000), 1_700_000_001_000);
 assert.equal(datedAfterDeletion(1_000, 1_700_000_000_123), 1_700_000_000_123);
 assert.equal(datedAfterDeletion(undefined, 42), 42);
 
+// the faucet's last-claim record goes with the account's addresses, but not one another account lists
+{
+  const { page: faucet } = accountDataKeys({ accountId: "a1", chatting: "kaspatest:QChat", addresses: ["kaspatest:qspend", "kaspatest:qtwin"], keep: ["kaspatest:qtwin"] });
+  assert.ok(faucet.includes("kachat_tn10_faucet_claimed_kaspatest:qchat"));
+  assert.ok(faucet.includes("kachat_tn10_faucet_claimed_kaspatest:qspend"));
+  assert.ok(!faucet.includes("kachat_tn10_faucet_claimed_kaspatest:qtwin"));
+}
+
 console.log("account scope: ok");

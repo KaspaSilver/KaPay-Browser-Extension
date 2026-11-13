@@ -76,6 +76,12 @@ export function accountDataKeys({ accountId, chatting = null, addresses = [], va
       `kachat_market_addresses.${key}`,          // shared/engine/kachat-names/actions.js
     );
   }
+  // faucet.js: when each address last claimed testnet coins (an address another account still
+  // lists keeps its own)
+  for (const address of new Set([chatting, ...addresses].filter(Boolean))) {
+    if (kept.has(lower(address))) continue;
+    for (const each of both(address)) page.push(`kachat_tn10_faucet_claimed_${lower(each)}`);
+  }
   // kachat-owned-cache.js: per network by name, the address lowercased
   for (const each of chatting ? both(chatting) : []) {
     const network = lower(each).startsWith("kaspatest:") ? "testnet" : "mainnet";

@@ -32,6 +32,11 @@ check("the window may act only on a request the worker still holds, unlocked and
   assert.deepEqual(claimDecision({ entry: {}, unlocked: true, loggedOut: true }), { ok: false, reason: "signedOut" });
   assert.deepEqual(claimDecision({ entry: {}, unlocked: false, loggedOut: false }), { ok: false, reason: "locked" });
   assert.deepEqual(claimDecision({ entry: {}, unlocked: true, loggedOut: false }), { ok: true });
+  // a site removed in Settings while its window was open: no sign or send for it (audit 2026-11-13)
+  assert.deepEqual(claimDecision({ entry: { kind: "sendKaspa" }, unlocked: true, loggedOut: false, connected: false }), { ok: false, reason: "disconnected" });
+  assert.deepEqual(claimDecision({ entry: { kind: "signMessage" }, unlocked: true, loggedOut: false, connected: false }), { ok: false, reason: "disconnected" });
+  // ...but Connect is how a site gets connected
+  assert.deepEqual(claimDecision({ entry: { kind: "connect" }, unlocked: true, loggedOut: false, connected: false }), { ok: true });
 });
 check("a site's priority fee is whole sompi, at most 1 KAS", () => {
   assert.deepEqual(sitePriorityFee(undefined), { sompi: "0" });

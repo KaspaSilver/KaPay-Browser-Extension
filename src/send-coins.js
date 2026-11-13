@@ -299,7 +299,7 @@ export const ORPHAN_POOL_REFUSED = "Not submitted to a node's orphan pool: a pay
 /** The node as the engine's submit sees it: the same client, its submit's socket failures worded
  *  as a lost connection (the engine reads them before any wrapper around it can). With
  *  `orphanPool: false`, a submit that allows an orphan is refused without reaching the node. */
-function submittingAsLost(node, { orphanPool = true } = {}) {
+export function submittingAsLost(node, { orphanPool = true } = {}) {
   if (!node || typeof node.submitTransaction !== "function") return node;
   return new Proxy(node, {
     get(target, key) {

@@ -23,6 +23,7 @@ import { showLiveNameDetail } from "./kachat-live.js";
 import { ownedDomainsTab, ownedDomainsEntry } from "./kachat-owned-cache.js";
 import { recipientLookup } from "./send-pieces.js";
 import { logWarn } from "./log.js";
+import { forgetAddressDomains } from "./address-domains.js";
 
 const BASE_FEE_SOMPI = 2_000_000n; // 0.02 KAS - iOS WithdrawFeeTier base for domain transfers
 const FEE_TIERS = [
@@ -293,6 +294,15 @@ async function finishTransfer(record, after) {
   try {
     const result = await wallet.finishDomainTransfer(record, ({ status }) => progress(status));
     if (result.status === "no-commit") {
+      // only offered once the commit can't still be on its way, and its address read as empty
+      if (!(await wallet.domainTransferForgettable(record))) {
+        showAlert({
+          title: "Commit Not Found Yet",
+          message: "The commit for this transfer isn't showing on chain yet. It may still be on its way, so this transfer is kept. Try Finish Transfer again in a few minutes.",
+        });
+        after();
+        return;
+      }
       showAlert({
         title: "No Commit Found",
         message: "The commit for this transfer isn't on chain, so nothing was spent. If you just sent it, wait a minute and try again; otherwise you can forget this transfer.",
@@ -302,6 +312,7 @@ async function finishTransfer(record, after) {
       after();
       return;
     }
+    forgetAddressDomains();
     toast(result.status === "already-transferred" ? `${record.domain} already belongs to the recipient.` : `${record.domain} transferred.`);
     if (result.revealTxid) showDomainSent({ txid: result.revealTxid, onDone: after });
     else after();
@@ -515,6 +526,8 @@ export function showSendDomain({ domain, onBack, onSent, source = { kind: "main"
 
 // iOS SentConfirmationSheet for a domain transfer: the reveal transaction.
 function showDomainSent({ txid, onDone }) {
+  // the Domains tab's counts are from before the name left
+  forgetAddressDomains();
   render(`
     <section class="screen sent">
       <div class="sent-check accent">${ICONS.checkBig}</div>

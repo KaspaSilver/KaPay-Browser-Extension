@@ -264,6 +264,7 @@ export async function deleteAccount(accountId, mainAddress) {
     await removeLocal(local);
     for (const key of page) { try { localStorage.removeItem(key); } catch { /* nothing kept */ } }
     await setLocal(LAST_USED_KEY, withoutAccount(await getLocal(LAST_USED_KEY), accountId));
+    await wallet.forgetUsedAddresses([chatting, ...addresses], keep).catch(() => {});
     if (chatting) {
       await forgetAddressBook(chatting);
       forgetBell(chatting);

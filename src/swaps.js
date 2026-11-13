@@ -156,8 +156,18 @@ export async function showSwap() {
     try {
       let address = "";
       if (to.ticker === "kas") {
-        // the next never-used legacy slot, reserved now that the swap is real - unless one was picked
-        address = state.payoutOverride?.address || (await wallet.reserveSwapPayoutAddress()).address;
+        // the next never-used legacy slot, reserved now that the swap is real - unless one was
+        // picked. It must be the one shown: another one is shown instead, and nothing is created.
+        try {
+          address = state.payoutOverride?.address || (await wallet.reserveSwapPayoutAddress(state.nextPayout?.address || null)).address;
+        } catch (error) {
+          if (error?.code !== wallet.PAYOUT_CHANGED) throw error;
+          state.nextPayout = error.next;
+          state.create = { status: "failed", result: null };
+          toast(error.message);
+          paintForm();
+          return;
+        }
       } else {
         address = state.payoutText.trim();
       }

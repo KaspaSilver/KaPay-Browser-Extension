@@ -28,7 +28,7 @@ import { addressDomainsTab } from "./address-domains.js";
 import { kachatRegistry } from "./kachat-names.js";
 import { followAccount } from "./approve.js";
 import { carryAccountData } from "./account-data.js";
-import { shownActiveAccount } from "./account-scope.js";
+import { shownActiveAccount, SWITCHED_ELSEWHERE } from "./account-scope.js";
 import { sompiFromUserText } from "./amounts.js";
 import { showAddToPortfolio } from "./portfolio.js";
 
@@ -300,7 +300,10 @@ async function showPrivateKey({ title, source, address, onBack }) {
     if (reveal) reveal.onclick = () => {
       revealed = true;
       paint();
-      timer = setTimeout(() => { revealed = false; if (app.dataset.screen === "key") paint(); }, 7000);
+      // only this screen is hidden again: another address's key screen opened since then is left alone
+      const shown = $(".key-box");
+      clearTimeout(timer);
+      timer = setTimeout(() => { revealed = false; if (shown?.isConnected) paint(); }, 7000);
     };
     const copy = $("#copy-key");
     if (copy) copy.onclick = () => copySecret(value, "Private key copied. Clipboard will clear in 30s.");
@@ -581,7 +584,10 @@ export function showManageAddresses({ onBack, onChangeIdentity = null }) {
     field: { placeholder: "Label", value: row.customLabel || "" },
     confirmLabel: "Save",
     cancelLabel: "Cancel",
-    onConfirm: async (value) => { await wallet.setSpendingLabel(row.index, value); load(); },
+    onConfirm: async (value) => {
+      try { await wallet.setSpendingLabel(row.index, value); } catch (error) { toast(error.message); }
+      load();
+    },
   });
 
   const setPrimary = async (row) => {
@@ -598,8 +604,8 @@ export function showManageAddresses({ onBack, onChangeIdentity = null }) {
       await wallet.setSpendingHidden(row.index, true);
       toast("Address hidden. Re-enable it in Address Visibility.");
       load();
-    } catch {
-      toast("This address can't be hidden.");
+    } catch (error) {
+      toast(error?.message === SWITCHED_ELSEWHERE ? SWITCHED_ELSEWHERE : "This address can't be hidden.");
     }
   };
 

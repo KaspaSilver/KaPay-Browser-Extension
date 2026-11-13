@@ -5,7 +5,7 @@
 // disk in the clear:
 //
 //   password --PBKDF2-SHA256 (600,000 rounds, random 16-byte salt)--> AES-256-GCM key
-//   { accounts, activeAccountId }  --AES-GCM (random 12-byte IV)-->  ciphertext in storage.local
+//   { accounts, activeAccountId }  --AES-GCM (random 12-byte IV)-->  ciphertext in KaPay's IndexedDB (vault-store.js)
 //
 // Unlocking derives the key once and keeps it (as raw bytes) in storage.session - memory only,
 // wiped when the browser closes or the auto-lock fires (background.js), and never readable by
@@ -15,8 +15,9 @@
 // All crypto is WebCrypto (crypto.subtle), available in every extension page and worker.
 
 import { getLocal, setLocal, removeLocal, getSession, setSession, removeSession, clearSession, localArea } from "./browser.js";
+import { readVault, writeVault, removeVault, LEGACY_VAULT_KEY } from "./vault-store.js";
 
-const VAULT_KEY = "kachat.vault.v1";
+const VAULT_KEY = LEGACY_VAULT_KEY;
 const SESSION_KEY = "kachat.unlockKey";
 const PBKDF2_ITERATIONS = 600_000;
 export const MIN_PASSWORD_LENGTH = 8;
@@ -84,7 +85,7 @@ function newAccountId() {
 
 /** Is there a vault at all (a wallet was set up in this browser)? */
 export async function hasVault() {
-  return Boolean(await getLocal(VAULT_KEY));
+  return Boolean(await readVault());
 }
 
 /** Is the vault unlocked right now (a key is held in session storage)? */
@@ -132,7 +133,7 @@ export async function createVault(password, account) {
     const kdf = newKdf();
     const keyBytes = await deriveKeyBytes(password, fromBase64(kdf.salt), kdf.iterations);
     const payload = { accounts: [stored], activeAccountId: stored.id };
-    await setLocal(VAULT_KEY, await seal(payload, keyBytes, kdf));
+    await writeVault(await seal(payload, keyBytes, kdf));
     await publishAccountIds(payload);
     await setSession(SESSION_KEY, sessionRecord(keyBytes, kdf));
     return publicView(payload);
@@ -144,7 +145,7 @@ export async function createVault(password, account) {
  *  it read before the change - it reads the vault the change left, or finishes before it. */
 export async function unlock(password) {
   return withVaultLock(async () => {
-    const vault = await getLocal(VAULT_KEY);
+    const vault = await readVault();
     if (!vault) throw new Error("No wallet has been set up yet.");
     const keyBytes = await deriveKeyBytes(password, fromBase64(vault.kdf.salt), vault.kdf.iterations);
     let payload;
@@ -167,7 +168,7 @@ export async function lock() {
 
 /** The decrypted vault. Callers that only need names and ids should use `readAccounts`. */
 async function readPayload() {
-  const vault = await getLocal(VAULT_KEY);
+  const vault = await readVault();
   if (!vault) throw new Error("No wallet has been set up yet.");
   return migratePassphrases(await open(vault, await sessionKeyBytes(vault)));
 }
@@ -184,6 +185,16 @@ async function migratePassphrases(payload) {
   if (!changed.length) return payload;
   for (const account of changed) account.passphrase = nfkd(account.passphrase);
   await writePayload(payload);
+  // The old chatting addresses (from the address cache, before it is dropped): what is kept under
+  // them - the backup-owed banner, contacts, the bell - follows the account to its new address
+  // (approve.js followOwedConnections -> account-data.js carryAccountData, audit 2026-11-13).
+  const carry = (await getLocal(DATA_TO_CARRY_KEY).catch(() => null)) || {};
+  for (const account of changed) {
+    const caches = await Promise.all([getLocal(`kachat.addresses.${account.id}`), getLocal(`kachat.addresses.${account.id}.testnet`)]).catch(() => []);
+    const from = caches.map((c) => c?.main).filter(Boolean);
+    if (from.length) carry[account.id] = [...new Set([...(carry[account.id] || []), ...from])];
+  }
+  if (Object.keys(carry).length) await setLocal(DATA_TO_CARRY_KEY, carry).catch(() => {});
   await removeLocal(changed.flatMap((a) => [`kachat.addresses.${a.id}`, `kachat.addresses.${a.id}.testnet`])).catch(() => {});
   // Their websites still hold the old chatting address: noted here (this file can't derive an
   // address), and the wallet window moves those connections to the new one (popup.js).
@@ -195,6 +206,9 @@ async function migratePassphrases(payload) {
 /** Accounts whose chatting address the passphrase migration changed, whose website connections
  *  still have to follow it (approve.js followAccount). */
 export const CONNECTIONS_TO_FOLLOW_KEY = "kachat.connectionsToFollow";
+/** accountId -> the chatting addresses (either network) an account had before the passphrase
+ *  migration moved it: its data still to be carried to the new one. */
+export const DATA_TO_CARRY_KEY = "kachat.dataToCarry";
 
 // Vault changes take turns across every open window - popup, tab, approval window - through one
 // Web Lock (audit EXT-027): an account change reads, edits and writes the vault inside it, and a
@@ -208,13 +222,13 @@ function withVaultLock(fn) {
 }
 
 async function writePayload(payload) {
-  const vault = await getLocal(VAULT_KEY);
+  const vault = await readVault();
   const sealed = await seal(payload, await sessionKeyBytes(vault), vault.kdf);
   // still the vault this seal is for - never write an old-password seal over a re-sealed vault
-  if ((await getLocal(VAULT_KEY))?.kdf?.salt !== vault.kdf.salt) {
+  if ((await readVault())?.kdf?.salt !== vault.kdf.salt) {
     throw new Error("The wallet password was just changed in another window. Try again.");
   }
-  await setLocal(VAULT_KEY, sealed);
+  await writeVault(sealed);
   await publishAccountIds(payload);
 }
 
@@ -312,7 +326,14 @@ export async function setIdentityIndex(id, index) {
     const payload = await readPayload();
     const account = payload.accounts.find((a) => a.id === id);
     if (!account) throw new Error("That account is no longer in the wallet.");
-    account.identityIndex = Math.max(0, Math.floor(Number(index) || 0));
+    const next = Math.max(0, Math.floor(Number(index) || 0));
+    // never the chatting address of another account from the same words: the two would share
+    // their data, and deleting one would wipe the other's (audit 2026-11-13)
+    const twin = payload.accounts.find((a) => a.id !== id
+      && a.mnemonic === account.mnemonic && (a.passphrase || "") === (account.passphrase || "")
+      && (a.family || "kaspaStandard") === (account.family || "kaspaStandard") && (a.identityIndex || 0) === next);
+    if (twin) throw new Error(`This address is already the chatting address of "${twin.name}".`);
+    account.identityIndex = next;
     await writePayload(payload);
     return publicView(payload);
   });
@@ -362,7 +383,7 @@ export async function changePassword(currentPassword, nextPassword) {
     const payload = await readPayload();
     const kdf = newKdf();
     const keyBytes = await deriveKeyBytes(nextPassword, fromBase64(kdf.salt), kdf.iterations);
-    await setLocal(VAULT_KEY, await seal(payload, keyBytes, kdf));
+    await writeVault(await seal(payload, keyBytes, kdf));
     await setSession(SESSION_KEY, sessionRecord(keyBytes, kdf));
   });
 }
@@ -378,13 +399,14 @@ export async function resetWallet() {
   await clearSession();
   const all = (await localArea?.get?.(null)) || {};
   const keys = Object.keys(all).filter((k) => k === VAULT_KEY || k.startsWith("kachat"));
+  await removeVault();
   await removeLocal([VAULT_KEY, ...keys]);
   try { localStorage.clear(); } catch { /* nothing kept there */ }
 }
 
 /** Confirms a password against the vault without changing the unlock state. */
 export async function verifyPassword(password) {
-  const vault = await getLocal(VAULT_KEY);
+  const vault = await readVault();
   if (!vault) return false;
   try {
     const keyBytes = await deriveKeyBytes(password, fromBase64(vault.kdf.salt), vault.kdf.iterations);

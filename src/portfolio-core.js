@@ -349,11 +349,14 @@ export function computeSummary(transactions, currentPrice) {
   }
   const holdingsKas = Number(holdingsSompi) / 1e8;
   const totalBoughtKas = Number(boughtSompi) / 1e8;
-  const currentValue = holdingsKas * (currentPrice || 0);
-  const totalPL = (currentValue + totalProceeds) - totalInvested;
+  // no price yet (or it couldn't be loaded): the value and P&L are unknown, never $0 and a 100%
+  // loss (audit 2026-11-13). Holdings with nothing in them are worth 0 at any price.
+  const priced = currentPrice != null && Number.isFinite(currentPrice) && currentPrice > 0;
+  const currentValue = priced ? holdingsKas * currentPrice : holdingsSompi === 0n ? 0 : null;
+  const totalPL = currentValue == null ? null : (currentValue + totalProceeds) - totalInvested;
   return {
     holdingsKas, totalInvested, totalProceeds, currentValue, totalPL,
-    totalPLPercent: totalInvested > 0 ? (totalPL / totalInvested) * 100 : 0,
+    totalPLPercent: totalPL == null ? null : totalInvested > 0 ? (totalPL / totalInvested) * 100 : 0,
     averageBuyPrice: totalBoughtKas > 0 ? totalInvested / totalBoughtKas : null,
   };
 }
@@ -511,6 +514,8 @@ export function bitcoin(value) {
 
 /** Sign, symbol, two grouped decimals: -$1,234.56 (bitcoin: eight decimals). */
 export function currency(value, code = store.currency) {
+  // not known (no price yet): a dash, never a made-up zero
+  if (value == null || !Number.isFinite(value)) return "—";
   if (code === "btc") return bitcoin(value);
   return `${value < 0 ? "-" : ""}${currencySymbol(code)}${grouped2(value)}`;
 }
@@ -937,7 +942,7 @@ export function ensureAltSeries({ force = false } = {}) {
 // --- per-portfolio derived numbers --------------------------------------------------------------
 
 export function summaryFor(portfolioId = store.data.activeId) {
-  return computeSummary(scopedTransactions(portfolioId), market.price?.price ?? 0);
+  return computeSummary(scopedTransactions(portfolioId), market.price?.price ?? null);
 }
 
 export function todayChangeFor(portfolioId) {
@@ -1160,6 +1165,9 @@ export async function importCsv(text) {
     const amount = lenient(f[4]);
     let total = lenient(f[5]);
     if (amount == null || total == null) continue;
+    // a negative amount or total isn't a trade: the form refuses them, and so does the import
+    // (audit 2026-11-13)
+    if (!(amount > 0) || total < 0) continue;
     if (f.length > 7 && String(f[7]).trim().toUpperCase() === "USD") {
       const fee = lenient(f[6]) || 0;
       if (type === "buy") total += fee;

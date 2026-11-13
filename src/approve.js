@@ -18,6 +18,8 @@ import { ext, getLocal, setLocal, removeLocal } from "./browser.js";
 import { esc, render, $, toast, noteActivity, resetActivityPing, ICONS } from "./ui.js";
 import { SEND_OUTCOME_UNKNOWN } from "../shared/engine/transactions.js";
 import { approvalTotals, armDelayLeft } from "./site-rules.js";
+import { SEND_FEE_CHANGED } from "./send-coins.js";
+import { carryAccountData } from "./account-data.js";
 
 // Per network: a site connected on mainnet knows the kaspa: address, on testnet the kaspatest: one.
 export const CONNECTIONS_KEY = netKey("kachat.connections");
@@ -54,6 +56,7 @@ export async function removeConnectionsFor(accountId) {
  *  CONNECTIONS_TO_FOLLOW_KEY): their website connections move to the new address. Run on every
  *  wallet home and after an approval window's unlock; kept until it succeeds. */
 export async function followOwedConnections() {
+  await carryOwedData();
   const owed = await getLocal(vault.CONNECTIONS_TO_FOLLOW_KEY).catch(() => null);
   if (!Array.isArray(owed) || !owed.length) return;
   const ids = new Set(((await vault.readAccounts().catch(() => null))?.accounts || []).map((a) => a.id));
@@ -65,6 +68,30 @@ export async function followOwedConnections() {
   }
   if (left.length) await setLocal(vault.CONNECTIONS_TO_FOLLOW_KEY, left).catch(() => {});
   else await removeLocal([vault.CONNECTIONS_TO_FOLLOW_KEY]).catch(() => {});
+}
+
+/** The passphrase migration moved these accounts to new chatting addresses: what was kept under the
+ *  old ones (backup owed, contacts, the bell) is carried to the new ones, on each network. */
+async function carryOwedData() {
+  const owed = await getLocal(vault.DATA_TO_CARRY_KEY).catch(() => null);
+  if (!owed || typeof owed !== "object" || !Object.keys(owed).length) return;
+  const ids = new Set(((await vault.readAccounts().catch(() => null))?.accounts || []).map((a) => a.id));
+  if (!ids.size) return;
+  const left = {};
+  for (const [id, olds] of Object.entries(owed)) {
+    if (!ids.has(id)) continue;
+    try {
+      const { address } = await wallet.identityFor(id);
+      for (const old of olds || []) {
+        const hrp = String(old).startsWith("kaspatest:") ? "kaspatest" : "kaspa";
+        await carryAccountData(old, reencodeAddress(address, hrp) || address);
+      }
+    } catch {
+      left[id] = olds;
+    }
+  }
+  if (Object.keys(left).length) await setLocal(vault.DATA_TO_CARRY_KEY, left).catch(() => {});
+  else await removeLocal([vault.DATA_TO_CARRY_KEY]).catch(() => {});
 }
 
 export async function followAccount(accountId, identity = null) {
@@ -174,21 +201,39 @@ export async function showApproval(id) {
   const leaveScreen = () => { screenToken += 1; };
   const screen = () => { const token = screenToken; return () => token === screenToken; };
 
-  // Connect / Sign / Approve arm once the screen has been visible APPROVE_ARM_MS (audit
-  // 2026-11-07): a window that pops up under a click the site timed can't take it as a yes.
-  let visibleSince = document.visibilityState === "visible" ? Date.now() : null;
-  document.addEventListener("visibilitychange", () => {
-    visibleSince = document.visibilityState === "visible" ? Date.now() : null;
-  });
-  const armWhenSeen = (onArmed) => {
+  // Connect / Sign / Approve arm once the screen has been visible and focused APPROVE_ARM_MS
+  // (audit 2026-11-07): a window that pops up under a click the site timed can't take it as a yes.
+  // They disarm whenever this window loses focus and arm again APPROVE_ARM_MS after it comes back
+  // (audit 2026-11-13): a site's own window laid over this one can't turn a click into a yes.
+  const inView = () => document.visibilityState === "visible" && document.hasFocus();
+  let visibleSince = inView() ? Date.now() : null;
+  const armChecks = new Set();
+  const viewChanged = () => {
+    if (!inView()) visibleSince = null;
+    else if (visibleSince == null) visibleSince = Date.now();
+    for (const check of [...armChecks]) check();
+  };
+  document.addEventListener("visibilitychange", viewChanged);
+  window.addEventListener("focus", viewChanged);
+  window.addEventListener("blur", viewChanged);
+  const armWhenSeen = (onArmed, onDisarmed = () => {}) => {
     const shownAt = Date.now();
     const onScreen = screen();
+    let armed = false;
+    let timer = null;
     const check = () => {
-      if (!onScreen()) return;
+      clearTimeout(timer);
+      if (!onScreen()) { armChecks.delete(check); return; }
       const left = armDelayLeft({ visibleSince, shownAt, now: Date.now() });
-      if (left === 0) onArmed();
-      else setTimeout(check, left ?? 100);
+      if (left === 0) {
+        if (!armed) { armed = true; onArmed(); }
+        return;
+      }
+      if (armed) { armed = false; onDisarmed(); }
+      // hidden or unfocused: looked at again now and then as well as on focus
+      timer = setTimeout(check, left ?? 250);
     };
+    armChecks.add(check);
     check();
   };
 
@@ -219,6 +264,11 @@ export async function showApproval(id) {
     if (answer?.ok) return true;
     leaveScreen();
     if (answer?.reason === "signedOut") showSignedOut(request, reject);
+    else if (answer?.reason === "disconnected") {
+      answered = true;
+      ext.runtime.sendMessage({ type: "approval-result", id, error: true }).catch(() => {});
+      showNotice(request, "This site is no longer connected", "Nothing was sent or signed. Connect the site again to continue.");
+    }
     else if (answer?.reason === "locked") showApprovalUnlock(request, proceed, reject);
     else showExpired();
     return false;
@@ -254,7 +304,8 @@ export async function showApproval(id) {
   }
   if (await getLocal(LOGGED_OUT_KEY)) return showSignedOut(request, reject);
   if (!(await vault.isUnlocked())) return showApprovalUnlock(request, proceed, reject);
-  noteActivity();
+  // a site opening this window isn't you using KaPay: auto-lock is pushed back only by your own
+  // clicks and keys here (audit 2026-11-13)
   proceed();
 }
 
@@ -302,6 +353,7 @@ async function showConnect(request, ctx) {
   const onScreen = ctx.screen();
   let chosen = view.activeAccountId;
   let armed = false;
+  let busy = false;
   const paint = () => {
     if (!onScreen()) return;
     render(`
@@ -320,15 +372,15 @@ async function showConnect(request, ctx) {
         <div class="spacer"></div>
         <div class="approve-buttons">
           <button id="cancel" class="soft">Cancel</button>
-          <button id="ok" ${armed ? "" : "disabled"}>Connect</button>
+          <button id="ok" ${armed && !busy ? "" : "disabled"}>${busy ? '<span class="spinner"></span>' : "Connect"}</button>
         </div>
       </section>`, "approve");
     for (const row of document.querySelectorAll("[data-account]")) row.onclick = () => { chosen = row.dataset.account; paint(); };
     $("#cancel").onclick = ctx.reject;
     $("#ok").onclick = async () => {
-      const button = $("#ok");
-      button.disabled = true;
-      button.innerHTML = '<span class="spinner"></span>';
+      if (!armed || busy) return;
+      busy = true;
+      paint();
       // still waiting in the worker, KaPay unlocked and signed in (audit 2026-11-07)
       if (!(await ctx.claim())) return;
       try {
@@ -339,14 +391,15 @@ async function showConnect(request, ctx) {
         await setLocal(CONNECTIONS_KEY, all);
         ctx.respond([identity.address]);
       } catch (error) {
-        $("#error").textContent = error.message;
-        button.disabled = false;
-        button.textContent = "Connect";
+        busy = false;
+        paint();
+        const shown = $("#error");
+        if (shown) shown.textContent = error.message;
       }
     };
   };
   paint();
-  ctx.armWhenSeen(() => { armed = true; paint(); });
+  ctx.armWhenSeen(() => { armed = true; paint(); }, () => { armed = false; paint(); });
 }
 
 async function connectionFor(request, reject) {
@@ -375,11 +428,17 @@ async function showSendApproval(request, ctx) {
   const amount = BigInt(sompiText);
   // the site's own extra fee, shown on its own row (audit 2026-11-07; capped by background.js)
   const siteFee = BigInt(priorityFeeText || "0");
-  const state = { fee: null, available: null, validTo: null, sending: false, error: "", armed: false };
+  // feeRise: the whole fee (network + site) a send said it would pay, more than this window showed
+  // (SEND_FEE_CHANGED): shown from then on, and the next Approve pays exactly that
+  const state = { fee: null, feeRise: null, available: null, validTo: null, sending: false, error: "", armed: false };
+  const shownNetworkFee = () => {
+    if (state.feeRise != null) return state.feeRise - siteFee;
+    return state.fee != null ? wallet.kasToSompi(state.fee.toFixed(8)) : null;
+  };
 
   const paint = () => {
     if (!onScreen()) return;
-    const networkFee = state.fee != null ? wallet.kasToSompi(state.fee.toFixed(8)) : null;
+    const networkFee = shownNetworkFee();
     const { total } = approvalTotals({ amount, networkFeeSompi: networkFee, siteFeeSompi: siteFee });
     const short = state.available != null && total != null && total > state.available;
     render(`
@@ -407,6 +466,7 @@ async function showSendApproval(request, ctx) {
       </section>`, "approve");
     $("#cancel").onclick = ctx.reject;
     $("#ok").onclick = async () => {
+      if (!state.armed || state.sending) return;
       state.sending = true;
       state.error = "";
       paint();
@@ -423,6 +483,9 @@ async function showSendApproval(request, ctx) {
           destination: to,
           amountKas: wallet.sompiToKasText(amount),
           tipKas: tip.toFixed(8),
+          // the fee this window shows (network + the site's extra): a send rebuilt from other
+          // coins that would pay more stops before anything is signed, as the Send screen's does
+          expectedFeeSompi: networkFee + siteFee,
           // the password prompt shows what leaves the wallet, the site's own extra fee named
           totalText: total != null ? `${wallet.formatKas(total, 8)} KAS` : null,
           extraFeeText: siteFee > 0n ? `${wallet.formatKas(siteFee, 8)} KAS` : null,
@@ -442,6 +505,14 @@ async function showSendApproval(request, ctx) {
         if (error?.code === wallet.SEND_ABORTED) return;
         state.sending = false;
         ctx.markSending(false);
+        // nothing was sent: built from today's coins it would pay more than shown. The new fee is
+        // shown with why, and Approve pays exactly that.
+        if (error?.code === SEND_FEE_CHANGED) {
+          state.feeRise = error.feeSompi;
+          state.error = String(error.message);
+          paint();
+          return;
+        }
         // the password prompt was cancelled: nothing was sent; Approve or Reject again
         state.error = error?.code === wallet.SEND_CANCELLED ? "" : String(error?.message || error);
         paint();
@@ -449,7 +520,7 @@ async function showSendApproval(request, ctx) {
     };
   };
   paint();
-  ctx.armWhenSeen(() => { state.armed = true; paint(); });
+  ctx.armWhenSeen(() => { state.armed = true; paint(); }, () => { state.armed = false; paint(); });
   state.validTo = await wallet.isValidAddress(to);
   paint();
   try {
@@ -481,7 +552,7 @@ async function showSignApproval(request, ctx) {
       <div class="glass list">
         <div class="list-row stack-tight"><span class="muted small">Account</span><span>${esc(connection.accountName)}</span><span class="mono tiny muted break">${esc(connection.address)}</span></div>
       </div>
-      <div class="sign-message" tabindex="0" aria-label="Message">${esc(message)}</div>
+      <div class="sign-message" tabindex="0" aria-label="Message"></div>
       <p class="muted small">Only sign messages you understand. Signing proves you own this address; it does not send Kaspa.</p>
       <p class="error" id="error"></p>
       <div class="approve-buttons">
@@ -489,9 +560,15 @@ async function showSignApproval(request, ctx) {
         <button id="ok" disabled>Sign</button>
       </div>
     </section>`, "approve");
+  // set after render: the testnet KAS -> TKAS relabel never changes the text you sign
+  $(".sign-message").textContent = message;
+  let armed = false;
+  let busy = false;
   $("#cancel").onclick = ctx.reject;
   $("#ok").onclick = async () => {
     const button = $("#ok");
+    if (!armed || busy) return;
+    busy = true;
     button.disabled = true;
     // still waiting in the worker, KaPay unlocked and signed in (audit 2026-11-07)
     if (!(await ctx.claim())) return;
@@ -499,8 +576,14 @@ async function showSignApproval(request, ctx) {
       ctx.respond(await wallet.signMessage(connection.accountId, message));
     } catch (error) {
       $("#error").textContent = String(error?.message || error);
-      button.disabled = false;
+      busy = false;
+      button.disabled = !armed;
     }
   };
-  ctx.armWhenSeen(() => { const button = $("#ok"); if (button) button.disabled = false; });
+  const setArmed = (on) => {
+    armed = on;
+    const button = $("#ok");
+    if (button && !busy) button.disabled = !on;
+  };
+  ctx.armWhenSeen(() => setArmed(true), () => setArmed(false));
 }
