@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "KaPay Extension",
   "short_name": "KaPay",
-  "version": "5.2.3",
+  "version": "5.3",
   "description": "KaPay, the Kaspa wallet from KaChat: send and receive KAS, manage addresses and domains, and connect to Kaspa websites.",
   "icons": {
     "16": "icons/kapay-16.png",
